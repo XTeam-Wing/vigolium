@@ -45,6 +45,7 @@ type Service struct {
 	tracker            *lru.Cache[string, PayloadContext] // nonce → PayloadContext (bounded LRU)
 	emitResult         func(*output.ResultEvent)
 	resolveRequestUUID func(requestHash string) string // resolves request hash → DB record UUID
+	resolveOrigin      func(requestHash string) *database.HTTPRecord
 	repo               *database.Repository
 	scanUUID           string
 	projectUUID        string
@@ -119,6 +120,16 @@ func New(cfg *config.OASTConfig, emitResult func(*output.ResultEvent), repo *dat
 		blindXSSSrc:        cfg.BlindXSSSrc,
 		enabledBlindXSS:    cfg.EnabledBlindXSS,
 	}, nil
+}
+
+// SetOriginResolver updates the function used to resolve request hashes to
+// in-memory HTTP records. Native SDK runs do not have a repository, but still
+// need the request/response that planted the OAST payload in emitted findings.
+func (s *Service) SetOriginResolver(fn func(string) *database.HTTPRecord) {
+	if s == nil {
+		return
+	}
+	s.resolveOrigin = fn
 }
 
 // ServerURL returns the interactsh server hostname (e.g. "oast.pro").
@@ -341,6 +352,14 @@ func (s *Service) originRecord(requestHash string) (string, *database.HTTPRecord
 	var uuid string
 	if s.resolveRequestUUID != nil {
 		uuid = s.resolveRequestUUID(requestHash)
+	}
+	if s.resolveOrigin != nil {
+		if rec := s.resolveOrigin(requestHash); rec != nil {
+			if uuid == "" {
+				uuid = rec.UUID
+			}
+			return uuid, rec
+		}
 	}
 	if s.repo == nil {
 		return uuid, nil

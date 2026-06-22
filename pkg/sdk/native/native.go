@@ -15,6 +15,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/core/network"
 	hostlimit "github.com/vigolium/vigolium/pkg/core/ratelimit"
 	"github.com/vigolium/vigolium/pkg/core/services"
+	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/dedup"
 	vighttp "github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
@@ -292,7 +293,9 @@ func (c *Config) runRequests(ctx context.Context, items []*httpmsg.HttpRequestRe
 	if err != nil {
 		return collector.Results(), fmt.Errorf("create OAST service: %w", err)
 	}
+	origins := newOriginStore()
 	if oastService != nil {
+		oastService.SetOriginResolver(origins.Get)
 		oastService.Start()
 		defer oastService.Close()
 	}
@@ -310,6 +313,9 @@ func (c *Config) runRequests(ctx context.Context, items []*httpmsg.HttpRequestRe
 		scanItem, err := c.ensureResponse(ctx, requester, item)
 		if err != nil {
 			return collector.Results(), err
+		}
+		if oastService != nil {
+			origins.Add(scanItem)
 		}
 		for _, module := range passive {
 			if module == nil || !module.CanProcess(scanItem) {
@@ -513,6 +519,50 @@ func buildResultEvidence(request, response string) string {
 		return ""
 	}
 	return request + output.EvidenceSeparator + response
+}
+
+type originStore struct {
+	mu      sync.RWMutex
+	records map[string]*database.HTTPRecord
+}
+
+func newOriginStore() *originStore {
+	return &originStore{records: make(map[string]*database.HTTPRecord)}
+}
+
+func (s *originStore) Add(item *httpmsg.HttpRequestResponse) {
+	if s == nil || item == nil || item.Request() == nil {
+		return
+	}
+	hash := item.Request().ID()
+	if hash == "" {
+		return
+	}
+
+	record := &database.HTTPRecord{
+		Method:     item.Request().Method(),
+		RawRequest: append([]byte(nil), item.Request().Raw()...),
+	}
+	if target := item.Target(); target != "" {
+		record.URL = target
+	}
+	if item.HasResponse() && item.Response() != nil {
+		record.RawResponse = append([]byte(nil), item.Response().Raw()...)
+	}
+
+	s.mu.Lock()
+	s.records[hash] = record
+	s.mu.Unlock()
+}
+
+func (s *originStore) Get(requestHash string) *database.HTTPRecord {
+	if s == nil || requestHash == "" {
+		return nil
+	}
+	s.mu.RLock()
+	record := s.records[requestHash]
+	s.mu.RUnlock()
+	return record
 }
 
 func (c *Config) ensureResponse(ctx context.Context, requester *vighttp.Requester, item *httpmsg.HttpRequestResponse) (*httpmsg.HttpRequestResponse, error) {

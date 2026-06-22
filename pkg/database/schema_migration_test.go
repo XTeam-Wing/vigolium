@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
+	_ "github.com/glebarez/go-sqlite"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
-	"github.com/uptrace/bun/driver/sqliteshim"
 )
 
 // newEmptyDB opens an in-memory SQLite *DB WITHOUT running CreateSchema, so the
@@ -21,7 +21,7 @@ import (
 func newEmptyDB(t *testing.T) *DB {
 	t.Helper()
 
-	sqldb, err := sql.Open(sqliteshim.ShimName, ":memory:?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL")
+	sqldb, err := sql.Open("sqlite", ":memory:?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL")
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}

@@ -5,9 +5,9 @@ import (
 	"database/sql"
 	"fmt"
 
+	_ "github.com/glebarez/go-sqlite"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
-	"github.com/uptrace/bun/driver/sqliteshim"
 )
 
 // MergeStats tracks merge operation statistics
@@ -38,7 +38,7 @@ func NewDBMerger(dstPath string, batchSize int, verbose bool) (*DBMerger, error)
 	// Open destination database with WAL mode
 	dsn := fmt.Sprintf("%s?_journal=WAL&_timeout=5000&_sync=NORMAL", dstPath)
 
-	sqldb, err := sql.Open(sqliteshim.ShimName, dsn)
+	sqldb, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open destination database: %w", err)
 	}

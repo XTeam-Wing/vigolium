@@ -6,10 +6,10 @@ import (
 	"net/url"
 	"testing"
 
+	_ "github.com/glebarez/go-sqlite"
 	"github.com/stretchr/testify/require"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
-	"github.com/uptrace/bun/driver/sqliteshim"
 
 	"github.com/vigolium/vigolium/pkg/deparos/jsscan"
 	"github.com/vigolium/vigolium/pkg/deparos/spider"
@@ -19,7 +19,7 @@ import (
 func setupTestDB(t *testing.T) *bun.DB {
 	t.Helper()
 
-	sqldb, err := sql.Open(sqliteshim.ShimName, ":memory:")
+	sqldb, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatalf("failed to open test database: %v", err)
 	}

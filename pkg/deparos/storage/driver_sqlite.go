@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/glebarez/go-sqlite"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
-	"github.com/uptrace/bun/driver/sqliteshim"
 )
 
 // SQLiteDriver implements DatabaseDriver for SQLite
@@ -17,7 +17,7 @@ type SQLiteDriver struct{}
 
 // Open creates a bun database connection for SQLite
 func (d *SQLiteDriver) Open(dsn string) (*bun.DB, error) {
-	sqldb, err := sql.Open(sqliteshim.ShimName, dsn)
+	sqldb, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite: %w", err)
 	}
@@ -25,7 +25,7 @@ func (d *SQLiteDriver) Open(dsn string) (*bun.DB, error) {
 }
 
 // ConfigurePool sets SQLite-specific connection settings for multi-process concurrent access.
-// Core PRAGMAs are set explicitly here since sqliteshim may not honor DSN parameters
+// Core PRAGMAs are set explicitly here since SQLite drivers may not honor DSN parameters
 // like _journal_mode, _busy_timeout, and _synchronous.
 func (d *SQLiteDriver) ConfigurePool(db *bun.DB, cfg *DatabaseConfig) error {
 	sqlDB := db.DB

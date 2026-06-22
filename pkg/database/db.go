@@ -10,11 +10,11 @@ import (
 	"sync"
 	"time"
 
+	_ "github.com/glebarez/go-sqlite"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/pgdialect"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
 	"github.com/uptrace/bun/driver/pgdriver"
-	"github.com/uptrace/bun/driver/sqliteshim"
 	"github.com/vigolium/vigolium/internal/config"
 	"go.uber.org/zap"
 )
@@ -149,10 +149,12 @@ func openSQLite(cfg *config.SQLiteConfig) (*sql.DB, error) {
 
 	// Build DSN with PRAGMA settings.
 	//
-	// sqliteshim resolves to the pure-Go modernc.org/sqlite driver, which
+	// github.com/glebarez/go-sqlite resolves to the same pure-Go SQLite core used
+	// by Sniper's GORM sqlite adapter, avoiding duplicate registration with
+	// modernc.org/sqlite when Vigolium is embedded in the server process. It
 	// expects connection PRAGMAs via repeated _pragma=<name>(<value>) query
 	// params. The legacy mattn/go-sqlite3 form (_busy_timeout=, _journal_mode=)
-	// is silently ignored by modernc, which left every connection on the
+	// is silently ignored by this driver, which left every connection on the
 	// SQLite defaults: busy_timeout=0 and journal_mode=delete. Under
 	// concurrent writers (e.g. RecordWriter batch flushes with
 	// MaxOpenConns>1) that yields immediate SQLITE_BUSY failures because no
@@ -181,7 +183,7 @@ func openSQLite(cfg *config.SQLiteConfig) (*sql.DB, error) {
 		sqliteMmapSize,
 	)
 
-	sqldb, err := sql.Open(sqliteshim.ShimName, dsn)
+	sqldb, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}

@@ -5,17 +5,17 @@ import (
 	"database/sql"
 	"testing"
 
+	_ "github.com/glebarez/go-sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
-	"github.com/uptrace/bun/driver/sqliteshim"
 )
 
 func setupTestObservedDB(t *testing.T) (*bun.DB, *ObservedRepository) {
 	t.Helper()
 
-	sqldb, err := sql.Open(sqliteshim.ShimName, ":memory:")
+	sqldb, err := sql.Open("sqlite", ":memory:")
 	require.NoError(t, err)
 
 	db := bun.NewDB(sqldb, sqlitedialect.New())

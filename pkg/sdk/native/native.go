@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/core/network"
 	hostlimit "github.com/vigolium/vigolium/pkg/core/ratelimit"
@@ -19,6 +20,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/input/formats/curl"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/oast"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types"
 )
@@ -48,6 +50,19 @@ type PassiveModule interface {
 	ScanPerHost(*httpmsg.HttpRequestResponse, *modkit.ScanContext) ([]*output.ResultEvent, error)
 }
 
+// OASTConfig controls out-of-band callback detection for native SDK scans.
+// A nil Enabled value keeps the SDK default enabled behavior.
+type OASTConfig struct {
+	Enabled         *bool
+	ServerURL       string
+	Token           string
+	PollInterval    int
+	GracePeriod     int
+	OastURL         string
+	BlindXSSSrc     string
+	EnabledBlindXSS bool
+}
+
 // Config controls a native scan run.
 type Config struct {
 	Concurrency             int
@@ -69,6 +84,7 @@ type Config struct {
 	DisableRedirects        bool
 	IncludeResponseInOutput bool
 	OmitResponse            bool
+	OAST                    OASTConfig
 
 	OnResult func(*Result)
 }
@@ -177,6 +193,12 @@ func WithOnResult(fn func(*Result)) Option {
 	return func(c *Config) { c.OnResult = fn }
 }
 
+// WithOASTConfig sets OAST callback detection options. OAST is enabled by
+// default; pass Enabled=false explicitly to disable it.
+func WithOASTConfig(cfg OASTConfig) Option {
+	return func(c *Config) { c.OAST = cfg }
+}
+
 // RunURL scans a single URL and returns all findings.
 func (c *Config) RunURL(ctx context.Context, target string) ([]*Result, error) {
 	if target == "" {
@@ -261,41 +283,33 @@ func (c *Config) runRequests(ctx context.Context, items []*httpmsg.HttpRequestRe
 		return nil, fmt.Errorf("create HTTP requester: %w", err)
 	}
 
-	active, passive := c.modules()
-	scanCtx := &modkit.ScanContext{DedupManager: dedupMgr}
-	var mu sync.Mutex
-	results := make([]*Result, 0)
-	emit := func(batch []*output.ResultEvent) {
-		for _, result := range batch {
-			if result == nil {
-				continue
-			}
-			if result.Type == "" {
-				result.Type = "http"
-			}
-			result.MatcherStatus = true
-			if result.Timestamp.IsZero() {
-				result.Timestamp = time.Now()
-			}
-			mu.Lock()
-			results = append(results, result)
-			mu.Unlock()
-			if c.OnResult != nil {
-				c.OnResult(result)
-			}
-		}
+	collector := newResultCollector(c.OnResult)
+	emit := collector.Emit
+
+	oastService, err := oast.New(c.oastConfig(), func(result *output.ResultEvent) {
+		emit([]*output.ResultEvent{result})
+	}, nil, opts.ScanUUID, opts.ProjectUUID, nil)
+	if err != nil {
+		return collector.Results(), fmt.Errorf("create OAST service: %w", err)
 	}
+	if oastService != nil {
+		oastService.Start()
+		defer oastService.Close()
+	}
+
+	active, passive := c.modules()
+	scanCtx := &modkit.ScanContext{DedupManager: dedupMgr, OASTProvider: oastService}
 
 	for _, item := range items {
 		if err := ctxErr(ctx); err != nil {
-			return results, err
+			return collector.Results(), err
 		}
 		if item == nil || item.Request() == nil {
 			continue
 		}
 		scanItem, err := c.ensureResponse(ctx, requester, item)
 		if err != nil {
-			return results, err
+			return collector.Results(), err
 		}
 		for _, module := range passive {
 			if module == nil || !module.CanProcess(scanItem) {
@@ -304,21 +318,21 @@ func (c *Config) runRequests(ctx context.Context, items []*httpmsg.HttpRequestRe
 			if module.ScanScopes().Has(modkit.ScanScopeRequest) {
 				batch, err := module.ScanPerRequest(scanItem, scanCtx)
 				if err != nil {
-					return results, fmt.Errorf("%s passive request scan: %w", module.ID(), err)
+					return collector.Results(), fmt.Errorf("%s passive request scan: %w", module.ID(), err)
 				}
 				emit(batch)
 			}
 			if module.ScanScopes().Has(modkit.ScanScopeHost) {
 				batch, err := module.ScanPerHost(scanItem, scanCtx)
 				if err != nil {
-					return results, fmt.Errorf("%s passive host scan: %w", module.ID(), err)
+					return collector.Results(), fmt.Errorf("%s passive host scan: %w", module.ID(), err)
 				}
 				emit(batch)
 			}
 		}
 		points, err := scanItem.CreateInsertionPoints(true)
 		if err != nil {
-			return results, fmt.Errorf("create insertion points: %w", err)
+			return collector.Results(), fmt.Errorf("create insertion points: %w", err)
 		}
 		for _, module := range active {
 			if module == nil || !module.CanProcess(scanItem) {
@@ -327,14 +341,14 @@ func (c *Config) runRequests(ctx context.Context, items []*httpmsg.HttpRequestRe
 			if module.ScanScopes().Has(modkit.ScanScopeRequest) {
 				batch, err := module.ScanPerRequest(scanItem, requester, scanCtx)
 				if err != nil {
-					return results, fmt.Errorf("%s active request scan: %w", module.ID(), err)
+					return collector.Results(), fmt.Errorf("%s active request scan: %w", module.ID(), err)
 				}
 				emit(batch)
 			}
 			if module.ScanScopes().Has(modkit.ScanScopeHost) {
 				batch, err := module.ScanPerHost(scanItem, requester, scanCtx)
 				if err != nil {
-					return results, fmt.Errorf("%s active host scan: %w", module.ID(), err)
+					return collector.Results(), fmt.Errorf("%s active host scan: %w", module.ID(), err)
 				}
 				emit(batch)
 			}
@@ -348,16 +362,144 @@ func (c *Config) runRequests(ctx context.Context, items []*httpmsg.HttpRequestRe
 				}
 				batch, err := module.ScanPerInsertionPoint(scanItem, point, requester, scanCtx)
 				if err != nil {
-					return results, fmt.Errorf("%s insertion-point scan: %w", module.ID(), err)
+					return collector.Results(), fmt.Errorf("%s insertion-point scan: %w", module.ID(), err)
 				}
 				emit(batch)
-				if opts.MaxFindingsPerModule > 0 && countModuleResults(results, module.ID()) >= opts.MaxFindingsPerModule {
+				if opts.MaxFindingsPerModule > 0 && collector.CountModuleResults(module.ID()) >= opts.MaxFindingsPerModule {
 					break
 				}
 			}
 		}
 	}
-	return results, nil
+	if oastService != nil {
+		oastService.Flush()
+	}
+	return collector.Results(), nil
+}
+
+type resultCollector struct {
+	mu       sync.Mutex
+	order    []string
+	byID     map[string]*Result
+	onResult func(*Result)
+}
+
+func newResultCollector(onResult func(*Result)) *resultCollector {
+	return &resultCollector{
+		order:    make([]string, 0),
+		byID:     make(map[string]*Result),
+		onResult: onResult,
+	}
+}
+
+func (c *resultCollector) Emit(batch []*output.ResultEvent) {
+	for _, result := range batch {
+		if result == nil {
+			continue
+		}
+		normalizeResult(result)
+		id := result.ID()
+
+		var first *Result
+		c.mu.Lock()
+		if existing, ok := c.byID[id]; ok {
+			mergeResult(existing, result)
+		} else {
+			c.byID[id] = result
+			c.order = append(c.order, id)
+			first = result
+		}
+		c.mu.Unlock()
+
+		if first != nil && c.onResult != nil {
+			c.onResult(first)
+		}
+	}
+}
+
+func (c *resultCollector) Results() []*Result {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	results := make([]*Result, 0, len(c.order))
+	for _, id := range c.order {
+		if result := c.byID[id]; result != nil {
+			results = append(results, result)
+		}
+	}
+	return results
+}
+
+func (c *resultCollector) CountModuleResults(moduleID string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	count := 0
+	for _, result := range c.byID {
+		if result != nil && result.ModuleID == moduleID {
+			count++
+		}
+	}
+	return count
+}
+
+func normalizeResult(result *Result) {
+	if result.Type == "" {
+		result.Type = "http"
+	}
+	result.MatcherStatus = true
+	if result.Timestamp.IsZero() {
+		result.Timestamp = time.Now()
+	}
+}
+
+func mergeResult(existing, incoming *Result) {
+	existing.ExtractedResults = appendUniqueStrings(existing.ExtractedResults, incoming.ExtractedResults)
+	existing.AdditionalEvidence = appendUniqueStrings(existing.AdditionalEvidence, incoming.AdditionalEvidence)
+
+	if existing.Request == "" {
+		existing.Request = incoming.Request
+	}
+	if existing.Response == "" {
+		existing.Response = incoming.Response
+	}
+	if existing.URL == "" {
+		existing.URL = incoming.URL
+	}
+	if existing.Host == "" {
+		existing.Host = incoming.Host
+	}
+	if existing.Scheme == "" {
+		existing.Scheme = incoming.Scheme
+	}
+	if existing.IP == "" {
+		existing.IP = incoming.IP
+	}
+	if len(existing.Metadata) == 0 && len(incoming.Metadata) > 0 {
+		existing.Metadata = incoming.Metadata
+	}
+	if existing.Timestamp.IsZero() {
+		existing.Timestamp = incoming.Timestamp
+	}
+	existing.MatcherStatus = existing.MatcherStatus || incoming.MatcherStatus
+}
+
+func appendUniqueStrings(existing, incoming []string) []string {
+	if len(incoming) == 0 {
+		return existing
+	}
+	seen := make(map[string]struct{}, len(existing)+len(incoming))
+	for _, item := range existing {
+		seen[item] = struct{}{}
+	}
+	for _, item := range incoming {
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		existing = append(existing, item)
+	}
+	return existing
 }
 
 func (c *Config) ensureResponse(ctx context.Context, requester *vighttp.Requester, item *httpmsg.HttpRequestResponse) (*httpmsg.HttpRequestResponse, error) {
@@ -398,6 +540,33 @@ func (c *Config) options() *types.Options {
 	base.ScanUUID = "sdk-" + uuid.NewString()
 	base.ProjectUUID = "default"
 	return base
+}
+
+func (c *Config) oastConfig() *config.OASTConfig {
+	cfg := config.DefaultOASTConfig()
+	if c.OAST.Enabled != nil {
+		cfg.Enabled = *c.OAST.Enabled
+	}
+	if c.OAST.ServerURL != "" {
+		cfg.ServerURL = c.OAST.ServerURL
+	}
+	if c.OAST.Token != "" {
+		cfg.Token = c.OAST.Token
+	}
+	if c.OAST.PollInterval > 0 {
+		cfg.PollInterval = c.OAST.PollInterval
+	}
+	if c.OAST.GracePeriod > 0 {
+		cfg.GracePeriod = c.OAST.GracePeriod
+	}
+	if c.OAST.OastURL != "" {
+		cfg.OastURL = c.OAST.OastURL
+	}
+	if c.OAST.BlindXSSSrc != "" {
+		cfg.BlindXSSSrc = c.OAST.BlindXSSSrc
+	}
+	cfg.EnabledBlindXSS = c.OAST.EnabledBlindXSS
+	return cfg
 }
 
 func (c *Config) modules() ([]ActiveModule, []PassiveModule) {

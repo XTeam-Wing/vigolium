@@ -11,7 +11,14 @@ import (
 	"time"
 
 	"github.com/vigolium/vigolium/pkg/modules/passive/software_version_header"
+	"github.com/vigolium/vigolium/pkg/output"
+	"github.com/vigolium/vigolium/pkg/types/severity"
 )
+
+func withoutOAST() Option {
+	enabled := false
+	return WithOASTConfig(OASTConfig{Enabled: &enabled})
+}
 
 func TestRunURLReturnsJSONMarshalableResults(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -25,6 +32,7 @@ func TestRunURLReturnsJSONMarshalableResults(t *testing.T) {
 		WithPassive(true),
 		WithConcurrency(1),
 		WithMaxPerHost(1),
+		withoutOAST(),
 	)
 
 	results, err := cfg.RunURL(context.Background(), server.URL)
@@ -54,6 +62,7 @@ func TestRunURLOnResultReceivesReturnedEvents(t *testing.T) {
 	cfg := NewConfig(
 		WithPassiveModules(software_version_header.New()),
 		WithConcurrency(1),
+		withoutOAST(),
 		WithOnResult(func(r *Result) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -91,7 +100,7 @@ func TestRunRequestPreservesMethodHeadersAndBody(t *testing.T) {
 		t.Fatalf("ParseRawRequest() error = %v", err)
 	}
 
-	cfg := NewConfig(WithPassiveModules(software_version_header.New()), WithConcurrency(1), WithMaxPerHost(1))
+	cfg := NewConfig(WithPassiveModules(software_version_header.New()), WithConcurrency(1), WithMaxPerHost(1), withoutOAST())
 	results, err := cfg.RunRequest(context.Background(), rr)
 	if err != nil {
 		t.Fatalf("RunRequest() error = %v", err)
@@ -114,7 +123,7 @@ func TestRunURLContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	cfg := NewConfig(WithPassiveModules(software_version_header.New()), WithConcurrency(1))
+	cfg := NewConfig(WithPassiveModules(software_version_header.New()), WithConcurrency(1), withoutOAST())
 	results, err := cfg.RunURL(ctx, "http://127.0.0.1/")
 	if err == nil {
 		t.Fatal("RunURL() error = nil, want cancellation error")
@@ -131,5 +140,92 @@ func TestParseCurl(t *testing.T) {
 	}
 	if rr == nil {
 		t.Fatal("ParseCurl() returned nil request")
+	}
+}
+
+func TestResultCollectorDeduplicatesByResultEventID(t *testing.T) {
+	collector := newResultCollector(nil)
+	collector.Emit([]*output.ResultEvent{
+		testResult("ssrf-blind", severity.High, "http://example.test/a"),
+		testResult("ssrf-blind", severity.High, "http://example.test/a"),
+	})
+
+	results := collector.Results()
+	if len(results) != 1 {
+		t.Fatalf("collector returned %d result(s), want 1", len(results))
+	}
+}
+
+func TestResultCollectorKeepsDifferentSeverities(t *testing.T) {
+	collector := newResultCollector(nil)
+	collector.Emit([]*output.ResultEvent{
+		testResult("ssrf-blind", severity.High, "http://example.test/a"),
+		testResult("ssrf-blind", severity.Info, "http://example.test/a"),
+	})
+
+	results := collector.Results()
+	if len(results) != 2 {
+		t.Fatalf("collector returned %d result(s), want 2", len(results))
+	}
+}
+
+func TestResultCollectorMergesDuplicateEvidence(t *testing.T) {
+	collector := newResultCollector(nil)
+
+	first := testResult("ssrf-blind", severity.High, "http://example.test/a")
+	first.ExtractedResults = []string{"callback-a"}
+	first.AdditionalEvidence = []string{"evidence-a"}
+	first.Request = "GET /first HTTP/1.1"
+
+	second := testResult("ssrf-blind", severity.High, "http://example.test/a")
+	second.ExtractedResults = []string{"callback-a", "callback-b"}
+	second.AdditionalEvidence = []string{"evidence-a", "evidence-b"}
+	second.Response = "HTTP/1.1 200 OK"
+
+	collector.Emit([]*output.ResultEvent{first, second})
+
+	results := collector.Results()
+	if len(results) != 1 {
+		t.Fatalf("collector returned %d result(s), want 1", len(results))
+	}
+	got := results[0]
+	if len(got.ExtractedResults) != 2 {
+		t.Fatalf("ExtractedResults = %#v, want two unique values", got.ExtractedResults)
+	}
+	if len(got.AdditionalEvidence) != 2 {
+		t.Fatalf("AdditionalEvidence = %#v, want two unique values", got.AdditionalEvidence)
+	}
+	if got.Request != first.Request {
+		t.Fatalf("Request = %q, want first non-empty request", got.Request)
+	}
+	if got.Response != second.Response {
+		t.Fatalf("Response = %q, want first non-empty response", got.Response)
+	}
+}
+
+func TestResultCollectorOnResultOnlyReceivesUniqueFindings(t *testing.T) {
+	var callbacks int
+	collector := newResultCollector(func(*Result) {
+		callbacks++
+	})
+	collector.Emit([]*output.ResultEvent{
+		testResult("ssrf-blind", severity.High, "http://example.test/a"),
+		testResult("ssrf-blind", severity.High, "http://example.test/a"),
+		testResult("ssrf-blind", severity.Info, "http://example.test/a"),
+	})
+
+	if callbacks != 2 {
+		t.Fatalf("OnResult called %d time(s), want 2", callbacks)
+	}
+}
+
+func testResult(moduleID string, sev severity.Severity, matched string) *output.ResultEvent {
+	return &output.ResultEvent{
+		ModuleID: moduleID,
+		Info: output.Info{
+			Description: "blind SSRF callback",
+			Severity:    sev,
+		},
+		Matched: matched,
 	}
 }

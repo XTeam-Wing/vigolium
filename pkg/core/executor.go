@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	goruntime "runtime"
 	"strings"
 	"sync"
@@ -19,7 +20,6 @@ import (
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
-	"github.com/vigolium/vigolium/pkg/input/source"
 	"github.com/vigolium/vigolium/pkg/modules"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -210,7 +210,7 @@ func SuggestWorkerCount(moduleCount, maxWorkers int) int {
 // Executor orchestrates scanning with worker pool.
 type Executor struct {
 	cfg            ExecutorConfig
-	source         source.InputSource
+	source         InputSource
 	activeModules  []modules.ActiveModule
 	passiveModules []modules.PassiveModule
 	httpClient     *http.Requester
@@ -373,7 +373,7 @@ type workerPool struct {
 // NewExecutor creates a new Executor with the given configuration.
 func NewExecutor(
 	cfg ExecutorConfig,
-	src source.InputSource,
+	src InputSource,
 	activeModules []modules.ActiveModule,
 	passiveModules []modules.PassiveModule,
 ) *Executor {
@@ -869,7 +869,7 @@ func (e *Executor) feedItems(ctx context.Context, itemCh chan<- *work.WorkItem) 
 
 		item, err := e.source.Next(ctx)
 		if err != nil {
-			if source.IsEOF(err) {
+			if errors.Is(err, io.EOF) {
 				return
 			}
 			if ctx.Err() != nil {
@@ -1758,8 +1758,11 @@ func (f *moduleFilter) allows(moduleID string) bool {
 }
 
 // getKnownTotal returns the total count from source if known, otherwise 0.
-func getKnownTotal(src source.InputSource) int64 {
-	return source.GetTotal(src)
+func getKnownTotal(src InputSource) int64 {
+	if c, ok := src.(CountableInputSource); ok {
+		return c.Count()
+	}
+	return 0
 }
 
 // getHeaderValue extracts the first matching header value by name (case-insensitive).

@@ -454,8 +454,8 @@ func normalizeResult(result *Result) {
 }
 
 func mergeResult(existing, incoming *Result) {
-	existing.ExtractedResults = appendUniqueStrings(existing.ExtractedResults, incoming.ExtractedResults)
-	existing.AdditionalEvidence = appendUniqueStrings(existing.AdditionalEvidence, incoming.AdditionalEvidence)
+	existing.AdditionalEvidence = appendUniqueEvidence(existing.AdditionalEvidence, buildResultEvidence(existing.Request, existing.Response), buildResultEvidence(incoming.Request, incoming.Response))
+	existing.AdditionalEvidence = appendUniqueEvidence(existing.AdditionalEvidence, buildResultEvidence(existing.Request, existing.Response), incoming.AdditionalEvidence...)
 
 	if existing.Request == "" {
 		existing.Request = incoming.Request
@@ -484,15 +484,21 @@ func mergeResult(existing, incoming *Result) {
 	existing.MatcherStatus = existing.MatcherStatus || incoming.MatcherStatus
 }
 
-func appendUniqueStrings(existing, incoming []string) []string {
+func appendUniqueEvidence(existing []string, primary string, incoming ...string) []string {
 	if len(incoming) == 0 {
 		return existing
 	}
 	seen := make(map[string]struct{}, len(existing)+len(incoming))
+	if primary != "" {
+		seen[primary] = struct{}{}
+	}
 	for _, item := range existing {
 		seen[item] = struct{}{}
 	}
 	for _, item := range incoming {
+		if item == "" {
+			continue
+		}
 		if _, ok := seen[item]; ok {
 			continue
 		}
@@ -500,6 +506,13 @@ func appendUniqueStrings(existing, incoming []string) []string {
 		existing = append(existing, item)
 	}
 	return existing
+}
+
+func buildResultEvidence(request, response string) string {
+	if request == "" && response == "" {
+		return ""
+	}
+	return request + output.EvidenceSeparator + response
 }
 
 func (c *Config) ensureResponse(ctx context.Context, requester *vighttp.Requester, item *httpmsg.HttpRequestResponse) (*httpmsg.HttpRequestResponse, error) {

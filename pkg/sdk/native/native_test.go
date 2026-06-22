@@ -176,11 +176,13 @@ func TestResultCollectorMergesDuplicateEvidence(t *testing.T) {
 	first.ExtractedResults = []string{"callback-a"}
 	first.AdditionalEvidence = []string{"evidence-a"}
 	first.Request = "GET /first HTTP/1.1"
+	first.Response = "HTTP/1.1 200 OK"
 
 	second := testResult("ssrf-blind", severity.High, "http://example.test/a")
 	second.ExtractedResults = []string{"callback-a", "callback-b"}
 	second.AdditionalEvidence = []string{"evidence-a", "evidence-b"}
-	second.Response = "HTTP/1.1 200 OK"
+	second.Request = "GET /second HTTP/1.1"
+	second.Response = "HTTP/1.1 403 Forbidden"
 
 	collector.Emit([]*output.ResultEvent{first, second})
 
@@ -189,16 +191,16 @@ func TestResultCollectorMergesDuplicateEvidence(t *testing.T) {
 		t.Fatalf("collector returned %d result(s), want 1", len(results))
 	}
 	got := results[0]
-	if len(got.ExtractedResults) != 2 {
-		t.Fatalf("ExtractedResults = %#v, want two unique values", got.ExtractedResults)
+	if len(got.ExtractedResults) != 1 || got.ExtractedResults[0] != "callback-a" {
+		t.Fatalf("ExtractedResults = %#v, want survivor value only", got.ExtractedResults)
 	}
-	if len(got.AdditionalEvidence) != 2 {
-		t.Fatalf("AdditionalEvidence = %#v, want two unique values", got.AdditionalEvidence)
+	if len(got.AdditionalEvidence) != 3 {
+		t.Fatalf("AdditionalEvidence = %#v, want existing evidence, duplicate request/response, and duplicate evidence", got.AdditionalEvidence)
 	}
 	if got.Request != first.Request {
 		t.Fatalf("Request = %q, want first non-empty request", got.Request)
 	}
-	if got.Response != second.Response {
+	if got.Response != first.Response {
 		t.Fatalf("Response = %q, want first non-empty response", got.Response)
 	}
 }

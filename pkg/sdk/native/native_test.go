@@ -169,6 +169,25 @@ func TestResultCollectorKeepsDifferentSeverities(t *testing.T) {
 	}
 }
 
+func TestResultCollectorUsesURLAsMatchedWhenModuleOmitsMatched(t *testing.T) {
+	collector := newResultCollector(nil)
+	collector.Emit([]*output.ResultEvent{{
+		ModuleID: "sqli-boolean-blind",
+		Info: output.Info{
+			Severity: severity.High,
+		},
+		URL: "http://localhost:8787/user/post/id",
+	}})
+
+	results := collector.Results()
+	if len(results) != 1 {
+		t.Fatalf("collector returned %d result(s), want 1", len(results))
+	}
+	if got := results[0].Matched; got != "http://localhost:8787/user/post/id" {
+		t.Fatalf("Matched = %q, want URL", got)
+	}
+}
+
 func TestResultCollectorMergesDuplicateEvidence(t *testing.T) {
 	collector := newResultCollector(nil)
 

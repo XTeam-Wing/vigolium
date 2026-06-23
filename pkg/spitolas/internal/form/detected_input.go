@@ -15,22 +15,23 @@ type DetectedInput struct {
 	*action.FormInput
 
 	// Detection metadata
-	Name        string // name attribute (for smart detection)
-	ID          string // id attribute (for smart detection)
-	XPath       string // skeleton XPath (cached for lookup)
-	Required    bool   // Whether input is required
-	Disabled    bool   // Whether input is disabled
-	ReadOnly    bool   // Whether input is read-only
-	Multiple    bool   // For select: allows multiple selections; for file: allows multiple files
-	Pattern     string // pattern attribute (regex)
-	MinLength   int    // minlength attribute
-	MaxLength   int    // maxlength attribute
-	Min         string // min attribute (for number/date/time)
-	Max         string // max attribute (for number/date/time)
-	Step        string // step attribute (for number/range)
-	Placeholder string // placeholder attribute
-	Label       string // text from associated <label> element
-	Accept      string // accept attribute (for file inputs: MIME types or extensions)
+	Name         string // name attribute (for smart detection)
+	ID           string // id attribute (for smart detection)
+	XPath        string // skeleton XPath (cached for lookup)
+	DefaultValue string // current DOM value before crawler filling
+	Required     bool   // Whether input is required
+	Disabled     bool   // Whether input is disabled
+	ReadOnly     bool   // Whether input is read-only
+	Multiple     bool   // For select: allows multiple selections; for file: allows multiple files
+	Pattern      string // pattern attribute (regex)
+	MinLength    int    // minlength attribute
+	MaxLength    int    // maxlength attribute
+	Min          string // min attribute (for number/date/time)
+	Max          string // max attribute (for number/date/time)
+	Step         string // step attribute (for number/range)
+	Placeholder  string // placeholder attribute
+	Label        string // text from associated <label> element
+	Accept       string // accept attribute (for file inputs: MIME types or extensions)
 
 	// Hidden file input detection (Go extension)
 	Hidden       bool   // Whether input is visually hidden (display:none, hidden attr, etc.)

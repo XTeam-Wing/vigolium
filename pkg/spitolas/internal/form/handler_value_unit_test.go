@@ -127,6 +127,16 @@ func TestGetDefaultValue(t *testing.T) {
 	}
 }
 
+func TestGetValueForInputPreservesDOMDefaultValue(t *testing.T) {
+	h := newTestHandler(config.FormFillNormal)
+	d := detectedInput(action.InputTypeText, "id")
+	d.DefaultValue = "1"
+
+	if got := h.getValueForInput(d); got != "1" {
+		t.Fatalf("getValueForInput() = %q, want DOM default value 1", got)
+	}
+}
+
 func TestGenerateRandomValue(t *testing.T) {
 	h := newTestHandler(config.FormFillRandom)
 

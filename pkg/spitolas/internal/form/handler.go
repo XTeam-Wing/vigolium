@@ -102,6 +102,7 @@ func (h *Handler) DetectForms(page *browser.Page) ([]*Form, error) {
 					xpath: getSkeletonXPath(input),
 					name: input.name || '',
 					id: input.id || '',
+					value: input.value || '',
 					required: input.required,
 					disabled: input.disabled,
 					readOnly: input.readOnly,
@@ -240,6 +241,7 @@ func (h *Handler) parseInputData(data map[string]interface{}) *DetectedInput {
 	detected.Name = name
 	detected.ID = id
 	detected.XPath = xpath
+	detected.DefaultValue = getString(data, "value")
 	detected.Required = getBool(data, "required")
 	detected.Disabled = getBool(data, "disabled")
 	detected.ReadOnly = getBool(data, "readOnly")
@@ -271,6 +273,7 @@ func (h *Handler) DetectInputs(page *browser.Page) ([]*DetectedInput, error) {
 				xpath: getSkeletonXPath(input),
 				name: input.name || '',
 				id: input.id || '',
+				value: input.value || '',
 				required: input.required,
 				disabled: input.disabled,
 				readOnly: input.readOnly,
@@ -486,6 +489,7 @@ func (h *Handler) DetectAll(page *browser.Page) ([]*Form, []*DetectedInput, erro
 				xpath: getSkeletonXPath(input),
 				name: input.name || '',
 				id: input.id || '',
+				value: input.value || '',
 				required: input.required,
 				disabled: input.disabled,
 				readOnly: input.readOnly,
@@ -1021,12 +1025,18 @@ func (h *Handler) getValueForInput(input *DetectedInput) string {
 		return input.NextValue()
 	}
 
-	// 2. Constraint-aware generation from HTML5 validation attributes
+	// 2. Preserve the page's current DOM value so crawling keeps the same
+	// application state, e.g. id=1 instead of replacing it with a generic "a".
+	if input.DefaultValue != "" {
+		return input.DefaultValue
+	}
+
+	// 3. Constraint-aware generation from HTML5 validation attributes
 	if val := h.generateConstrainedValue(input); val != "" {
 		return val
 	}
 
-	// 3. Strict HTML5 typed inputs (url/tel/number/range/color/date/time) need a
+	// 4. Strict HTML5 typed inputs (url/tel/number/range/color/date/time) need a
 	// format-valid value: the name-based smart step below returns "a" for an
 	// unmatched field, which these types reject — so the form fails validation
 	// and a multi-step flow stalls. Resolve them by type first. Text/email/
@@ -1046,12 +1056,12 @@ func (h *Handler) getValueForInput(input *DetectedInput) string {
 		}
 	}
 
-	// 4. Generate random value if enabled
+	// 5. Generate random value if enabled
 	if h.config.FormFillMode == config.FormFillRandom {
 		return h.generateRandomValue(input)
 	}
 
-	// 5. Return default value based on type
+	// 6. Return default value based on type
 	return h.getDefaultValue(input)
 }
 

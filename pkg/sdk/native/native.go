@@ -326,6 +326,7 @@ func (c *Config) runRequests(ctx context.Context, items []*httpmsg.HttpRequestRe
 				if err != nil {
 					return collector.Results(), fmt.Errorf("%s passive request scan: %w", module.ID(), err)
 				}
+				annotateModuleResults(batch, module.ID())
 				emit(batch)
 			}
 			if module.ScanScopes().Has(modkit.ScanScopeHost) {
@@ -333,6 +334,7 @@ func (c *Config) runRequests(ctx context.Context, items []*httpmsg.HttpRequestRe
 				if err != nil {
 					return collector.Results(), fmt.Errorf("%s passive host scan: %w", module.ID(), err)
 				}
+				annotateModuleResults(batch, module.ID())
 				emit(batch)
 			}
 		}
@@ -349,6 +351,7 @@ func (c *Config) runRequests(ctx context.Context, items []*httpmsg.HttpRequestRe
 				if err != nil {
 					return collector.Results(), fmt.Errorf("%s active request scan: %w", module.ID(), err)
 				}
+				annotateModuleResults(batch, module.ID())
 				emit(batch)
 			}
 			if module.ScanScopes().Has(modkit.ScanScopeHost) {
@@ -356,6 +359,7 @@ func (c *Config) runRequests(ctx context.Context, items []*httpmsg.HttpRequestRe
 				if err != nil {
 					return collector.Results(), fmt.Errorf("%s active host scan: %w", module.ID(), err)
 				}
+				annotateModuleResults(batch, module.ID())
 				emit(batch)
 			}
 			if !module.ScanScopes().Has(modkit.ScanScopeInsertionPoint) {
@@ -370,6 +374,7 @@ func (c *Config) runRequests(ctx context.Context, items []*httpmsg.HttpRequestRe
 				if err != nil {
 					return collector.Results(), fmt.Errorf("%s insertion-point scan: %w", module.ID(), err)
 				}
+				annotateModuleResults(batch, module.ID())
 				emit(batch)
 				if opts.MaxFindingsPerModule > 0 && collector.CountModuleResults(module.ID()) >= opts.MaxFindingsPerModule {
 					break
@@ -423,6 +428,15 @@ func (c *resultCollector) Emit(batch []*output.ResultEvent) {
 	}
 }
 
+func annotateModuleResults(batch []*output.ResultEvent, moduleID string) {
+	for _, result := range batch {
+		if result == nil || result.ModuleID != "" {
+			continue
+		}
+		result.ModuleID = moduleID
+	}
+}
+
 func (c *resultCollector) Results() []*Result {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -452,6 +466,9 @@ func (c *resultCollector) CountModuleResults(moduleID string) int {
 func normalizeResult(result *Result) {
 	if result.Type == "" {
 		result.Type = "http"
+	}
+	if result.Matched == "" {
+		result.Matched = result.URL
 	}
 	result.MatcherStatus = true
 	if result.Timestamp.IsZero() {

@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/modules/passive/software_version_header"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
@@ -188,6 +190,32 @@ func TestResultCollectorUsesURLAsMatchedWhenModuleOmitsMatched(t *testing.T) {
 	}
 }
 
+func TestResultCollectorCompletesModuleMetadata(t *testing.T) {
+	collector := newResultCollector(nil)
+	collector.EmitModuleResults(testModule{}, []*output.ResultEvent{{URL: "http://example.test/a"}})
+
+	results := collector.Results()
+	if len(results) != 1 {
+		t.Fatalf("collector returned %d result(s), want 1", len(results))
+	}
+	got := results[0]
+	if got.ModuleID != "sqli-boolean-blind" {
+		t.Fatalf("ModuleID = %q, want module ID", got.ModuleID)
+	}
+	if got.Info.Name != "Blind SQL Injection (Boolean-Based)" {
+		t.Fatalf("Info.Name = %q, want module name", got.Info.Name)
+	}
+	if got.Info.Severity != severity.High {
+		t.Fatalf("Info.Severity = %v, want high", got.Info.Severity)
+	}
+	if got.Info.Confidence != severity.Certain {
+		t.Fatalf("Info.Confidence = %v, want certain", got.Info.Confidence)
+	}
+	if got.Matched != "http://example.test/a" {
+		t.Fatalf("Matched = %q, want URL", got.Matched)
+	}
+}
+
 func TestResultCollectorMergesDuplicateEvidence(t *testing.T) {
 	collector := newResultCollector(nil)
 
@@ -239,6 +267,21 @@ func TestResultCollectorOnResultOnlyReceivesUniqueFindings(t *testing.T) {
 		t.Fatalf("OnResult called %d time(s), want 2", callbacks)
 	}
 }
+
+type testModule struct{}
+
+func (testModule) ID() string                   { return "sqli-boolean-blind" }
+func (testModule) Name() string                 { return "Blind SQL Injection (Boolean-Based)" }
+func (testModule) Description() string          { return "boolean SQLi description" }
+func (testModule) ShortDescription() string     { return "boolean SQLi" }
+func (testModule) ConfirmationCriteria() string { return "true and false responses differ" }
+func (testModule) Severity() severity.Severity  { return severity.High }
+func (testModule) Confidence() severity.Confidence {
+	return severity.Certain
+}
+func (testModule) ScanScopes() modkit.ScanScope                 { return modkit.ScanScopeRequest }
+func (testModule) Tags() []string                               { return []string{"injection", "sqli"} }
+func (testModule) CanProcess(*httpmsg.HttpRequestResponse) bool { return true }
 
 func testResult(moduleID string, sev severity.Severity, matched string) *output.ResultEvent {
 	return &output.ResultEvent{

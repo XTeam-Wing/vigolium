@@ -20,6 +20,7 @@ import (
 	vighttp "github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/input/formats/curl"
+	"github.com/vigolium/vigolium/pkg/modules"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/oast"
 	"github.com/vigolium/vigolium/pkg/output"
@@ -33,9 +34,7 @@ type Result = output.ResultEvent
 // Built-in active modules satisfy this without importing the global module
 // registry package.
 type ActiveModule interface {
-	ID() string
-	CanProcess(*httpmsg.HttpRequestResponse) bool
-	ScanScopes() modkit.ScanScope
+	modules.Module
 	AllowedInsertionPointTypes() modkit.InsertionPointTypeSet
 	ScanPerInsertionPoint(*httpmsg.HttpRequestResponse, httpmsg.InsertionPoint, *vighttp.Requester, *modkit.ScanContext) ([]*output.ResultEvent, error)
 	ScanPerRequest(*httpmsg.HttpRequestResponse, *vighttp.Requester, *modkit.ScanContext) ([]*output.ResultEvent, error)
@@ -44,9 +43,7 @@ type ActiveModule interface {
 
 // PassiveModule is the minimal passive-module contract used by the SDK runner.
 type PassiveModule interface {
-	ID() string
-	CanProcess(*httpmsg.HttpRequestResponse) bool
-	ScanScopes() modkit.ScanScope
+	modules.Module
 	ScanPerRequest(*httpmsg.HttpRequestResponse, *modkit.ScanContext) ([]*output.ResultEvent, error)
 	ScanPerHost(*httpmsg.HttpRequestResponse, *modkit.ScanContext) ([]*output.ResultEvent, error)
 }
@@ -326,16 +323,14 @@ func (c *Config) runRequests(ctx context.Context, items []*httpmsg.HttpRequestRe
 				if err != nil {
 					return collector.Results(), fmt.Errorf("%s passive request scan: %w", module.ID(), err)
 				}
-				annotateModuleResults(batch, module.ID())
-				emit(batch)
+				collector.EmitModuleResults(module, batch)
 			}
 			if module.ScanScopes().Has(modkit.ScanScopeHost) {
 				batch, err := module.ScanPerHost(scanItem, scanCtx)
 				if err != nil {
 					return collector.Results(), fmt.Errorf("%s passive host scan: %w", module.ID(), err)
 				}
-				annotateModuleResults(batch, module.ID())
-				emit(batch)
+				collector.EmitModuleResults(module, batch)
 			}
 		}
 		points, err := scanItem.CreateInsertionPoints(true)
@@ -351,16 +346,14 @@ func (c *Config) runRequests(ctx context.Context, items []*httpmsg.HttpRequestRe
 				if err != nil {
 					return collector.Results(), fmt.Errorf("%s active request scan: %w", module.ID(), err)
 				}
-				annotateModuleResults(batch, module.ID())
-				emit(batch)
+				collector.EmitModuleResults(module, batch)
 			}
 			if module.ScanScopes().Has(modkit.ScanScopeHost) {
 				batch, err := module.ScanPerHost(scanItem, requester, scanCtx)
 				if err != nil {
 					return collector.Results(), fmt.Errorf("%s active host scan: %w", module.ID(), err)
 				}
-				annotateModuleResults(batch, module.ID())
-				emit(batch)
+				collector.EmitModuleResults(module, batch)
 			}
 			if !module.ScanScopes().Has(modkit.ScanScopeInsertionPoint) {
 				continue
@@ -374,8 +367,7 @@ func (c *Config) runRequests(ctx context.Context, items []*httpmsg.HttpRequestRe
 				if err != nil {
 					return collector.Results(), fmt.Errorf("%s insertion-point scan: %w", module.ID(), err)
 				}
-				annotateModuleResults(batch, module.ID())
-				emit(batch)
+				collector.EmitModuleResults(module, batch)
 				if opts.MaxFindingsPerModule > 0 && collector.CountModuleResults(module.ID()) >= opts.MaxFindingsPerModule {
 					break
 				}
@@ -428,12 +420,34 @@ func (c *resultCollector) Emit(batch []*output.ResultEvent) {
 	}
 }
 
-func annotateModuleResults(batch []*output.ResultEvent, moduleID string) {
+func (c *resultCollector) EmitModuleResults(module modules.Module, batch []*output.ResultEvent) {
 	for _, result := range batch {
-		if result == nil || result.ModuleID != "" {
-			continue
-		}
-		result.ModuleID = moduleID
+		completeModuleResult(result, module)
+	}
+	c.Emit(batch)
+}
+
+func completeModuleResult(result *output.ResultEvent, module modules.Module) {
+	if result == nil || module == nil {
+		return
+	}
+	if result.ModuleID == "" {
+		result.ModuleID = module.ID()
+	}
+	if result.Info.Name == "" {
+		result.Info.Name = module.Name()
+	}
+	if result.Info.Description == "" {
+		result.Info.Description = module.Description()
+	}
+	if result.Info.Severity == 0 {
+		result.Info.Severity = module.Severity()
+	}
+	if result.Info.Confidence == 0 {
+		result.Info.Confidence = module.Confidence()
+	}
+	if len(result.Info.Tags) == 0 {
+		result.Info.Tags = append([]string(nil), module.Tags()...)
 	}
 }
 

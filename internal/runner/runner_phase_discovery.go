@@ -7,6 +7,7 @@ import (
 	neturl "net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -453,6 +454,84 @@ func (r *Runner) seedCLITargets(ctx context.Context, infra *phaseInfra) error {
 	return nil
 }
 
+// spideringPhaseBudgetCap bounds how many per-target max-duration budgets the
+// whole spidering phase may consume. Each target still gets its own full
+// max-duration; the overall phase deadline is max-duration × min(targets, cap),
+// so a small target list is unaffected while a large merged list (CLI targets +
+// many in-scope DB hosts) can't blow the phase out to len(targets) × max-duration.
+const spideringPhaseBudgetCap = 8
+
+// spideringPhaseCeiling returns the overall wall-clock budget for the spidering
+// phase. Each of numTargets gets up to maxDuration, but the total is capped at
+// max-duration × min(numTargets, spideringPhaseBudgetCap). A non-positive
+// maxDuration (unlimited) or non-positive target count returns 0, meaning "no
+// ceiling" — the caller should then run without a phase deadline.
+func spideringPhaseCeiling(maxDuration time.Duration, numTargets int) time.Duration {
+	if maxDuration <= 0 || numTargets <= 0 {
+		return 0
+	}
+	return maxDuration * time.Duration(min(numTargets, spideringPhaseBudgetCap))
+}
+
+// spideringTeardownGrace is how long past a target's max-duration the watchdog
+// waits before declaring RunSpider wedged. Legitimate teardown (browser/page
+// close, record-writer drain) is bounded and quick; this only fires on a true
+// hang — e.g. an unresponsive/anti-bot browser, or a rod CDP call without a
+// bound — guaranteeing the spidering phase can never block the scan forever.
+const spideringTeardownGrace = 90 * time.Second
+
+// runWithWatchdog runs work in a goroutine and returns its result, or — if work
+// does not finish within timeout — calls onTimeout and returns that instead. The
+// work goroutine is abandoned on timeout (it leaks until it finishes on its own,
+// if ever), which is the whole point: a wedged operation can never block the
+// caller past timeout. The done channel is buffered so a late-finishing
+// abandoned worker never blocks on send. Generic + side-effect-free so it can be
+// unit-tested without a browser.
+func runWithWatchdog[T any](timeout time.Duration, work func() T, onTimeout func() T) T {
+	done := make(chan T, 1)
+	go func() { done <- work() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case v := <-done:
+		return v
+	case <-timer.C:
+		return onTimeout()
+	}
+}
+
+// runSpiderWatchdog runs spitolas.RunSpider (and closes rw) under a hard
+// watchdog: it always returns within budget + spideringTeardownGrace. If the run
+// wedges past that, it logs a full goroutine dump (so the stuck call site is
+// diagnosable) and returns an error rather than hanging the scan; the stuck run
+// and its browser are abandoned and leak until the process exits. rw is closed
+// inside the worker so a stuck close is abandoned with it, not awaited.
+func runSpiderWatchdog(ctx context.Context, cfg spitolas.SpiderConfig, rw *database.RecordWriter, budget time.Duration, target string) (*spitolas.SpiderResult, error) {
+	type outcome struct {
+		res *spitolas.SpiderResult
+		err error
+	}
+	oc := runWithWatchdog(
+		budget+spideringTeardownGrace,
+		func() outcome {
+			res, err := spitolas.RunSpider(ctx, cfg, rw)
+			rw.Close()
+			return outcome{res, err}
+		},
+		func() outcome {
+			buf := make([]byte, 1<<20)
+			n := runtime.Stack(buf, true)
+			zap.L().Error("Spidering watchdog fired — RunSpider did not return within budget+grace; abandoning the run (browser/goroutines leak until exit)",
+				zap.String("target", target),
+				zap.Duration("budget", budget),
+				zap.Duration("grace", spideringTeardownGrace))
+			zap.L().Warn("Spidering watchdog goroutine dump follows:\n" + string(buf[:n]))
+			return outcome{nil, fmt.Errorf("spidering watchdog timeout for %s (exceeded %s)", target, budget+spideringTeardownGrace)}
+		},
+	)
+	return oc.res, oc.err
+}
+
 // runSpideringPhase runs browser-based crawling using spitolas.
 // Captured traffic is stored in vigolium's HTTPRecord table via RepositoryWriter.
 // Targets are merged from CLI targets and in-scope hosts discovered by prior phases.
@@ -539,9 +618,33 @@ func (r *Runner) runSpideringPhase(ctx context.Context, infra *phaseInfra) error
 	r.printTargetDetail(r.formatTargetCounts(ctx, len(targets)))
 	r.printVerboseTargets(targets)
 
+	// Per-target budget with an overall phase ceiling. Each target still gets
+	// its own full max-duration, but the whole phase is bounded so a large
+	// merged target list (CLI targets + many in-scope DB hosts) can't make
+	// spidering run for len(targets) × max-duration. The ceiling is
+	// max-duration × min(targets, spideringPhaseBudgetCap); each per-target
+	// context derives from it, so the last target before the ceiling gets
+	// whatever budget remains and any targets beyond it are skipped (logged).
+	// phaseDeadline treats a zero ceiling (unlimited max-duration) as unbounded.
+	phaseCeiling := spideringPhaseCeiling(maxDuration, len(targets))
+	phaseCtx, phaseCancel := phaseDeadline(ctx, phaseCeiling)
+	defer phaseCancel()
+
 	var totalStates, totalActions, totalRecords int
 	var ssoHosts []string
-	for _, target := range targets {
+	var skippedTargets int
+	for i, target := range targets {
+		// Overall ceiling exhausted — skip the remaining targets rather than
+		// launching crawls against an already-expired context.
+		if phaseCtx.Err() != nil {
+			skippedTargets = len(targets) - i
+			zap.L().Warn("Spidering: phase budget ceiling reached, skipping remaining targets",
+				zap.Int("skipped", skippedTargets),
+				zap.Int("total", len(targets)),
+				zap.Duration("max_duration", maxDuration),
+				zap.Int("budget_cap", spideringPhaseBudgetCap))
+			break
+		}
 		zap.L().Info("Spidering target", zap.String("target", target))
 
 		cfg := spitolas.SpiderConfig{
@@ -572,10 +675,13 @@ func (r *Runner) runSpideringPhase(ctx context.Context, infra *phaseInfra) error
 		}
 
 		rw := database.NewRecordWriter(r.repository, database.RecordWriterConfig{})
-		timeoutCtx, cancel := context.WithTimeout(ctx, maxDuration)
-		result, err := spitolas.RunSpider(timeoutCtx, cfg, rw)
+		// Derive from phaseCtx so the per-target budget is min(max-duration,
+		// remaining phase ceiling) — the overall cap is enforced automatically.
+		// The watchdog guarantees this returns within budget+grace even if the
+		// browser/teardown wedges, so a single target can never hang the scan.
+		timeoutCtx, cancel := context.WithTimeout(phaseCtx, maxDuration)
+		result, err := runSpiderWatchdog(timeoutCtx, cfg, rw, maxDuration, target)
 		cancel()
-		rw.Close()
 
 		if err != nil {
 			zap.L().Error("Spidering failed",
@@ -657,10 +763,16 @@ func (r *Runner) runSpideringPhase(ctx context.Context, infra *phaseInfra) error
 	}
 
 	elapsed := time.Since(phaseStart)
-	r.printPhaseComplete("Spidering", fmt.Sprintf("completed — %s records, %s states, %s actions in %s",
+	completion := fmt.Sprintf("completed — %s records, %s states, %s actions in %s",
 		terminal.Orange(fmt.Sprintf("%d", totalRecords)),
 		terminal.Orange(fmt.Sprintf("%d", totalStates)),
 		terminal.Orange(fmt.Sprintf("%d", totalActions)),
-		terminal.HiPurple(fmtDuration(elapsed))))
+		terminal.HiPurple(fmtDuration(elapsed)))
+	if skippedTargets > 0 {
+		completion += fmt.Sprintf(" (%s targets skipped — phase budget ceiling of %s reached)",
+			terminal.Yellow(fmt.Sprintf("%d", skippedTargets)),
+			terminal.Yellow(fmtDuration(phaseCeiling)))
+	}
+	r.printPhaseComplete("Spidering", completion)
 	return nil
 }

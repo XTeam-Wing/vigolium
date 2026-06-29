@@ -4,6 +4,7 @@ import (
 	"fmt"
 	nethttp "net/http"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
@@ -127,14 +128,14 @@ func (m *Module) ScanPerRequest(
 	// profile. Whatever candidate it produces is the site's generic page for an
 	// unknown user; any real probe matching it is reading that same page, not a
 	// leak.
-	baseline := m.probeUserPath(ctx, httpClient, fmt.Sprintf("/user/%d", baselineProbeUID))
+	baseline := m.probeUserPath(ctx, httpClient, fmt.Sprintf("/user/%d", baselineProbeUID), strconv.Itoa(baselineProbeUID))
 
 	var rawMatches []string
 	seen := map[string]bool{}
 	var usernames []string
 	for i := 1; i <= 5; i++ {
 		path := fmt.Sprintf("/user/%d", i)
-		username := m.probeUserPath(ctx, httpClient, path)
+		username := m.probeUserPath(ctx, httpClient, path, strconv.Itoa(i))
 		if username == "" || username == baseline {
 			continue
 		}
@@ -187,8 +188,10 @@ func (m *Module) ScanPerRequest(
 // block/SSO/challenge detection first, then accepts either a canonical redirect
 // to /users/<name> (excluding Drupal's own auth routes) or a 200 profile page —
 // the latter only when the response actually looks like Drupal and its <title>
-// is not a generic error/auth title.
-func (m *Module) probeUserPath(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, path string) string {
+// is not a generic error/auth title. uid is the numeric id requested in path; a
+// redirect whose captured segment is just that id echoed back (bare or with an
+// appended extension/selectors) is self-canonicalisation, not a leaked username.
+func (m *Module) probeUserPath(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester, path, uid string) string {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return ""
@@ -224,9 +227,10 @@ func (m *Module) probeUserPath(ctx *httpmsg.HttpRequestResponse, httpClient *htt
 		location := resp.Response().Header.Get("Location")
 		if matches := usernameRegex.FindStringSubmatch(location); len(matches) > 1 {
 			username := matches[1]
-			// Drop UIDs (still numeric), Drupal's own auth routes, and any
-			// error/status-shaped segment.
-			if !isNumeric(username) && !isReservedUserRoute(username) && looksLikeUsername(username) {
+			// Drop UIDs echoed back (bare numeric, or the requested id with an
+			// appended extension/selectors like AEM's /user/1 -> /user/1.html),
+			// Drupal's own auth routes, and any error/status-shaped segment.
+			if !isNumeric(username) && !isUIDEcho(username, uid) && !isReservedUserRoute(username) && looksLikeUsername(username) {
 				return username
 			}
 		}
@@ -359,6 +363,19 @@ func looksLikeUsername(s string) bool {
 
 func isReservedUserRoute(s string) bool {
 	return reservedUserRoutes[strings.ToLower(s)]
+}
+
+// isUIDEcho reports whether the captured /user(s)/<segment> is just the
+// requested numeric uid the site canonicalised back at us — bare, or with an
+// appended file extension and/or selectors (e.g. AEM redirecting /user/1 to
+// /user/1.html, or /user/1.profile.html). That is a self-redirect, not a leaked
+// username, so it must not be mined for a name. A genuine Drupal enumeration
+// leaks a different, non-numeric username token instead.
+func isUIDEcho(captured, uid string) bool {
+	if uid == "" {
+		return false
+	}
+	return captured == uid || strings.HasPrefix(captured, uid+".")
 }
 
 func isNumeric(s string) bool {

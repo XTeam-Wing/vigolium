@@ -233,6 +233,66 @@ func TestDeduplicateFindings(t *testing.T) {
 	}
 }
 
+// TestDeduplicateFindings_SecretDetectExcluded verifies that the URL-keyed dedup
+// does NOT collapse distinct secrets the secret detector reports on one URL. A
+// client_id, client_secret, and access_token leaked in the same response share
+// (module, severity, URL) but are three separate secrets — they must all survive,
+// not get merged into one with the others buried as Additional Evidence.
+func TestDeduplicateFindings_SecretDetectExcluded(t *testing.T) {
+	db := newTestDB(t)
+	repo := NewRepository(db)
+	ctx := context.Background()
+	projectUUID := DefaultProjectUUID
+
+	const url = "http://example.com/leak.html"
+	insertSecret := func(extracted string) int64 {
+		res, err := db.ExecContext(ctx,
+			`INSERT INTO findings (project_uuid, scan_uuid, module_id, module_name,
+				finding_hash, severity, confidence, http_record_uuids, matched_at, extracted_results)
+			VALUES (?, 'scan1', 'secret-detect', 'secret-detect', ?, 'high', 'firm', '[]', ?, ?)`,
+			projectUUID, uuid.NewString(), `["`+url+`"]`, `["`+extracted+`"]`)
+		if err != nil {
+			t.Fatalf("insert secret finding: %v", err)
+		}
+		id, _ := res.LastInsertId()
+		return id
+	}
+
+	// Three distinct secrets on the same URL (same module + severity).
+	insertSecret("12345-abc.apps.googleusercontent.com")
+	insertSecret("VfJASjhImoB6IErdcHR0DLt9")
+	insertSecret("ya29.GlskBNk6_nqhfOcJHvyoIAQoAkw95ulaGbENUB")
+
+	// A different module on the same URL with duplicates still collapses, proving
+	// the exclusion is scoped to secret-detect, not a blanket no-op.
+	for i := 0; i < 3; i++ {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO findings (project_uuid, scan_uuid, module_id, module_name,
+				finding_hash, severity, confidence, http_record_uuids, matched_at)
+			VALUES (?, 'scan1', 'input-behavior-probe', 'input-behavior-probe', ?, 'info', 'firm', '[]', ?)`,
+			projectUUID, uuid.NewString(), `["`+url+`"]`); err != nil {
+			t.Fatalf("insert probe finding: %v", err)
+		}
+	}
+
+	deleted, grouped, err := repo.DeduplicateFindings(ctx, projectUUID)
+	if err != nil {
+		t.Fatalf("DeduplicateFindings: %v", err)
+	}
+	// Only the input-behavior-probe group collapses (3 → 1 = 2 deleted, 1 group).
+	if deleted != 2 || grouped != 1 {
+		t.Fatalf("expected 2 deleted / 1 grouped (probe only), got %d / %d", deleted, grouped)
+	}
+
+	var secretCount int
+	if err := db.NewRaw("SELECT COUNT(*) FROM findings WHERE module_id = 'secret-detect'").Scan(ctx, &secretCount); err != nil {
+		t.Fatalf("count secrets: %v", err)
+	}
+	if secretCount != 3 {
+		t.Fatalf("all 3 distinct secrets on one URL must survive the URL-keyed dedup, got %d", secretCount)
+	}
+}
+
 func TestDeduplicateFindings_HostScoped(t *testing.T) {
 	db := newTestDB(t)
 	repo := NewRepository(db)

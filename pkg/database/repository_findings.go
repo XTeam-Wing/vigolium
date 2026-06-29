@@ -37,7 +37,14 @@ func (r *Repository) SaveFinding(ctx context.Context, event *output.ResultEvent,
 		return fmt.Errorf("failed to convert finding: %w", err)
 	}
 
-	return r.saveFindingIDB(ctx, r.db, finding, httpRecordUUIDs)
+	inserted, err := r.saveFindingIDB(ctx, r.db, finding, httpRecordUUIDs)
+	if err != nil {
+		return err
+	}
+	if inserted {
+		r.emitFindingSaved(finding)
+	}
+	return nil
 }
 
 // SaveFindingsBatch persists a batch of findings in a single transaction,
@@ -51,6 +58,7 @@ func (r *Repository) SaveFindingsBatch(ctx context.Context, writes []FindingWrit
 	type prepared struct {
 		finding     *Finding
 		recordUUIDs []string
+		inserted    bool
 	}
 	items := make([]prepared, 0, len(writes))
 	for i := range writes {
@@ -74,14 +82,23 @@ func (r *Repository) SaveFindingsBatch(ctx context.Context, writes []FindingWrit
 	}
 
 	err := r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
-		for _, it := range items {
-			if err := r.saveFindingIDB(ctx, tx, it.finding, it.recordUUIDs); err != nil {
+		for i := range items {
+			inserted, err := r.saveFindingIDB(ctx, tx, items[i].finding, items[i].recordUUIDs)
+			if err != nil {
 				return err
 			}
+			items[i].inserted = inserted
 		}
 		return nil
 	})
 	if err == nil {
+		// Fire hooks only after the transaction commits, so a mirror never sees a
+		// finding that was rolled back.
+		for i := range items {
+			if items[i].inserted {
+				r.emitFindingSaved(items[i].finding)
+			}
+		}
 		return nil
 	}
 
@@ -89,8 +106,12 @@ func (r *Repository) SaveFindingsBatch(ctx context.Context, writes []FindingWrit
 	// doesn't sink the whole batch.
 	zap.L().Warn("SaveFindingsBatch: transaction failed, retrying findings individually", zap.Error(err))
 	var firstErr error
-	for _, it := range items {
-		if e := r.saveFindingIDB(ctx, r.db, it.finding, it.recordUUIDs); e != nil && firstErr == nil {
+	for i := range items {
+		inserted, e := r.saveFindingIDB(ctx, r.db, items[i].finding, items[i].recordUUIDs)
+		if inserted {
+			r.emitFindingSaved(items[i].finding)
+		}
+		if e != nil && firstErr == nil {
 			firstErr = e
 		}
 	}
@@ -99,8 +120,10 @@ func (r *Repository) SaveFindingsBatch(ctx context.Context, writes []FindingWrit
 
 // saveFindingIDB inserts a single finding using the given bun.IDB, which may be
 // the shared *DB (single write) or a bun.Tx (batched write). The dedup/append
-// and junction logic is identical in both cases.
-func (r *Repository) saveFindingIDB(ctx context.Context, idb bun.IDB, finding *Finding, httpRecordUUIDs []string) error {
+// and junction logic is identical in both cases. Returns inserted=true only when
+// a new finding row was written (false on a dedup-append to an existing finding),
+// so callers fire the OnFindingSaved hook exactly once per genuinely new finding.
+func (r *Repository) saveFindingIDB(ctx context.Context, idb bun.IDB, finding *Finding, httpRecordUUIDs []string) (bool, error) {
 	// Atomic dedup: INSERT with conflict resolution on finding_hash.
 	// If a duplicate hash exists, the row is silently skipped.
 	var res sql.Result
@@ -113,19 +136,19 @@ func (r *Repository) saveFindingIDB(ctx context.Context, idb bun.IDB, finding *F
 		res, err = idb.NewInsert().Model(finding).Exec(ctx)
 	}
 	if err != nil {
-		return fmt.Errorf("failed to insert finding: %w", err)
+		return false, fmt.Errorf("failed to insert finding: %w", err)
 	}
 
 	// If ON CONFLICT fired, no row was inserted — append records and evidence to existing finding
 	if finding.FindingHash != "" {
 		if n, _ := res.RowsAffected(); n == 0 {
-			return r.appendRecordsToFinding(ctx, idb, finding.ProjectUUID, finding.FindingHash, httpRecordUUIDs, buildEvidence(finding.Request, finding.Response))
+			return false, r.appendRecordsToFinding(ctx, idb, finding.ProjectUUID, finding.FindingHash, httpRecordUUIDs, buildEvidence(finding.Request, finding.Response))
 		}
 	}
 
 	r.insertFindingRecords(ctx, idb, finding.ID, httpRecordUUIDs)
 
-	return nil
+	return true, nil
 }
 
 // SaveFindingDirect inserts a pre-built Finding directly (without ResultEvent conversion).
@@ -137,7 +160,14 @@ func (r *Repository) SaveFindingDirect(ctx context.Context, finding *Finding) er
 
 	finding.ProjectUUID = defaultProjectUUID(finding.ProjectUUID)
 
-	return r.saveFindingIDB(ctx, r.db, finding, finding.HTTPRecordUUIDs)
+	inserted, err := r.saveFindingIDB(ctx, r.db, finding, finding.HTTPRecordUUIDs)
+	if err != nil {
+		return err
+	}
+	if inserted {
+		r.emitFindingSaved(finding)
+	}
+	return nil
 }
 
 // insertFindingRecords batch-inserts finding↔record junction rows in a single
@@ -377,6 +407,34 @@ func (r *Repository) UpdateFindingTriage(ctx context.Context, id int64, severity
 		return sql.ErrNoRows
 	}
 	return nil
+}
+
+// DeleteFindingByHash deletes the finding(s) with the given content hash within a
+// project, including their finding_records junction rows. Used by the OAST
+// collector to replace a weaker finding (e.g. a DNS-resolution lead) with a
+// stronger one (the HTTP-fetch confirmation) for the same callback payload, so each
+// payload yields exactly one finding reflecting the strongest evidence. No-op when
+// findingHash is empty or no such finding exists.
+func (r *Repository) DeleteFindingByHash(ctx context.Context, projectUUID, findingHash string) error {
+	if findingHash == "" {
+		return nil
+	}
+	projectUUID = defaultProjectUUID(projectUUID)
+	return r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+		// Clear the junction rows via a subquery on the same predicate, then drop the
+		// finding(s) — both are no-ops when nothing matches, so no pre-SELECT is needed.
+		if _, err := tx.NewRaw(
+			"DELETE FROM finding_records WHERE finding_id IN (SELECT id FROM findings WHERE project_uuid = ? AND finding_hash = ?)",
+			projectUUID, findingHash,
+		).Exec(ctx); err != nil {
+			return fmt.Errorf("failed to delete finding_records: %w", err)
+		}
+		if _, err := tx.NewDelete().Model((*Finding)(nil)).
+			Where("project_uuid = ? AND finding_hash = ?", projectUUID, findingHash).Exec(ctx); err != nil {
+			return fmt.Errorf("failed to delete finding: %w", err)
+		}
+		return nil
+	})
 }
 
 // DeleteFinding deletes a finding by its numeric ID, including any finding_records junction rows.

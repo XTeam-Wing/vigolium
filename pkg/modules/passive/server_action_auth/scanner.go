@@ -126,7 +126,7 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 			Info: output.Info{
 				Name:        "Server Action Missing Authorization",
 				Description: fmt.Sprintf("Next.js Server Action at %s performs %d mutation(s) without authorization checks", urlx.Path, len(mutations)),
-				Severity:    severity.High,
+				Severity:    severity.Medium,
 				Confidence:  severity.Tentative,
 				Tags:        []string{"auth", "server-action", "nextjs", "source-analysis"},
 				Reference:   []string{"https://cwe.mitre.org/data/definitions/862.html"},

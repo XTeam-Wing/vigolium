@@ -3,15 +3,48 @@ package wp_user_enum
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/pkg/modules/infra"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
 )
+
+// baselineAuthorID is an author id far beyond any plausible real account. A
+// genuine WordPress /?author=N redirect must NOT resolve to a real author slug
+// for it. Whatever slug it yields is the site's generic redirect for an unknown
+// author (catch-all / canonicalisation / SSO wall); any real probe matching it
+// is reading that same page, not a per-author leak, so it is dropped.
+const baselineAuthorID = 2147483646
+
+// reservedAuthorSlugs are WordPress' own routes / generic tokens that show up as
+// the /author/<slug> segment when the site canonicalises or auth-walls the
+// request rather than leaking a username. None is a real login slug.
+var reservedAuthorSlugs = map[string]bool{
+	"login":    true,
+	"logout":   true,
+	"register": true,
+	"wp-login": true,
+	"wp-admin": true,
+	"password": true,
+	"reset":    true,
+}
+
+// errorSlugMarkers are substrings that appear in error/auth/status redirect
+// targets, never in a real author slug. A site that answers every /?author=N
+// with a generic redirect (404/SSO/maintenance) echoes one of these, not a
+// username.
+var errorSlugMarkers = []string{
+	"404", "403", "401", "500", "502", "503",
+	"not-found", "notfound", "forbidden", "access-denied", "accessdenied",
+	"unauthorized", "error", "sign-in", "signin", "sign_in",
+	"maintenance", "unavailable", "captcha", "redirect",
+}
 
 type Module struct {
 	modkit.BaseActiveModule
@@ -71,12 +104,34 @@ func (m *Module) ScanPerRequest(
 	var results []*output.ResultEvent
 
 	// 1. Author archive enumeration: /?author=1..5
+	//
+	// Baseline control: an author id far beyond any real account must not resolve
+	// to a real author slug. Whatever it yields is the site's generic redirect for
+	// an unknown author; any real probe matching it is reading that same catch-all,
+	// not a leak.
+	baseline := m.probeAuthor(ctx, httpClient, baselineAuthorID)
+
+	var rawSlugs []string
+	seen := map[string]bool{}
 	var authorUsers []string
 	for i := 1; i <= 5; i++ {
 		username := m.probeAuthor(ctx, httpClient, i)
-		if username != "" {
+		if username == "" || username == baseline {
+			continue
+		}
+		rawSlugs = append(rawSlugs, username)
+		if !seen[username] {
+			seen[username] = true
 			authorUsers = append(authorUsers, username)
 		}
+	}
+
+	// Uniformity guard: genuine enumeration leaks a different slug per author id.
+	// Multiple ids collapsing to a single value means one generic redirect was
+	// echoed for every /?author=N (a single existing account legitimately yields
+	// one match from one probe, so this only trips on 2+ identical hits).
+	if len(rawSlugs) >= 2 && len(authorUsers) == 1 {
+		authorUsers = nil
 	}
 
 	if len(authorUsers) > 0 {
@@ -147,21 +202,80 @@ func (m *Module) probeAuthor(ctx *httpmsg.HttpRequestResponse, httpClient *http.
 		return ""
 	}
 
+	// A WAF/CDN challenge, auth gate, rate-limit, or maintenance page is the edge
+	// talking, not WordPress leaking an author archive — skip it before extracting
+	// anything.
+	if infra.IsBlockedResponse(resp) {
+		return ""
+	}
+
 	// Check for redirect to /author/<username>/
 	status := resp.Response().StatusCode
 	if status == 301 || status == 302 {
 		location := resp.Response().Header.Get("Location")
 		if idx := strings.Index(location, "/author/"); idx >= 0 {
 			slug := location[idx+len("/author/"):]
-			slug = strings.TrimSuffix(slug, "/")
-			slug = strings.TrimSpace(slug)
-			if slug != "" && !strings.Contains(slug, "/") {
-				return slug
+			slug = strings.TrimSuffix(strings.TrimSpace(slug), "/")
+			// A trailing query/fragment is canonicalisation noise, not the slug.
+			if cut := strings.IndexAny(slug, "?#"); cut >= 0 {
+				slug = slug[:cut]
 			}
+			if slug == "" || strings.Contains(slug, "/") {
+				return ""
+			}
+			// Reject the author id echoed straight back (a bare number, or the id
+			// canonicalised with an appended extension/selector like /author/1.html),
+			// WordPress' own routes, and any error/auth/status-shaped token — none is
+			// a leaked username. A genuine leak resolves to a distinct, real slug.
+			if isNumeric(slug) || isAuthorIDEcho(slug, authorID) || isReservedAuthorSlug(slug) || !looksLikeUsername(slug) {
+				return ""
+			}
+			return slug
 		}
 	}
 
 	return ""
+}
+
+// isAuthorIDEcho reports whether the /author/<slug> segment is just the requested
+// author id echoed back — bare, or canonicalised with an appended file extension
+// or selectors (e.g. /author/1 -> /author/1.html). That is a self-redirect, not
+// a username leak.
+func isAuthorIDEcho(slug string, authorID int) bool {
+	id := strconv.Itoa(authorID)
+	return slug == id || strings.HasPrefix(slug, id+".")
+}
+
+// isReservedAuthorSlug reports whether the slug is one of WordPress' own routes
+// rather than a username.
+func isReservedAuthorSlug(s string) bool {
+	return reservedAuthorSlugs[strings.ToLower(s)]
+}
+
+// looksLikeUsername rejects slugs that are empty, implausibly long, or shaped
+// like an error/auth/status redirect target rather than a username.
+func looksLikeUsername(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" || len(s) > 60 {
+		return false
+	}
+	lower := strings.ToLower(s)
+	for _, marker := range errorSlugMarkers {
+		if strings.Contains(lower, marker) {
+			return false
+		}
+	}
+	return true
+}
+
+// isNumeric reports whether s is a non-empty run of digits.
+func isNumeric(s string) bool {
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 
 func (m *Module) probeRESTUsers(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) []string {
@@ -185,6 +299,11 @@ func (m *Module) probeRESTUsers(ctx *httpmsg.HttpRequestResponse, httpClient *ht
 	defer resp.Close()
 
 	if resp.Response() == nil || resp.Response().StatusCode != 200 {
+		return nil
+	}
+
+	// An SSO/CDN gate can answer the REST path with a 200 too — skip it.
+	if infra.IsBlockedResponse(resp) {
 		return nil
 	}
 

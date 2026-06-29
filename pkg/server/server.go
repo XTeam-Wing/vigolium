@@ -11,6 +11,7 @@ import (
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/core/services"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/fsexport"
 	vhttp "github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/metrics"
 	"github.com/vigolium/vigolium/pkg/queue"
@@ -36,6 +37,7 @@ type Server struct {
 	queue           queue.Queue
 	db              *database.DB
 	repo            *database.Repository
+	fsMirror        *fsexport.Mirror // live --mirror-fs filesystem mirror (nil when disabled)
 }
 
 // NewServer creates a new HTTP API server.
@@ -106,6 +108,25 @@ func NewServer(cfg ServerConfig, q queue.Queue, db *database.DB, repo *database.
 		queue:        q,
 		db:           db,
 		repo:         repo,
+	}
+
+	// --mirror-fs: mirror every saved record + finding to a live filesystem tree
+	// in addition to the database. Wired via the repository's save callbacks, so
+	// it covers all ingestion paths (handlers, ingest-proxy, scan-on-receive)
+	// uniformly. Best-effort: a setup failure logs and leaves the DB untouched.
+	if cfg.MirrorFSPath != "" && repo != nil {
+		// omitResponse=false: always mirror a response when the record has one
+		// (records without a response simply skip the .resp.* files).
+		mirror, err := fsexport.NewMirror(config.ExpandPath(cfg.MirrorFSPath), false)
+		if err != nil {
+			zap.L().Warn("Failed to start --mirror-fs filesystem mirror; continuing without it",
+				zap.String("path", cfg.MirrorFSPath), zap.Error(err))
+		} else {
+			s.fsMirror = mirror
+			repo.OnRecordSaved = mirror.OnRecord
+			repo.OnFindingSaved = mirror.OnFinding
+			zap.L().Info("Filesystem mirror enabled", zap.String("path", cfg.MirrorFSPath))
+		}
 	}
 
 	// Create config watcher for hot reload. Watch the same file the server
@@ -242,6 +263,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// Flush remaining buffered records before closing
 	if s.recordWriter != nil {
 		s.recordWriter.Close()
+	}
+
+	// Drain and flush the filesystem mirror AFTER the record writer flush, so the
+	// final batch of saved records reaches their callbacks (and thus the mirror)
+	// before we wait for the mirror's writer goroutine to finish.
+	if s.fsMirror != nil {
+		s.fsMirror.Close()
 	}
 
 	// Honor the caller's deadline: ShutdownWithContext force-closes any

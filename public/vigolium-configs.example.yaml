@@ -60,6 +60,12 @@ server:
   # Leave empty to omit from the response.
   license: "open-source"
 
+  # Mirror every ingested HTTP record and finding to a flat filesystem tree
+  # under this directory (<dir>/traffic, <dir>/findings) as they are saved, in
+  # addition to the database — so an external agent can read live traffic as
+  # files with ls/grep/jq. Same as the --mirror-fs flag. Empty = disabled.
+  mirror_fs_path: ""
+
 # ============================================================================
 # Database Configuration
 # ============================================================================
@@ -333,9 +339,9 @@ scanning_strategy:
 #   4. Built-in defaults
 scanning_pace:
   ## Common defaults (inherited by all phases unless overridden)
-  concurrency: 50        # Worker/thread count
+  concurrency: 40        # Worker/thread count
   rate_limit: 100        # Requests/sec (applies to KnownIssueScan currently)
-  max_per_host: 50        # Per-host concurrency cap
+  max_per_host: 40        # Per-host concurrency cap
   max_duration: 1h       # Base duration for all phases (per-phase factors scale this)
   # NOTE: the --scanning-max-duration CLI flag additionally caps TOTAL scan
   # wall-clock time (all phases combined) at the value passed, so multi-phase

@@ -55,6 +55,10 @@ type serverOptions struct {
 	// Output
 	Output string
 
+	// MirrorFS, when set, mirrors ingested traffic + findings to this directory
+	// as a live filesystem tree (in addition to the database).
+	MirrorFS string
+
 	// Catchup scan
 	CatchupThreads int
 	DisableCatchup bool
@@ -119,6 +123,8 @@ func init() {
 
 	// Output group
 	flags.StringVarP(&serverOpts.Output, "output", "o", "", "Write findings to specified output file")
+	flags.StringVar(&serverOpts.MirrorFS, "mirror-fs", "",
+		"Mirror ingested traffic + findings to a live flat filesystem tree under this dir (<dir>/traffic, <dir>/findings), in addition to the database — readable by an external agent with ls/grep/jq")
 
 	// Scan-on-receive group (runServerCmd reads these globals)
 	flags.BoolVarP(&globalScanOnReceive, "scan-on-receive", "S", false,
@@ -452,6 +458,7 @@ func runServerCmd(cmd *cobra.Command, args []string) error {
 		ViewOnly:             serverOpts.ViewOnly,
 		DemoOnly:             serverOpts.DemoOnly,
 		License:              settings.Server.License,
+		MirrorFSPath:         firstNonEmptyString(serverOpts.MirrorFS, settings.Server.MirrorFSPath),
 		AgentHeavyMax:        settings.Server.AgentHeavyMax,
 		AgentLightMax:        settings.Server.AgentLightMax,
 		AgentQueueTimeout:    parseAgentQueueTimeout(settings.Server.AgentQueueTimeout),

@@ -9,6 +9,31 @@ import (
 // Repository handles HTTP record and finding storage
 type Repository struct {
 	db *DB
+
+	// OnRecordSaved, when non-nil, is invoked with each newly inserted HTTP
+	// record (deduplicated saves and dedup hits do NOT fire). OnFindingSaved is
+	// the equivalent for newly inserted findings (a dedup-append to an existing
+	// finding does not fire). Both run synchronously on the save goroutine, so
+	// implementations must be fast and non-blocking (e.g. enqueue and return).
+	// Used by the server's --mirror-fs filesystem mirror; left nil elsewhere, so
+	// CLI scans and other repo users are unaffected.
+	OnRecordSaved  func(*HTTPRecord)
+	OnFindingSaved func(*Finding)
+}
+
+// emitRecordSaved fires the OnRecordSaved hook when set. Centralized so every
+// record-insert path notifies the same way without repeating the nil check.
+func (r *Repository) emitRecordSaved(rec *HTTPRecord) {
+	if r.OnRecordSaved != nil {
+		r.OnRecordSaved(rec)
+	}
+}
+
+// emitFindingSaved fires the OnFindingSaved hook when set.
+func (r *Repository) emitFindingSaved(f *Finding) {
+	if r.OnFindingSaved != nil {
+		r.OnFindingSaved(f)
+	}
 }
 
 // ErrScanProjectMismatch is returned by CreateScan / CreateAgenticScan when

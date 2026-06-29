@@ -16,7 +16,7 @@ var (
 **Fix:** Treat Authorization values as secrets: keep them out of logs, caches, and URLs, send only over TLS, scope and expire tokens, and rotate exposed credentials.`
 
 	ModuleConfirmation = "Confirmed when a request carries an Authorization header with a real credential (not a bare scheme or placeholder) and the response is the application, not a WAF/CDN edge block"
-	ModuleSeverity     = severity.High
-	ModuleConfidence   = severity.Firm
+	ModuleSeverity     = severity.Medium
+	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"authentication", "info-disclosure", "light"}
 )

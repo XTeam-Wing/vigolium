@@ -16,7 +16,7 @@ var (
 **Fix:** Enforce an explicit auth check at the start of every state-changing Server Action, not just UI or middleware.`
 
 	ModuleConfirmation = "Confirmed when a Server Action contains mutation operations but no authorization checks"
-	ModuleSeverity     = severity.High
+	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"nextjs", "javascript", "authentication", "light"}
 )

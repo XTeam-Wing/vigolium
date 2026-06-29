@@ -239,23 +239,25 @@ func (m *Module) ScanPerRequest(
 
 				// The oracle — the two sound path-normalization signals:
 				//
-				//   accessUnlock  the clean original path does NOT reach a
-				//                 resource (4xx/5xx/3xx) but the traversal-bearing
-				//                 path reaches a 2xx resource. The payload unlocked
-				//                 access to something the clean URL cannot reach.
+				//   accessUnlock  the clean original path is refused by a STABLE
+				//                 access-control / routing decision (401/403/404)
+				//                 but the traversal-bearing path reaches a 2xx
+				//                 resource. A transient infrastructure response on
+				//                 the clean path (429 rate limit, 503, 5xx, or a 3xx
+				//                 canonicalization redirect) is NOT a denial — the
+				//                 motivating false positive was a rate-limited (429)
+				//                 clean path read as "the traversal unlocked access"
+				//                 when the payload merely resolved to the public
+				//                 site root.
 				//
 				//   differential  both the clean path and the traversal-bearing
 				//                 path reach 2xx, but the traversal response is a
 				//                 materially different resource than the clean
 				//                 baseline (substantial body delta).
 				//
-				// This replaces the old "over-traversal 400 / clean path 200"
-				// oracle, which fired on the normal behaviour of any host that
-				// rejects malformed suffixes and serves the canonical path.
 				// accessUnlock requires a successful baseline probe — a failed
-				// baseline fetch (status 0) must not be read as "the clean path
-				// cannot reach the resource".
-				accessUnlock := baseline.ok && !isResourceReached(baseline.status)
+				// baseline fetch (status 0) is excluded by isAccessDenialStatus.
+				accessUnlock := baseline.ok && isAccessDenialStatus(baseline.status)
 				differential := isResourceReached(baseline.status) &&
 					modkit.HasSubstantialBodyDifference(backedSig, baselineSig)
 				if !accessUnlock && !differential {
@@ -269,6 +271,32 @@ func (m *Module) ScanPerRequest(
 				if !confirm.ok || !isResourceReached(confirm.status) ||
 					!modkit.RatioSimilar(backedSig, modkit.NewResponseSignature(confirm.status, confirm.body, "")) {
 					continue
+				}
+
+				// Root-resolution guard — the dominant false positive. An upward
+				// `../`-family traversal that does not over-shoot simply normalizes
+				// to the site ROOT and returns the public homepage; reaching it is
+				// not a bypass. The initial root reference (captured once above) can
+				// be poisoned by a transient block — the very rate-limiting that
+				// produced the accessUnlock noise — so re-fetch root fresh (cache
+				// bypassed) and drop the finding when:
+				//   - the backed-off resource matches the fresh root (it IS the
+				//     public homepage), or
+				//   - root cannot be established because of a transient block, so
+				//     "resolved to root" cannot be ruled out and a High finding
+				//     must not ride on an unverifiable reference.
+				// A stable access-denial root (401/403/404) is left to proceed: the
+				// homepage is not public there, so reaching a 2xx via traversal is a
+				// genuinely distinct resource.
+				if originalPath != "/" {
+					freshRoot := m.probePath(rawRequest, "/", httpService, httpClient, true)
+					if isTransientBlock(freshRoot) {
+						continue
+					}
+					if freshRoot.ok && isResourceReached(freshRoot.status) &&
+						modkit.RatioSimilar(backedSig, modkit.NewResponseSignature(freshRoot.status, freshRoot.body, "")) {
+						continue
+					}
 				}
 
 				ev := m.buildFinding(urlx, payload, fuzzedPath, backedOffPath, baseline, fuzz, backed, confirm, accessUnlock)
@@ -347,7 +375,11 @@ func (m *Module) buildFinding(
 		},
 		URL:                vulnURLString,
 		Host:               urlx.Host,
-		Matched:            backedOffPath,
+		// Matched is the location the console/grouping renders (MatchedURL prefers
+		// it over URL); use the full absolute URL so the live finding line shows
+		// the target host, matching every other active module. The bare path is
+		// still surfaced via ExtractedResults for the trailing [.../] annotation.
+		Matched:            vulnURLString,
 		Request:            backed.requestRaw,
 		Response:           truncateBody(backed.body),
 		AdditionalEvidence: evidence,
@@ -368,6 +400,36 @@ func probeEvidence(label string, p pathProbe) string {
 // or server-error (500) response.
 func isResourceReached(status int) bool {
 	return status >= 200 && status < 300
+}
+
+// isAccessDenialStatus reports whether status is a STABLE access-control or
+// routing denial — the only clean-baseline states for which "clean path refused,
+// traversal-bearing path served" is a meaningful normalization bypass (the
+// accessUnlock oracle). Transient infrastructure responses (429 rate limit, 503
+// maintenance, 5xx server errors) and 3xx canonicalization redirects are
+// deliberately excluded: the motivating false positive was a rate-limited (429)
+// clean path read as "the traversal unlocked access" when the payload merely
+// resolved to the public site root.
+func isAccessDenialStatus(status int) bool {
+	switch status {
+	case 401, 403, 404:
+		return true
+	}
+	return false
+}
+
+// isTransientBlock reports whether a probe failed for a transient infrastructure
+// reason — a rate limit (429), maintenance/unavailable (503), or a WAF/CDN
+// challenge interstitial (which infra.IsBlockedResponse flags even on a 200/202)
+// — as opposed to a stable access-control decision (401/403). A transient block
+// on a REFERENCE probe (root) poisons the oracle's comparisons, so a finding that
+// depends on it must be dropped rather than emitted on noise.
+func isTransientBlock(p pathProbe) bool {
+	switch p.status {
+	case 429, 503:
+		return true
+	}
+	return p.blocked && p.status != 401 && p.status != 403
 }
 
 // pathProbe is a single probe result: status and body (the oracle inputs) plus

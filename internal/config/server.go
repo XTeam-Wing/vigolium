@@ -18,6 +18,7 @@ type ServerConfig struct {
 	AgentLightMax      int    `yaml:"agent_light_max"`     // max concurrent light agent runs (query/chat); 0 = default 10
 	AgentQueueTimeout  string `yaml:"agent_queue_timeout"` // max wait when all agent slots busy; 0/empty = default 30s
 	License            string `yaml:"license"`             // license identifier surfaced in /server-info for UI display
+	MirrorFSPath       string `yaml:"mirror_fs_path"`      // when set, mirror ingested traffic + findings to this dir as a live filesystem tree (see --mirror-fs)
 }
 
 // DefaultServerConfig returns default server configuration

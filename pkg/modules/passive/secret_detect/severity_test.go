@@ -9,15 +9,17 @@ import (
 
 func TestSecretFindingSeverity(t *testing.T) {
 	tests := []struct {
-		name             string
-		validated        bool
-		redirect         bool
-		inHeader         bool
-		lowValueJWT      bool
-		recaptchaSiteKey bool
-		googleAPIKey     bool
-		wantSev          severity.Severity
-		wantConf         severity.Confidence
+		name                 string
+		validated            bool
+		redirect             bool
+		inHeader             bool
+		reflectedFromRequest bool
+		lowValueJWT          bool
+		recaptchaSiteKey     bool
+		googleAPIKey         bool
+		oauthClientID        bool
+		wantSev              severity.Severity
+		wantConf             severity.Confidence
 	}{
 		{
 			name:     "plain body match is High/Firm",
@@ -35,6 +37,19 @@ func TestSecretFindingSeverity(t *testing.T) {
 			inHeader: true,
 			wantSev:  severity.Low,
 			wantConf: severity.Tentative,
+		},
+		{
+			name:                 "request-URL reflection downgrades to Low/Tentative",
+			reflectedFromRequest: true,
+			wantSev:              severity.Low,
+			wantConf:             severity.Tentative,
+		},
+		{
+			name:                 "validation outranks request reflection (stays Critical)",
+			reflectedFromRequest: true,
+			validated:            true,
+			wantSev:              severity.Critical,
+			wantConf:             severity.Certain,
 		},
 		{
 			name:        "low-value JWT downgrades to Medium/Tentative",
@@ -60,6 +75,19 @@ func TestSecretFindingSeverity(t *testing.T) {
 			validated:        true,
 			wantSev:          severity.Info,
 			wantConf:         severity.Tentative,
+		},
+		{
+			name:          "OAuth client ID downgrades to Info/Tentative",
+			oauthClientID: true,
+			wantSev:       severity.Info,
+			wantConf:      severity.Tentative,
+		},
+		{
+			name:          "OAuth client ID outranks validation (public by design, stays Info)",
+			oauthClientID: true,
+			validated:     true,
+			wantSev:       severity.Info,
+			wantConf:      severity.Tentative,
 		},
 		{
 			name:         "validation outranks Google API key (stays Critical)",
@@ -100,7 +128,7 @@ func TestSecretFindingSeverity(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotSev, gotConf := SecretFindingSeverity(tt.validated, tt.redirect, tt.inHeader, tt.lowValueJWT, tt.recaptchaSiteKey, tt.googleAPIKey)
+			gotSev, gotConf := SecretFindingSeverity(tt.validated, tt.redirect, tt.inHeader, tt.reflectedFromRequest, tt.lowValueJWT, tt.recaptchaSiteKey, tt.googleAPIKey, tt.oauthClientID)
 			if gotSev != tt.wantSev {
 				t.Errorf("severity = %v, want %v", gotSev, tt.wantSev)
 			}
@@ -175,6 +203,67 @@ func TestSnippetInHeaderValues(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := SnippetInHeaderValues(tt.snippet, tt.blob); got != tt.want {
 				t.Errorf("SnippetInHeaderValues(%q, ...) = %v, want %v", tt.snippet, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSnippetReflectedFromRequest(t *testing.T) {
+	// The real Cloudflare Access SSO case: the app id sits in the verify-code
+	// URL path and is reflected into the login page body, where a generic
+	// Cloudflare-token rule matches it.
+	const appID = "abc84c1452a446328be5a8141b812b7f-ambarvale"
+	const ssoURL = "https://roche-code.cloudflareaccess.com/cdn-cgi/access/verify-code/" + appID + "-p.pages.roche.com?kid=46de"
+	const ssoRequest = "GET /cdn-cgi/access/verify-code/" + appID + "-p.pages.roche.com HTTP/1.1\r\nHost: roche-code.cloudflareaccess.com\r\n\r\n"
+
+	tests := []struct {
+		name       string
+		snippet    string
+		requestURL string
+		rawRequest string
+		want       bool
+	}{
+		{
+			name:       "app id reflected from request URL",
+			snippet:    appID,
+			requestURL: ssoURL,
+			want:       true,
+		},
+		{
+			name:       "value reflected from raw request only",
+			snippet:    appID,
+			rawRequest: ssoRequest,
+			want:       true,
+		},
+		{
+			name:       "snippet with surrounding whitespace still matches",
+			snippet:    "  " + appID + "  ",
+			requestURL: ssoURL,
+			want:       true,
+		},
+		{
+			name:       "genuine server secret absent from the request is not a reflection",
+			snippet:    "AKIAIOSFODNN7EXAMPLE",
+			requestURL: ssoURL,
+			rawRequest: ssoRequest,
+			want:       false,
+		},
+		{
+			name:    "blank snippet never matches",
+			snippet: "   ",
+			want:    false,
+		},
+		{
+			name:    "empty request never matches",
+			snippet: appID,
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := SnippetReflectedFromRequest(tt.snippet, tt.requestURL, tt.rawRequest); got != tt.want {
+				t.Errorf("SnippetReflectedFromRequest(%q, ...) = %v, want %v", tt.snippet, got, tt.want)
 			}
 		})
 	}

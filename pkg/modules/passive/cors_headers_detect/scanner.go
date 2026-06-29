@@ -3,6 +3,7 @@ package cors_headers_detect
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"go.uber.org/zap"
@@ -39,6 +40,23 @@ func New() *Module {
 	}
 	m.ModuleTags = ModuleTags
 	return m
+}
+
+// reflectsCrossOrigin reports whether the response's Access-Control-Allow-Origin
+// echoes the request's Origin header (proving dynamic reflection rather than a
+// static allow-list entry) AND that reflected origin is cross-origin to the
+// target host. A same-origin reflection, an absent Origin, or an ACAO that does
+// not match the sent Origin is not a credentials exposure and must not be flagged.
+func reflectsCrossOrigin(reqOrigin, acao, targetHost string) bool {
+	reqOrigin = strings.TrimSpace(reqOrigin)
+	if reqOrigin == "" || !strings.EqualFold(reqOrigin, strings.TrimSpace(acao)) {
+		return false
+	}
+	o, err := url.Parse(reqOrigin)
+	if err != nil || o.Hostname() == "" {
+		return false
+	}
+	return !strings.EqualFold(o.Hostname(), targetHost)
 }
 
 // ScanPerRequest analyzes response for permissive CORS headers.
@@ -86,9 +104,19 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 		issues = append(issues, "Null origin accepted in Access-Control-Allow-Origin")
 	}
 
-	// Credentials enabled (even without wildcard, worth noting)
-	if strings.EqualFold(acac, "true") && acao != "*" {
-		issues = append(issues, fmt.Sprintf("Credentials enabled for origin: %s", acao))
+	// Credentials enabled alongside a specific (non-wildcard, non-null) origin is
+	// only a real exposure when the server REFLECTS an arbitrary cross-origin
+	// Origin back. A fixed allow-list entry — or a site echoing its OWN origin —
+	// paired with credentials is the normal, safe pattern, so passively we require
+	// the response to echo the request's Origin AND that origin to be cross-origin
+	// to the target host. (The active cors_misconfiguration module probes with an
+	// evil Origin and is what proves true reflection.) This drops the false
+	// positive where a site reflects its own origin with credentials, e.g. a
+	// Cloudflare RUM telemetry beacon whose ACAO is its own host.
+	if strings.EqualFold(acac, "true") && acao != "*" && !strings.EqualFold(acao, "null") {
+		if reflectsCrossOrigin(ctx.Request().Header("Origin"), acao, urlx.Hostname()) {
+			issues = append(issues, fmt.Sprintf("Credentials enabled for reflected cross-origin: %s", acao))
+		}
 	}
 
 	if len(issues) == 0 {

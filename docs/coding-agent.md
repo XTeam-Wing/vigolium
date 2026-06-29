@@ -180,6 +180,50 @@ vigolium module --json                   # machine-readable module catalog
 vigolium doctor --json                   # environment readiness
 ```
 
+## Export a browsable filesystem tree (`--format fs`)
+
+When you'd rather `ls`/`grep`/`jq` a scan than query a DB, export a flat tree.
+Works on `export`, `db export`, and any scan (`scan`/`scan-url`/`scan-request`/`run`).
+
+```bash
+vigolium export --format fs -o run            # whole DB → run-traffic/ + run-findings/
+vigolium scan-url https://t/ -S --format fs -o run   # straight from a scan
+```
+
+Layout (two sibling dirs off the `-o` base; defaults to `vigolium` in the cwd):
+
+```
+run-traffic/
+  index.json                 # [{id,host,path,method,url,status,content_type,bytes,finding}, …]
+  <host>/0001.req            # "@target https://<host>" + the raw request (replayable)
+  <host>/0001.resp.headers   # status line + response headers
+  <host>/0001.resp.body      # response body, gzip-decoded so it greps clean
+run-findings/
+  index.json                 # [{id,host,path,severity,confidence,module,title,url,traffic}, …]
+  <host>/0001.md             # the finding, cross-linked to ../../run-traffic/<host>/0001.req
+```
+
+`index.json` is the entry point — one `jq` over it maps every id to its url/status
+and to the file that holds the bytes, so you never guess paths. The `finding` field
+on a traffic row is the top severity of any finding touching that request, and each
+finding `.md` links straight to the `.req`/`.resp.*` that proves it. `--omit-response`
+drops the `.resp.*` files; `--split-by-host` is a no-op (fs already splits by host).
+
+### Live mirror from the ingestion server
+
+To watch traffic land as files while another tool (Burp, a proxy, `vigolium ingest`)
+feeds the server, run the server with a mirror dir:
+
+```bash
+vigolium server --mirror-fs ./mirror     # also: config server.mirror_fs_path
+```
+
+Every ingested record and finding is written to `./mirror/traffic/<host>/…` and
+`./mirror/findings/<host>/…` as it's saved to the DB. Same layout as `--format fs`,
+except the indexes are append-only **`index.jsonl`** (one object per line — tail/grep
+it live) and per-host ids resume across server restarts. Point your agent at `./mirror`
+and let it `jq`/`grep` the growing tree.
+
 ## Gotchas
 
 - `-S` means `--stateless` on `scan` but `--scan-on-receive` on `ingest`.

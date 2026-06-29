@@ -83,6 +83,13 @@ func (pc *ParallelCrawler) RunParallel(ctx context.Context) (*Result, error) {
 		pc.mu.Unlock()
 	}()
 
+	// Bind the crawl context to every pooled browser so the deadline reaches
+	// rod's per-operation timeouts (see Crawler.Run / Browser.crawlCtx). Must
+	// run before any consumer creates a page.
+	if pc.browserPool != nil {
+		pc.browserPool.SetCrawlContext(ctx)
+	}
+
 	// Initialize index state
 	if err := pc.initializeIndexState(ctx); err != nil {
 		return nil, fmt.Errorf("failed to initialize index state: %w", err)

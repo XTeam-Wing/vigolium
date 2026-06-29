@@ -238,6 +238,116 @@ func TestScanPerRequest_NoFalsePositiveDegenerateBackoff(t *testing.T) {
 	assert.Empty(t, res, "rejecting traversal suffixes with 400 while serving the clean path with 200 is not a bypass")
 }
 
+// rateLimitedBaselineHandler reproduces the reported false positive
+// (roch-business.gxs.com.sg): a Webflow-style CDN where an upward `..//`
+// traversal normalizes to the public homepage, the over-traversed path
+// overshoots the root and is rejected (400), and the clean path / root / a
+// non-existent sibling are all transiently RATE-LIMITED (429) during the scan.
+// The old accessUnlock oracle read "clean path 429 (not 2xx) / traversal 200" as
+// "the traversal unlocked access", reporting High. A 429 is a transient rate
+// limit, not an access-control denial, so no bypass exists.
+func rateLimitedBaselineHandler() http.HandlerFunc {
+	home := "<html><body>" + strings.Repeat("public homepage marketing content here ", 60) + "</body></html>"
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch n := strings.Count(r.URL.RequestURI(), "..//"); {
+		case n >= 2:
+			// Over-traversed: overshoots the root, rejected as malformed.
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte("bad request"))
+		case n == 1:
+			// Backed-off traversal normalizes to the public homepage.
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(home))
+		default:
+			// Clean path, root, and non-existent probes are all rate-limited.
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("429 too many requests"))
+		}
+	}
+}
+
+// TestScanPerRequest_NoFalsePositiveRateLimitedBaseline is the regression guard
+// for the rate-limited accessUnlock false positive: a clean path that returns
+// 429 must NOT be read as "access denied" so that a backed-off traversal
+// reaching 200 is reported as an unlock. A 429 is transient infrastructure, not
+// a stable access-control decision.
+func TestScanPerRequest_NoFalsePositiveRateLimitedBaseline(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(rateLimitedBaselineHandler())
+	defer srv.Close()
+
+	client := modtest.Requester(t)
+	rr := modtest.Request(t, srv.URL+"/cny2025-terms")
+
+	res, err := New().ScanPerRequest(rr, client, &modkit.ScanContext{})
+	require.NoError(t, err)
+	assert.Empty(t, res, "a rate-limited (429) clean path must not be read as an access-control denial that the traversal unlocked")
+}
+
+// resolvesToRootHandler reproduces the differential variant of the same false
+// positive, where the clean baseline is a real 200 page but the upward `..//`
+// traversal normalizes to the public homepage (a materially different body, so
+// the differential oracle fires) and the ROOT reference probe is transiently
+// rate-limited on its FIRST fetch — poisoning the catch-all guard's stored root
+// signature exactly as observed in the field. A subsequent (fresh) root fetch
+// returns the homepage, so the backed-off resource is provably just the public
+// root. No bypass exists.
+func resolvesToRootHandler() http.HandlerFunc {
+	home := "<html><body>" + strings.Repeat("public homepage marketing content here ", 60) + "</body></html>"
+	contact := "<html><body>" + strings.Repeat("contact us form distinct page ", 60) + "</body></html>"
+	var rootHits int32
+	return func(w http.ResponseWriter, r *http.Request) {
+		raw := r.URL.RequestURI()
+		switch n := strings.Count(raw, "..//"); {
+		case n >= 2:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte("bad request"))
+		case n == 1:
+			// Backed-off traversal normalizes to the public homepage.
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(home))
+		case raw == "/":
+			// Root: rate-limited on the first probe (poisons the stored
+			// reference), then serves the homepage on the fresh re-fetch.
+			if atomic.AddInt32(&rootHits, 1) == 1 {
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte("429 too many requests"))
+				return
+			}
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(home))
+		case strings.Contains(raw, "nonexistent"):
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("<html><body>404 not found</body></html>"))
+		default:
+			// The clean baseline is a real, distinct 200 page.
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(contact))
+		}
+	}
+}
+
+// TestScanPerRequest_NoFalsePositiveResolvesToRoot is the regression guard for
+// the differential/catch-all variant: even when the initial root reference is
+// poisoned by a transient 429, the fresh root re-fetch must recognise the
+// backed-off resource as the public homepage and drop the finding.
+func TestScanPerRequest_NoFalsePositiveResolvesToRoot(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(resolvesToRootHandler())
+	defer srv.Close()
+
+	client := modtest.Requester(t)
+	rr := modtest.Request(t, srv.URL+"/contact")
+
+	res, err := New().ScanPerRequest(rr, client, &modkit.ScanContext{})
+	require.NoError(t, err)
+	assert.Empty(t, res, "an upward traversal that normalizes to the public homepage must not be reported, even when the initial root reference was rate-limited")
+}
+
 // TestScanPerRequest_NoFalsePositive ensures a host that returns a uniform
 // response for every path (no normalization divergence) yields no finding.
 func TestScanPerRequest_NoFalsePositive(t *testing.T) {

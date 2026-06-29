@@ -164,9 +164,11 @@ func (r *Runner) runTargetedReSpiderPhase(ctx context.Context, infra *phaseInfra
 
 		rw := database.NewRecordWriter(r.repository, database.RecordWriterConfig{})
 		seedCtx, cancel := context.WithTimeout(stepCtx, rcfg.PerSeedDuration())
-		result, rerr := spitolas.RunSpider(seedCtx, cfg, rw)
+		// Same hang-proofing as the discovery spidering phase: the watchdog bounds
+		// RunSpider + the rw.Close teardown so a wedged browser on one seed can't
+		// hang the re-spider phase forever.
+		result, rerr := runSpiderWatchdog(seedCtx, cfg, rw, rcfg.PerSeedDuration(), s.url)
 		cancel()
-		rw.Close()
 		if rerr != nil {
 			zap.L().Warn("Re-spider: crawl failed", zap.String("seed", s.url), zap.Error(rerr))
 			continue

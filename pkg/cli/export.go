@@ -48,7 +48,7 @@ The --format bundle (alias gz) emits a .tar.gz archive containing export.jsonl, 
 
 func init() {
 	rootCmd.AddCommand(exportCmd)
-	exportCmd.Flags().StringVar(&topExportFormat, "format", "jsonl", "Export format: html, report, pdf, jsonl, markdown (alias: md), bundle (alias: gz)")
+	exportCmd.Flags().StringVar(&topExportFormat, "format", "jsonl", "Export format: html, report, pdf, jsonl, markdown (alias: md), bundle (alias: gz), fs (flat request/response + finding tree)")
 	exportCmd.Flags().StringVarP(&topExportOutput, "output", "o", "", "Output file path or gs://<project>/<key> URL (required for html); supports {ts} and {project-uuid} placeholders")
 	exportCmd.Flags().StringSliceVar(&topExportOnly, "only", nil,
 		"Export only these tables (repeatable: http, findings, scans, modules, oast, source-repos, scopes)")
@@ -123,6 +123,13 @@ func runExportCmd(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// fs writes a directory tree (not a single file), defaults its base to the
+	// cwd when no -o is given, and isn't a gs:// upload target — so it bypasses
+	// the file-oriented output resolution below.
+	if topExportFormat == "fs" {
+		return runExportFS()
+	}
+
 	needsOutput := topExportFormat == "html" || topExportFormat == "report" || topExportFormat == "pdf" ||
 		topExportFormat == "markdown" || topExportFormat == "md" ||
 		topExportFormat == "bundle" || topExportFormat == "gz"
@@ -158,7 +165,7 @@ func runExportCmd(cmd *cobra.Command, args []string) error {
 	case "bundle", "gz":
 		dispatchErr = runExportBundle()
 	default:
-		return fmt.Errorf("unsupported format %q; valid formats: html, report, pdf, jsonl, markdown, bundle", topExportFormat)
+		return fmt.Errorf("unsupported format %q; valid formats: html, report, pdf, jsonl, markdown, bundle, fs", topExportFormat)
 	}
 	if dispatchErr != nil {
 		return dispatchErr
@@ -371,6 +378,33 @@ func printExportStats(format, outputPath string, items []any) {
 func runExportMarkdown() error {
 	gen, title, _ := reportGenerator("markdown")
 	return runExportWithGenerator("markdown", title, gen)
+}
+
+// runExportFS writes the whole DB to a flat <base>-traffic/ + <base>-findings/
+// filesystem tree (the `fs` format). Honors --search, --severity, --limit, and
+// --omit-response; defaults the base to "vigolium" in the cwd when no -o is set.
+func runExportFS() error {
+	db, err := getDB()
+	if err != nil {
+		return err
+	}
+	defer closeDatabaseOnExit()
+
+	var severities []string
+	if topExportSeverity != "" {
+		severities = strings.Split(topExportSeverity, ",")
+	}
+	filters := database.QueryFilters{
+		FuzzyTerm: topExportSearch,
+		Severity:  severities,
+		Limit:     topExportLimit,
+	}
+	stats, err := writeFSExport(context.Background(), db, filters, topExportOutput, fsExportOptions{omitResponse: topExportOmitResponse})
+	if err != nil {
+		return err
+	}
+	fsPrintSummary(stats)
+	return nil
 }
 
 // queryExportData queries all enabled tables and returns a slice of exportEnvelope

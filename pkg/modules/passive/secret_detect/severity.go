@@ -14,16 +14,23 @@ import (
 // where it appears — a confirmed live credential is serious anywhere. For
 // unvalidated matches the baseline is High/Firm, with several downgrades:
 //
-//   - A reCAPTCHA site key (recaptchaSiteKey — see IsReCaptchaSiteKey) drops to
-//     Info/Tentative. Site keys are public by design — embedded in page HTML/JS
-//     so the widget can render — so this outranks every other branch, including
-//     a (spurious) validation: a public key is never a leaked secret.
+//   - A reCAPTCHA site key (recaptchaSiteKey — see IsReCaptchaSiteKey) or a
+//     Google OAuth client ID (oauthClientID — see IsGoogleOAuthClientID) drops to
+//     Info/Tentative. Both are public by design — a reCAPTCHA site key is embedded
+//     in page HTML/JS so the widget can render, and an OAuth client ID rides in
+//     every Google sign-in button — so they outrank every other branch, including
+//     a (spurious) validation: a public identifier is never a leaked secret. The
+//     paired client *secret* is a separate match and keeps full severity.
 //
-//   - Matches that ride on a redirect (3xx) response or that appear verbatim
-//     inside a response header value drop to Low/Tentative. Those are almost
-//     always low-value reflections — e.g. an OAuth client_id / state / nonce
-//     embedded in a Location URL that merely bounces the browser to an SSO login
-//     page — rather than a genuinely leaked secret served in page content.
+//   - Matches that ride on a redirect (3xx) response, appear verbatim inside a
+//     response header value, or are reflected straight back out of the request
+//     (its URL or raw bytes — see SnippetReflectedFromRequest) drop to
+//     Low/Tentative. Those are almost always low-value reflections — e.g. an
+//     OAuth client_id / state / nonce embedded in a Location URL that merely
+//     bounces the browser to an SSO login page, or a Cloudflare Access
+//     application id in a /cdn-cgi/access/verify-code/<app-id> SSO URL echoed
+//     into the login page — rather than a genuinely leaked secret served in
+//     page content.
 //
 //   - A Google API key (googleAPIKey — see IsGoogleAPIKey) drops to Medium/Firm.
 //     The AIza… key family is routinely embedded in client-side code by design,
@@ -36,13 +43,13 @@ import (
 //     similar SSO pre-auth "meta" tokens that are embedded in login-page URLs and
 //     reflected into the page body: they decode to an unauthenticated metadata
 //     token (auth_status=NONE, no identity), not a leaked secret.
-func SecretFindingSeverity(validated, redirect, inHeader, lowValueJWT, recaptchaSiteKey, googleAPIKey bool) (severity.Severity, severity.Confidence) {
+func SecretFindingSeverity(validated, redirect, inHeader, reflectedFromRequest, lowValueJWT, recaptchaSiteKey, googleAPIKey, oauthClientID bool) (severity.Severity, severity.Confidence) {
 	switch {
-	case recaptchaSiteKey:
+	case recaptchaSiteKey, oauthClientID:
 		return severity.Info, severity.Tentative
 	case validated:
 		return severity.Critical, severity.Certain
-	case redirect || inHeader:
+	case redirect || inHeader || reflectedFromRequest:
 		return severity.Low, severity.Tentative
 	case googleAPIKey:
 		return severity.Medium, severity.Firm
@@ -87,4 +94,27 @@ func SnippetInHeaderValues(snippet, headerValues string) bool {
 		return false
 	}
 	return strings.Contains(headerValues, snippet)
+}
+
+// SnippetReflectedFromRequest reports whether the matched secret snippet appears
+// verbatim in the request that produced the response — its URL (path or query)
+// or anywhere in the raw request bytes.
+//
+// A value the client itself sent and the server merely echoed into the page is
+// a reflection of client-supplied input, not a server-held secret newly leaked
+// to the reader. The dominant case is single-sign-on login flows: a Cloudflare
+// Access application id sits in the /cdn-cgi/access/verify-code/<app-id> URL and
+// is reflected into the login page body, where a generic Cloudflare-token rule
+// matches it. The value came from the request, so the client already had it;
+// the body reflection is not a new leak, and the match is downgraded rather than
+// reported as a High-severity secret. A blank snippet never matches.
+func SnippetReflectedFromRequest(snippet, requestURL, rawRequest string) bool {
+	snippet = strings.TrimSpace(snippet)
+	if snippet == "" {
+		return false
+	}
+	if requestURL != "" && strings.Contains(requestURL, snippet) {
+		return true
+	}
+	return rawRequest != "" && strings.Contains(rawRequest, snippet)
 }

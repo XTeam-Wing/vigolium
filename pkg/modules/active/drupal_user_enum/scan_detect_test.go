@@ -145,6 +145,34 @@ func TestScanPerRequest_NoFP_ReservedRouteRedirect(t *testing.T) {
 	assert.Empty(t, res, "a redirect to a reserved /users/<route> must not be reported as a username")
 }
 
+// TestScanPerRequest_NoFP_AEMExtensionCanonicalisation reproduces the motivating
+// false positive: an AEM-fronted host (diagnostics.roche.com) that canonicalises
+// extensionless paths by 302-redirecting /user/N -> /user/N.html. The redirect
+// regex captures "N.html" for each probe — distinct per UID, so the uniformity
+// guard never trips and the baseline differs from every real probe — yet each is
+// just the requested id echoed back with a file extension, not a leaked username.
+func TestScanPerRequest_NoFP_AEMExtensionCanonicalisation(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// AEM dispatcher canonicalises /user/N to /user/N.html (and selectors),
+		// the same resource echoed back — not a profile for a named user.
+		if strings.HasPrefix(r.URL.Path, "/user/") && !strings.HasSuffix(r.URL.Path, ".html") {
+			w.Header().Set("Location", r.URL.Path+".html")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	client := modtest.Requester(t)
+	rr := modtest.Request(t, srv.URL+"/")
+
+	res, err := New().ScanPerRequest(rr, client, &modkit.ScanContext{})
+	require.NoError(t, err)
+	assert.Empty(t, res, "an AEM /user/N -> /user/N.html self-canonicalisation must not be reported as user enumeration")
+}
+
 // TestScanPerRequest_DetectsTitleVector confirms the title vector still fires when
 // the host is recognisably Drupal and leaks distinct usernames per UID.
 func TestScanPerRequest_DetectsTitleVector(t *testing.T) {

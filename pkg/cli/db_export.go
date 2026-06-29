@@ -50,7 +50,7 @@ var (
 func init() {
 	dbCmd.AddCommand(dbExportCmd)
 
-	dbExportCmd.Flags().StringVarP(&exportFormat, "format", "f", "jsonl", "Export format: jsonl, json, raw, csv, markdown, markdown-table, bundle")
+	dbExportCmd.Flags().StringVarP(&exportFormat, "format", "f", "jsonl", "Export format: jsonl, json, raw, csv, markdown, markdown-table, bundle, fs")
 	dbExportCmd.Flags().StringVarP(&exportOutput, "output", "o", "", "Output file path, defaults to stdout")
 
 	dbExportCmd.Flags().StringVar(&exportHost, "host", "", "Filter records by hostname pattern")
@@ -77,6 +77,12 @@ func runDBExport(cmd *cobra.Command, args []string) error {
 	db, err := getDB()
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	// fs writes a directory tree (filtered by the same flags), not to a single
+	// output file — handle it before opening outputFile so no stray file is made.
+	if exportFormat == "fs" {
+		return runDBExportFS(db)
 	}
 
 	// Open output file once (outside the watch loop)
@@ -185,6 +191,60 @@ func runDBExport(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("unsupported export format: %s", exportFormat)
 		}
 	})
+}
+
+// runDBExportFS writes the filtered records + findings to a flat
+// <base>-traffic/ + <base>-findings/ tree (the `fs` format). It reuses the same
+// host/method/status/path/scan/severity/date/search/limit filters as the other
+// db export formats, scoped to the active project; the base defaults to
+// "vigolium" in the cwd when no -o is given.
+func runDBExportFS(db *database.DB) error {
+	var dateFrom, dateTo *time.Time
+	if exportFrom != "" {
+		t, err := clicommon.ParseDate(exportFrom)
+		if err != nil {
+			return fmt.Errorf("invalid --from date: %w", err)
+		}
+		dateFrom = &t
+	}
+	if exportTo != "" {
+		t, err := clicommon.ParseDate(exportTo)
+		if err != nil {
+			return fmt.Errorf("invalid --to date: %w", err)
+		}
+		dateTo = &t
+	}
+
+	var severities []string
+	if exportSeverity != "" {
+		severities = strings.Split(exportSeverity, ",")
+	}
+
+	projectUUID, err := resolveProjectUUID()
+	if err != nil {
+		return err
+	}
+
+	filters := database.QueryFilters{
+		ProjectUUID: projectUUID,
+		HostPattern: exportHost,
+		Methods:     exportMethods,
+		StatusCodes: exportStatus,
+		PathPattern: exportPath,
+		ScanUUID:    exportScanUUID,
+		Severity:    severities,
+		DateFrom:    dateFrom,
+		DateTo:      dateTo,
+		FuzzyTerm:   dbSearch,
+		Limit:       exportLimit,
+		Offset:      exportOffset,
+	}
+	stats, err := writeFSExport(context.Background(), db, filters, exportOutput, fsExportOptions{omitResponse: exportRequestOnly})
+	if err != nil {
+		return err
+	}
+	fsPrintSummary(stats)
+	return nil
 }
 
 func exportJSONL(ctx context.Context, db *database.DB, records []*database.HTTPRecord, out *os.File) error {

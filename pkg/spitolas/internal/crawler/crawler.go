@@ -281,6 +281,15 @@ func (c *Crawler) Run(ctx context.Context) (*Result, error) {
 	zap.L().Debug("Browser pool created", zap.Int("size", c.config.BrowserCount))
 	defer func() { _ = pool.Close() }()
 
+	// Bind the crawl context to every page the pool creates so the deadline /
+	// cancellation reaches rod's per-operation timeouts. Without this the
+	// max-duration is only honored at Go-level loop boundaries, while in-flight
+	// browser work (navigation, WaitStable, clicks, form fills, the per-page
+	// priming steps) runs to its own fixed rod timeouts — the spider overshoots
+	// the deadline by however long the current browser operation takes to wind
+	// down. Must run before initializeIndexState creates the first page.
+	pool.SetCrawlContext(ctx)
+
 	// Create traffic capture with the configured writer
 	capture := network.New(c.writer, c.config.NoColor, c.config.Silent, c.config.Verbose, c.config.IncludeResponseBody, c.config.IncludeResponseHeaders, c.config.URL.Hostname(), "spider")
 	defer func() { _ = capture.Close() }()
@@ -1736,6 +1745,25 @@ func (c *Crawler) shouldTerminate(ctx context.Context) bool {
 		zap.L().Debug("Context cancelled, terminating")
 		return true
 	default:
+	}
+
+	// Check max duration. This is a backstop: the caller normally enforces the
+	// budget via a context deadline (which also propagates into browser ops via
+	// the bound page context), but checking elapsed time here makes MaxDuration
+	// meaningful even when the caller passes a context without a deadline, and
+	// guarantees the loop stops promptly at the boundary regardless.
+	if c.config.MaxDuration > 0 {
+		c.mu.Lock()
+		start := c.stats.StartTime
+		c.mu.Unlock()
+		if !start.IsZero() {
+			if elapsed := time.Since(start); elapsed >= c.config.MaxDuration {
+				zap.L().Debug("Max duration reached, terminating",
+					zap.Duration("elapsed", elapsed),
+					zap.Duration("max", c.config.MaxDuration))
+				return true
+			}
+		}
 	}
 
 	// Check max states

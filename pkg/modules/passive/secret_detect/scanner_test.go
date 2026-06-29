@@ -77,6 +77,34 @@ func TestCanProcess_OversizedBody(t *testing.T) {
 	assert.False(t, m.CanProcess(ctx))
 }
 
+func TestSecretDedupKey(t *testing.T) {
+	const (
+		host = "usinfo.roche.com"
+		url  = "https://usinfo.roche.com/lp/975-FPO-828/1Roche1StopV2.html"
+		rule = "kingfisher.google.6"
+		snip = "384916164796-8rgnoe66fd9992r0oi4pvuq7c086brk8.apps.googleusercontent.com"
+	)
+
+	// The same secret on the same URL collapses to one key (the dynamic-assessment
+	// passive pass and the discovery/spider passes all re-observe the same page).
+	base := SecretDedupKey(host, url, rule, snip)
+	assert.Equal(t, base, SecretDedupKey(host, url, rule, snip), "identical inputs must share a key")
+
+	// A different URL, rule, or value yields a distinct key so genuinely separate
+	// leaks are never collapsed.
+	assert.NotEqual(t, base, SecretDedupKey(host, url+"?v=2", rule, snip), "different URL must differ")
+	assert.NotEqual(t, base, SecretDedupKey(host, url, "kingfisher.google.3", snip), "different rule must differ")
+	assert.NotEqual(t, base, SecretDedupKey(host, url, rule, "VfJASjhImoB6IErdcHR0DLt9"), "different value must differ")
+	assert.NotEqual(t, base, SecretDedupKey("other.host", url, rule, snip), "different host must differ")
+
+	// The NUL separator prevents field-boundary collisions (host|url vs hostur|l).
+	assert.NotEqual(t,
+		SecretDedupKey("ab", "c", rule, snip),
+		SecretDedupKey("a", "bc", rule, snip),
+		"field boundaries must not be ambiguous",
+	)
+}
+
 func TestIsTextBasedMIME(t *testing.T) {
 	textTypes := []string{
 		"text/html",

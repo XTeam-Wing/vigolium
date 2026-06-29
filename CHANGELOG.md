@@ -2,6 +2,67 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.1.42-beta] - 2026-06-28
+
+A performance and false-positive-hardening release. The CLI gains an opt-in update check, the evaluated-math and reflected-value detectors now confirm a match tracks fresh inputs instead of a fixed substring, and a broad hot-path sweep cuts allocations and blocking work across deduplication, the database, discovery, and HTML analysis.
+
+### Added
+
+- **Startup update check (`vigolium update`)** — Vigolium now checks the npm registry at most once every 24 hours (cached in `~/.vigolium/update-check.json`, 1.5s timeout, fetched in the background) and prints a one-line upgrade notice after the run when a newer `@vigolium/vigolium` is available. The notice is suppressed for `--json`, CI, non-TTY/piped output, and the `version`/`update`/`init` commands. Set `VIGOLIUM_AUTO_UPDATE=1` to silently install the new version and re-exec the original command; set `VIGOLIUM_DISABLE_UPDATE_CHECK=1` to turn the whole thing off.
+
+### Fixed
+
+- **`reflected-ssti` and `struts-ognl-injection` confirm the evaluated result tracks fresh operands** — both detectors previously matched a single hard-coded product (`1970×2024` for SSTI; a fixed constant for OGNL) appearing anywhere in the body, which collides with incidental numbers (product ids, file sizes, timestamps). Each now re-injects the winning payload with two rounds of fresh random operands and requires the newly *computed* product to appear each time. This also repairs `struts-ognl-injection`, whose hard-coded result string (`1614244871`) didn't equal the operands it claimed (`41273×39127 = 1614888671`), so genuine detections were being silently dropped — the marker is now computed, not hardcoded.
+- **`web-cache-poisoning` confirms generic header values actually reflect** — short, common probe values such as `X-Forwarded-Port: 1337` or a scheme override matched on a single coincidental substring (an asset hash, a story id). The detector now re-injects two fresh, distinct values (a random high port, a canarized scheme token) and requires each to reflect the same way before flagging.
+
+### Performance
+
+- **Lower-contention deduplication** — `DiskSet` lookups take a read lock and escalate to a write lock only for genuinely new keys, and request hashing no longer materializes per-insertion-point body copies when body hashing is off (the default), unblocking the 60+ modules that share one dedup set.
+- **Off-hot-path database writes** — DNS resolution for saved records moved to a bounded background pool (no more ~5s blocking timeouts on the write path; IP is now best-effort metadata), record dedup collapsed from a per-record `SELECT` on each worker to one batched lookup in the flush goroutine, and a new covering index makes the scan-status severity aggregation index-only.
+- **Cheaper per-request and per-module work** — `IsMediaPath`/media-class results are memoized on the request, `GetMethod`/`GetPath` scan only the request line, the tech registry serves read queries via lock-free `Peek`, the discovery enabled-module set is memoized, and the anomaly HTML extractor shares one lazily-built DOM index across its ~18 attribute checksums instead of re-walking the tree each time. Hot-path regexes and string formatting were hoisted/precompiled throughout.
+
+## [v0.1.41-beta] - 2026-06-27
+
+A finding-deduplication and false-positive-hardening release. Out-of-band (OAST) callbacks now collapse to one finding per planted payload, the secret detector ignores build-tool content-hash maps and folds repeats of a single rule, and the path-traversal / forbidden-bypass family confirms the target isn't already reachable by a plain request.
+
+### Fixed
+
+- **OAST callbacks collapse to one finding per planted payload** — a single out-of-band payload normally triggers a burst of callbacks (DNS `A` + `AAAA`, several recursive resolvers hitting the authoritative server, then the HTTP-fetch leg), and each previously became its own finding sharing one callback host. Findings are now keyed by the callback nonce and coalesced by protocol strength: duplicate or weaker callbacks fold into the existing finding, while a strictly stronger callback (the HTTP fetch confirming an earlier DNS lead) upgrades it in place. The command-injection modules also mint a **unique OAST host per breakout variant** instead of sharing one host across all payloads, so a callback pinpoints the exact shell payload that fired.
+- **`command-injection-oast` and blind-SSRF downgrade proxy-reflected host headers** — a unique OAST host placed in `X-Forwarded-Host`, `X-Forwarded-Server`, `X-Host`, `X-Original-Host`, `X-Original-URL`, or `X-Rewrite-URL` is routinely reflected by a reverse proxy into a redirect `Location` / upstream URL that the proxy (or a redirect-following client) then fetches — an outbound request with no shell or server-side SSRF involved. A shared `isProxyReflectedHostHeader` set now downgrades both the DNS and HTTP callbacks on these headers to informational, replacing the single hard-coded `X-Forwarded-Host` check; genuine parameter-based SSRF and client-IP headers (`X-Forwarded-For`, `Referer`, `Origin`, …) stay high.
+- **`secret-detect` ignores build-tool content-hash manifests** — a new structural `IsChunkHashManifestMatch` guard recognises when a fixed-width / high-entropy rule clipped its "secret" out of a webpack/Vite/rspack chunk-hash map (a minified bundle ships dozens to hundreds of identical-shape lowercase-hex hashes). A response that genuinely leaks one short hex credential carries at most a handful of unrelated hashes, never a map of them, so the match is dropped. Wired into both the passive flush and the known-issue-scan path via the shared `IsNonSecretMatch` chain.
+- **`secret-detect` folds repeats of one rule while keeping distinct secrets apart** — a new **by-rule** grouping mode collapses findings on `(module, rule_name, severity[, host])`, so one Kingfisher rule (e.g. "Looker Client ID") matching every hash in a bundle's content-hash map becomes a single finding (all values unioned on), while a genuinely different secret — an AWS key, a Slack token — keeps its own row. Distinct from the by-module mode, which would wrongly merge unrelated secrets under one finding.
+- **Path-traversal and forbidden-bypass detectors confirm the target isn't reachable cleanly** — a "clean-canonical control" now verifies that the file/route a bypass appears to reach isn't already served by a plain, un-mangled request (a public file at the web root, an app catch-all shell, or a resource that simply became public since the crawl-time `401`/`403` baseline). Added to **`path-normalization`** static traversal, **`nginx-off-by-slash`**, **`php-path-info-misconfig`**, **`cdn-object-traversal-listing`**, **`forbidden-bypass`**, and **`nextjs-middleware-bypass`**.
+
+## [v0.1.40-beta] - 2026-06-26
+
+A false-positive-hardening release. Several detectors that fired on a name or substring match now require structural proof, and the secret detector gains per-URL deduplication, two new reflection/source-code guards, and an inline matched value in the finding body.
+
+### Fixed
+
+- **`secret-detect` no longer reports public OAuth client IDs as leaked secrets** — a Google OAuth client ID (`NNNN-xxxx.apps.googleusercontent.com`) is the public half of an OAuth client, embedded in every sign-in button by design, so it now drops to **Info/Tentative**. The paired client *secret* is a separate match and keeps full severity.
+- **`secret-detect` drops JavaScript source artifacts matched out of unicode escapes** — a new structural `IsJSEscapeArtifactMatch` guard recognises when a fixed-length / high-entropy token rule clipped its match out of a `\uXXXX` / `\xXX` escape in a minified bundle (e.g. Angular's `ɵ`-prefixed exports), which is source code, not a credential. The check is body-located and conservative, so a genuine secret in the same bundle is still reported.
+- **`secret-detect` downgrades values reflected from the request** — a matched value that appears verbatim in the request URL or raw bytes (the dominant case: a Cloudflare Access application id in a `/cdn-cgi/access/verify-code/<app-id>` SSO URL echoed into the login page) is client-supplied input the server merely echoed, not a newly leaked server-held secret, so it drops to **Low/Tentative**.
+- **`secret-detect` collapses the same secret re-observed on one URL** — the same `(host, url, rule, snippet)` leak is now emitted once across the discovery / spidering / re-spider / dynamic-assessment passes (and across records in the known-issue-scan batch), so near-identical request/response copies no longer pile up as redundant Additional Evidence. Distinct secrets on a single URL (e.g. a `client_id`, `client_secret`, and `access_token` in one response) are no longer merged by the URL-keyed finding dedup — secret-detect is excluded from that pass and deduped by value instead. Every secret finding's description now ends with the matched value inline.
+- **`csrf-verify` only fires on a cross-site-forgeable request** — token enforcement is now checked only when the request is actually CSRF-able: a simple/form content type, no header-based auth (`Authorization`), and an ambient `Cookie`. A `*token*`-named field in a JSON/XML body (a CORS non-simple request that can't be auto-submitted cross-origin) is application data, not an anti-CSRF token — closing the false positive on a Cloudflare RUM beacon's JSON `siteToken`. The token-name pattern is also anchored (`\btoken\b`) so camelCase app fields like `accessToken`/`deviceToken` no longer match.
+- **`wp-user-enum` requires a per-author leak, not a generic redirect** — adds a baseline control (an author id far beyond any real account), an edge-block guard (`IsBlockedResponse` for WAF/SSO/maintenance pages), a uniformity guard (multiple `?author=N` ids collapsing to one slug is a catch-all, not enumeration), and rejection of author-id echoes (`/author/1` → `/author/1.html`), WordPress' own routes, and error/status-shaped slugs.
+- **`drupal-user-enum` rejects self-canonicalised UID echoes** — a redirect whose captured segment is just the requested id echoed back, bare or with an appended extension/selectors (e.g. AEM canonicalising `/user/1` → `/user/1.html`), is no longer mined as a leaked username.
+- **`cors-headers-detect` only flags credentialed CORS on true cross-origin reflection** — credentials enabled alongside a specific origin is now reported only when the response echoes the request's `Origin` *and* that origin is cross-origin to the target host. A fixed allow-list entry or a site reflecting its own origin (e.g. a Cloudflare RUM telemetry beacon) is the normal, safe pattern and is no longer flagged.
+
+## [v0.1.39-beta] - 2026-06-24
+
+Adds a no-database `fs` export format and a live filesystem mirror for the ingestion server, so a coding agent can investigate a scan or watch ingested traffic with `ls`/`grep`/`jq`. Also tightens the spider's `max-duration` so it can no longer run past its deadline.
+
+### Added
+
+- **`--format fs` — a flat, browsable filesystem export** — writes `<base>-traffic/` + `<base>-findings/` trees (per-host raw `.req`/`.resp.*` files, finding `.md` files cross-linked to their request, and a jq-friendly `index.json`) so a scan can be triaged with no DB. Available on `export`, `db export`, and the `scan`/`scan-url`/`scan-request`/`run` family; honors `--omit-response`.
+- **`vigolium server --mirror-fs <dir>`** (config `server.mirror_fs_path`) — mirrors every saved HTTP record and finding to a live `<dir>/traffic` + `<dir>/findings` filesystem tree as they are persisted, in addition to the database, so an external agent can read ingested Burp/proxy traffic as files in real time. Wired through new optional `Repository.OnRecordSaved`/`OnFindingSaved` callbacks that never block the DB save path; per-host id numbering resumes across restarts.
+
+### Fixed
+
+- **The spider now honors `max-duration` during in-flight browser operations** — the crawl deadline is bound onto rod's per-operation CDP timeouts (navigation, `WaitStable`, clicks, element lookups, form fills) rather than only being polled between actions, so an individual blocking browser op can no longer push the crawl far past its budget. Browser-level teardown is also bounded so a wedged browser can't hang shutdown.
+- **Spidering gains an overall phase budget ceiling** — each target still gets its full `max-duration`, but the whole phase is capped at `max-duration × min(targets, 8)`, so a large merged target list (CLI targets plus many in-scope DB hosts) can no longer stretch spidering out to `len(targets) × max-duration`.
+- **Further false-positive hardening** in the `path-normalization` traversal detector and the `cdn-object-traversal-listing`, `auth-headers-detect`, and `server-action-auth` modules.
+
 ## [v0.1.38-beta] - 2026-06-22
 
 A false-positive-hardening release for the host-injection, blind-OAST, file-read, and header-leak detectors, plus a scan-resume convenience. Detectors that fired on a substring match now require structural proof, and a DNS-only command-injection callback on a forwarding header is no longer reported as a confirmed shell.

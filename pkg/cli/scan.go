@@ -722,6 +722,7 @@ func executeNativeScan(cmd *cobra.Command, settings *config.Settings, strategyNa
 // still reach this path and keep their reports.
 func reportNativeScanSuccess(db *database.DB, settings *config.Settings, repo *database.Repository, scanStart time.Time) {
 	maybeGenerateReports(db, scanOpts)
+	finishFSExport(db, scanOpts)
 	uploadNativeScanResults(settings, scanOpts, repo)
 	if !scanOpts.Silent {
 		fmt.Fprintf(os.Stderr, "\n%s %s\n", terminal.Aqua(terminal.SymbolSparkle), terminal.BoldAqua("Native scan completed"))
@@ -1065,9 +1066,9 @@ func reconcileOutputFormats(opts *types.Options) error {
 	}
 	for _, f := range opts.OutputFormats {
 		switch f {
-		case "console", "jsonl", "html", "report", "pdf", "sqlite":
+		case "console", "jsonl", "html", "report", "pdf", "sqlite", "fs":
 		default:
-			return fmt.Errorf("invalid --format value %q; valid formats: console, jsonl, html, report, pdf, sqlite", f)
+			return fmt.Errorf("invalid --format value %q; valid formats: console, jsonl, html, report, pdf, sqlite, fs", f)
 		}
 	}
 	// The sqlite format dumps this run's database to a standalone file, which is
@@ -1094,7 +1095,7 @@ type reportFormatEntry struct {
 	// streamGenerate, when set, renders the report by pulling items one at a
 	// time from a producer, so the result set never lives in memory at once.
 	streamGenerate func(output.ReportItemProducer, string, output.HTMLReportMeta) error
-	beforeMsg string // optional stderr message before generation
+	beforeMsg      string // optional stderr message before generation
 }
 
 var reportFormats = []reportFormatEntry{
@@ -1125,16 +1126,50 @@ func maybeGenerateReports(db *database.DB, opts *types.Options) {
 	}
 }
 
+// finishFSExport writes the post-scan flat filesystem tree (the `fs` format)
+// for a persisted run, scoped to the scan's project. Stateless runs are handled
+// by finishStatelessExport (their temp DB is whole-run-scoped and opts.Output is
+// blanked), so this no-ops for them. The base defaults to "vigolium" in the cwd
+// when no -o was given, matching the documented fs behavior.
+func finishFSExport(db *database.DB, opts *types.Options) {
+	if !opts.HasFormat("fs") || opts.Stateless {
+		return
+	}
+	base := opts.Output
+	if len(opts.OutputFormats) > 1 {
+		base = opts.OutputBasePath()
+	}
+	filters := database.QueryFilters{ProjectUUID: exportProjectScope(opts)}
+	stats, err := writeFSExport(context.Background(), db, filters, base, fsExportOptions{omitResponse: opts.OmitResponse})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s Failed to export fs tree: %v\n", terminal.ErrorPrefix(), err)
+		return
+	}
+	fsPrintSummary(stats)
+}
+
 // finishStatelessExport writes the full database export to the output file(s)
 // when running in stateless mode. StandardWriter's live file output is
 // suppressed in stateless mode, so every requested format (console, jsonl,
 // html, report, pdf) is materialized here from the database.
 func finishStatelessExport(db *database.DB, opts *types.Options, outputPath string, skipConsole bool) {
-	if !opts.Stateless || outputPath == "" {
+	if !opts.Stateless {
+		return
+	}
+	ctx := context.Background()
+	if outputPath == "" {
+		// Every file-based format needs an explicit -o, but fs defaults its base
+		// to the cwd ("vigolium"), so it still writes a tree with no -o.
+		if opts.HasFormat("fs") {
+			if stats, err := writeFSExport(ctx, db, database.QueryFilters{}, "", fsExportOptions{omitResponse: opts.OmitResponse}); err != nil {
+				fmt.Fprintf(os.Stderr, "%s Failed to export fs tree: %v\n", terminal.ErrorPrefix(), err)
+			} else {
+				fsPrintSummary(stats)
+			}
+		}
 		return
 	}
 
-	ctx := context.Background()
 	basePath := types.StripFormatExtension(outputPath)
 
 	for _, format := range opts.OutputFormats {
@@ -1150,6 +1185,13 @@ func finishStatelessExport(db *database.DB, opts *types.Options, outputPath stri
 			exportStatelessJSONL(ctx, db, opts, outPath)
 		case "sqlite":
 			exportStatelessSQLite(ctx, db, outPath)
+		case "fs":
+			// The stateless temp DB holds only this run → whole-DB tree ("").
+			if stats, err := writeFSExport(ctx, db, database.QueryFilters{}, outPath, fsExportOptions{omitResponse: opts.OmitResponse}); err != nil {
+				fmt.Fprintf(os.Stderr, "%s Failed to export fs tree: %v\n", terminal.ErrorPrefix(), err)
+			} else {
+				fsPrintSummary(stats)
+			}
 		default:
 			for _, rf := range reportFormats {
 				if rf.format != format {

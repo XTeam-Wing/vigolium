@@ -35,6 +35,19 @@ type Browser struct {
 	uaOnce     sync.Once
 	uaOverride string
 
+	// crawlCtx, when set, is bound onto every page created by NewPage so that
+	// the crawl's deadline/cancellation propagates into every rod operation
+	// (navigation, WaitStable, clicks, element lookups, form fills) — not just
+	// the Go-level loop checks. rod's Page.Timeout(d) derives from the page's
+	// context, so a bound page caps each op at min(d, remaining-deadline) and
+	// aborts in-flight CDP calls the moment the crawl context is cancelled.
+	// Without this the spider can run far past max-duration: the deadline is
+	// only polled between actions while individual browser operations block on
+	// their own fixed rod timeouts (PageLoadTimeout=30s, ElementTimeout=5s).
+	// The browser connection itself stays on the background context so capture
+	// flushing and shutdown still work after the deadline fires.
+	crawlCtx context.Context
+
 	mu    sync.Mutex
 	pages []*Page
 }
@@ -208,11 +221,51 @@ func applyProxy(l *launcher.Launcher, proxyURL string) *launcher.Launcher {
 		Set("disable-quic")
 }
 
+// SetCrawlContext binds ctx onto every page subsequently created by NewPage so
+// the crawl deadline propagates into rod's per-operation timeouts. Call it once
+// before the crawl starts creating pages. A nil ctx clears the binding. See the
+// crawlCtx field doc for why this is required to honor max-duration.
+func (b *Browser) SetCrawlContext(ctx context.Context) {
+	b.mu.Lock()
+	b.crawlCtx = ctx
+	b.mu.Unlock()
+}
+
+// browserOpTimeout bounds a one-shot browser-level CDP op (page/tab create,
+// list, close, version). Unlike page ops, these run on the browser's background
+// context — NOT the crawl context bound onto pages — so without an explicit cap
+// a wedged or unresponsive browser would hang them forever, including at
+// teardown. Do NOT use the capped clone for long-lived loops (EachEvent).
+const browserOpTimeout = 30 * time.Second
+
+// boundedBrowser returns the rod browser capped at browserOpTimeout for a
+// one-shot browser-level CDP call.
+func (b *Browser) boundedBrowser() *rod.Browser {
+	return b.rodBrowser.Timeout(browserOpTimeout)
+}
+
 // NewPage creates a new page (tab).
 func (b *Browser) NewPage() (*Page, error) {
+	// Create on the raw browser, NOT a Timeout-bounded clone: rod sets the new
+	// page's .browser to whatever browser created it, and page ops that route
+	// through the browser context would then inherit (and outlive into) that short
+	// timeout — expiring the long-lived crawl page browserOpTimeout after creation.
+	// Page creation is a quick browser-level call; the wedged-browser cap matters
+	// for the one-shot ops (Close/Pages/version), which don't hand back a
+	// long-lived object.
 	rodPage, err := b.rodBrowser.Page(proto.TargetCreateTarget{URL: "about:blank"})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create page: %w", err)
+	}
+
+	// Bind the crawl context (if set) so every rod operation on this page — and
+	// every element derived from it — inherits the crawl's deadline and
+	// cancellation. rod returns a clone from Context(), so use the clone.
+	b.mu.Lock()
+	crawlCtx := b.crawlCtx
+	b.mu.Unlock()
+	if crawlCtx != nil {
+		rodPage = rodPage.Context(crawlCtx)
 	}
 
 	// Enable Network domain on this page for traffic capture.
@@ -228,7 +281,7 @@ func (b *Browser) NewPage() (*Page, error) {
 	// Chrome version) and pin Accept-Language to en-US. The UA is resolved once per
 	// browser; the override itself is a page-level CDP call, so it's applied here.
 	b.uaOnce.Do(func() {
-		if ver, verr := (proto.BrowserGetVersion{}).Call(b.rodBrowser); verr == nil {
+		if ver, verr := (proto.BrowserGetVersion{}).Call(b.boundedBrowser()); verr == nil {
 			b.uaOverride = strings.ReplaceAll(ver.UserAgent, "HeadlessChrome", "Chrome")
 		}
 	})
@@ -352,7 +405,7 @@ func (b *Browser) CloseOtherWindows() error {
 	currentTargetID := b.currentPage.rodPage.TargetID
 
 	// Query all browser pages including those opened by target="_blank" or window.open()
-	allPages, err := b.rodBrowser.Pages()
+	allPages, err := b.boundedBrowser().Pages()
 	if err != nil {
 		zap.L().Error("Failed to query browser pages", zap.Error(err))
 		return fmt.Errorf("failed to query browser pages: %w", err)
@@ -409,9 +462,10 @@ func (b *Browser) Close() error {
 	}
 	b.pages = nil
 
-	// Close browser
+	// Close browser. Cap it so a wedged browser can't hang teardown forever
+	// (the deferred pool.Close at the end of a crawl runs through here).
 	if b.rodBrowser != nil {
-		if err := b.rodBrowser.Close(); err != nil {
+		if err := b.boundedBrowser().Close(); err != nil {
 			return err
 		}
 	}
@@ -521,6 +575,16 @@ func NewPool(cfg *config.Config) (*Pool, error) {
 	}
 
 	return pool, nil
+}
+
+// SetCrawlContext binds ctx onto every browser in the pool so pages they create
+// inherit the crawl deadline/cancellation. Call before the crawl starts.
+func (p *Pool) SetCrawlContext(ctx context.Context) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, browser := range p.browsers {
+		browser.SetCrawlContext(ctx)
+	}
 }
 
 // Get returns a browser from the pool.

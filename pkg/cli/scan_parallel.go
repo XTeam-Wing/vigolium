@@ -717,6 +717,7 @@ func exportUnifiedFromDB(destCfg config.DatabaseConfig, opts *types.Options) err
 		return fmt.Errorf("prepare destination schema: %w", err)
 	}
 	maybeGenerateReports(db, opts)
+	finishFSExport(db, opts)
 	finishScanJSONLExport(db, opts)
 	return nil
 }

@@ -39,6 +39,14 @@ type Page struct {
 	dialogs  []DialogEvent
 }
 
+// crawlCtxDone reports whether the crawl context bound to this page (via
+// Browser.SetCrawlContext) has been cancelled or has expired. Used to skip the
+// non-ctx fallback sleeps below once the crawl deadline has fired, so a
+// cancelled crawl winds down promptly instead of sleeping per operation.
+func (p *Page) crawlCtxDone() bool {
+	return p.rodPage.GetContext().Err() != nil
+}
+
 // Navigate navigates to a URL with timeout.
 func (p *Page) Navigate(url string) error {
 	if err := p.rodPage.Timeout(p.config.PageLoadTimeout).Navigate(url); err != nil {
@@ -46,7 +54,7 @@ func (p *Page) Navigate(url string) error {
 	}
 
 	// Wait for page to load
-	if err := p.WaitStable(p.config.DOMStableTime); err != nil {
+	if err := p.WaitStable(p.config.DOMStableTime); err != nil && !p.crawlCtxDone() {
 		// Non-fatal, log and continue
 		time.Sleep(p.config.DOMStableTime)
 	}
@@ -60,7 +68,7 @@ func (p *Page) Reload() error {
 		return fmt.Errorf("failed to reload: %w", err)
 	}
 
-	if err := p.WaitStable(p.config.WaitAfterReload); err != nil {
+	if err := p.WaitStable(p.config.WaitAfterReload); err != nil && !p.crawlCtxDone() {
 		time.Sleep(p.config.WaitAfterReload)
 	}
 
@@ -240,7 +248,7 @@ func (p *Page) SetCookies(cookies []*http.Cookie) error {
 		params = append(params, param)
 	}
 
-	return p.rodPage.SetCookies(params)
+	return p.boundedPage(0).SetCookies(params)
 }
 
 // ShadowUIDAttr is the attribute the shadow-piercing queries stamp on each element
@@ -434,6 +442,30 @@ func (p *Page) Hover(selector string) error {
 	return elem.Hover()
 }
 
+// firstPositiveDuration returns the first argument greater than zero, or 0 if
+// none — used to resolve a timeout from a preferred value, a config default, and
+// a hardcoded floor in order.
+func firstPositiveDuration(ds ...time.Duration) time.Duration {
+	for _, d := range ds {
+		if d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+// boundedPage returns the rod page capped (at the caller's timeout, else
+// PageLoadTimeout) for a one-shot CDP call. It is the single chokepoint that
+// keeps every direct rod/CDP call on a page bounded: the CDP call blocks on the
+// page context waiting for the renderer, so a wedged/unresponsive one would hang
+// forever on a deadline-less context (a RuntimeEvaluate's own Timeout only bounds
+// JS execution once it starts). Do NOT use it for long-lived loops (EachEvent),
+// which must run for the whole crawl. See Browser.crawlCtx for the binding that
+// makes the effective bound min(cap, remaining-crawl-deadline).
+func (p *Page) boundedPage(timeout time.Duration) *rod.Page {
+	return p.rodPage.Timeout(firstPositiveDuration(timeout, p.config.PageLoadTimeout, 30*time.Second))
+}
+
 // Eval evaluates JavaScript expression on the page.
 // Uses CDP RuntimeEvaluate directly to support arbitrary expressions (not just functions).
 func (p *Page) Eval(script string) (interface{}, error) {
@@ -441,7 +473,7 @@ func (p *Page) Eval(script string) (interface{}, error) {
 		Expression:            script,
 		IncludeCommandLineAPI: true,
 		ReturnByValue:         true,
-	}.Call(p.rodPage)
+	}.Call(p.boundedPage(0))
 
 	if err != nil {
 		return nil, err
@@ -458,7 +490,7 @@ func (p *Page) Eval(script string) (interface{}, error) {
 func (p *Page) EvalWithArgs(script string, args ...interface{}) (interface{}, error) {
 	var val interface{}
 	if err := safeRod("EvalWithArgs", func() error {
-		result, err := p.rodPage.Evaluate(rod.Eval(script, args...))
+		result, err := p.boundedPage(0).Evaluate(rod.Eval(script, args...))
 		if err != nil {
 			return err
 		}
@@ -485,7 +517,9 @@ func (p *Page) EvalAwait(script string, timeout time.Duration) (interface{}, err
 		eval.Timeout = proto.RuntimeTimeDelta(timeout.Milliseconds())
 	}
 
-	result, err := eval.Call(p.rodPage)
+	// Cap the CDP call itself (not just JS execution) so a wedged renderer can't
+	// hang the await forever; eval.Timeout above only applies once the script runs.
+	result, err := eval.Call(p.boundedPage(timeout))
 	if err != nil {
 		return nil, err
 	}
@@ -503,7 +537,7 @@ func (p *Page) EvalCDP(expression string) (interface{}, error) {
 		Expression:            expression,
 		IncludeCommandLineAPI: true,
 		ReturnByValue:         true,
-	}.Call(p.rodPage)
+	}.Call(p.boundedPage(0))
 
 	if err != nil {
 		return nil, err
@@ -525,27 +559,35 @@ func (p *Page) ExecuteCDP(method string, params map[string]interface{}) (interfa
 
 // Screenshot takes a viewport screenshot as PNG.
 func (p *Page) Screenshot() ([]byte, error) {
-	return p.rodPage.Screenshot(false, nil)
+	return p.boundedPage(0).Screenshot(false, nil)
 }
 
 // FullScreenshot takes a full page screenshot as PNG.
 func (p *Page) FullScreenshot() ([]byte, error) {
-	return p.rodPage.Screenshot(true, nil)
+	return p.boundedPage(0).Screenshot(true, nil)
 }
 
 // ScreenshotCompact captures a viewport screenshot as JPEG at reduced quality.
 // Optimized for AI agent consumption: small file size, sufficient visual fidelity.
 func (p *Page) ScreenshotCompact(quality int) ([]byte, error) {
-	return p.rodPage.Screenshot(false, &proto.PageCaptureScreenshot{
+	return p.boundedPage(0).Screenshot(false, &proto.PageCaptureScreenshot{
 		Format:           proto.PageCaptureScreenshotFormatJpeg,
 		Quality:          &quality,
 		OptimizeForSpeed: true,
 	})
 }
 
-// Close closes the page.
+// Close closes the page. Two hazards to navigate at teardown:
+//   - The crawl context is usually cancelled by now (the deadline fired), so
+//     closing on the page's own context would fail and leak the tab — detach to
+//     a background context so the close still runs.
+//   - A wedged/unresponsive browser (busy renderer, anti-bot challenge) makes the
+//     close CDP call block forever on that deadline-less background context.
+//
+// closePageWithTimeout runs the close in a goroutine and abandons it after a
+// bound, so teardown can never hang the scan forever even against a stuck browser.
 func (p *Page) Close() error {
-	return p.rodPage.Close()
+	return closePageWithTimeout(p.rodPage.Context(context.Background()), browserOpTimeout, 1)
 }
 
 // Browser returns the parent browser.
@@ -574,7 +616,7 @@ func (p *Page) NavigateBack() error {
 	wait := p.rodPage.Timeout(p.config.PageLoadTimeout).WaitNavigation(proto.PageLifecycleEventNameNetworkAlmostIdle)
 
 	// Trigger back navigation
-	if err := p.rodPage.NavigateBack(); err != nil {
+	if err := p.boundedPage(0).NavigateBack(); err != nil {
 		return err
 	}
 
@@ -591,7 +633,7 @@ func (p *Page) NavigateForward() error {
 
 // SetViewport sets the page viewport size.
 func (p *Page) SetViewport(width, height int) error {
-	return p.rodPage.SetViewport(&proto.EmulationSetDeviceMetricsOverride{
+	return p.boundedPage(0).SetViewport(&proto.EmulationSetDeviceMetricsOverride{
 		Width:  width,
 		Height: height,
 	})
@@ -882,7 +924,7 @@ func matchesFramePattern(pattern, frameIdent string) bool {
 // confirmation can observe it, then auto-accepts the dialog.
 func (p *Page) setupAutoDialogHandler() {
 	// Enable Page domain for dialog events
-	_ = proto.PageEnable{}.Call(p.rodPage)
+	_ = proto.PageEnable{}.Call(p.boundedPage(0))
 
 	// Start background goroutine to handle all dialogs.
 	// Callback returns bool: false = keep listening, true = stop.
@@ -896,7 +938,7 @@ func (p *Page) setupAutoDialogHandler() {
 		_ = proto.PageHandleJavaScriptDialog{
 			Accept:     true,
 			PromptText: "",
-		}.Call(p.rodPage)
+		}.Call(p.boundedPage(0))
 		return false
 	})()
 }
@@ -952,7 +994,7 @@ func (p *Page) HandlePopups() error {
 func (p *Page) DismissDialog() error {
 	return proto.PageHandleJavaScriptDialog{
 		Accept: false, // Dismiss/cancel
-	}.Call(p.rodPage)
+	}.Call(p.boundedPage(0))
 }
 
 // AcceptDialog accepts any currently open dialog.
@@ -960,7 +1002,7 @@ func (p *Page) AcceptDialog(promptText string) error {
 	return proto.PageHandleJavaScriptDialog{
 		Accept:     true,
 		PromptText: promptText,
-	}.Call(p.rodPage)
+	}.Call(p.boundedPage(0))
 }
 
 // HandleFileDialog enables file chooser interception and returns a handler function.

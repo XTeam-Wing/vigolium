@@ -16,8 +16,13 @@ import (
 	"github.com/vigolium/vigolium/pkg/utils"
 )
 
-// csrfParamPattern matches common CSRF token parameter names.
-var csrfParamPattern = regexp.MustCompile(`(?i)(csrf|xsrf|token|authenticity.token|__RequestVerificationToken|antiforgery|_token|nonce|csrfmiddlewaretoken)`)
+// csrfParamPattern matches common CSRF token parameter names. The bare token
+// alternative is anchored with word boundaries (\btoken\b) so it matches a field
+// literally named "token" but NOT camelCase application fields whose name merely
+// ends in "Token" (siteToken, accessToken, deviceToken, pageToken, …). Genuine
+// anti-CSRF fields that use camelCase are still caught via the csrf/xsrf prefix
+// (csrfToken, xsrfToken) or the explicit _token / authenticity.token alternatives.
+var csrfParamPattern = regexp.MustCompile(`(?i)(csrf|xsrf|\btoken\b|authenticity.token|__RequestVerificationToken|antiforgery|_token|nonce|csrfmiddlewaretoken)`)
 
 // stateChangingMethods are HTTP methods that modify server state.
 var stateChangingMethods = map[string]bool{
@@ -25,6 +30,49 @@ var stateChangingMethods = map[string]bool{
 	"PUT":    true,
 	"DELETE": true,
 	"PATCH":  true,
+}
+
+// csrfForgeableContentType reports whether a request body content type is one a
+// cross-site HTML form (or a "simple" CORS request) can produce without a
+// preflight. A CSRF token is only a meaningful defense for these.
+//
+// Any other body type — application/json, application/xml, application/*+json,
+// etc. — is a CORS "non-simple" request: a cross-origin HTML form cannot set its
+// Content-Type, and a fetch/XHR carrying it triggers a preflight the target must
+// explicitly allow. Such a request is not auto-submittable cross-origin, so a
+// field whose name merely contains "token" (e.g. a Cloudflare RUM beacon's
+// siteToken) is application data, not an anti-CSRF token, and removing it proves
+// nothing about CSRF. An empty/absent content type is treated as forgeable to
+// stay false-negative safe — the name pattern and param-location guard still apply.
+func csrfForgeableContentType(ct string) bool {
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	if i := strings.IndexByte(ct, ';'); i >= 0 { // drop ";charset=" / ";boundary="
+		ct = strings.TrimSpace(ct[:i])
+	}
+	switch ct {
+	case "",
+		"application/x-www-form-urlencoded",
+		"multipart/form-data",
+		"text/plain":
+		return true
+	default:
+		return false
+	}
+}
+
+// isForgeableTokenLocation reports whether a parameter location can hold a real
+// anti-CSRF token. JSON and XML body values are CORS non-simple and not
+// cross-origin-forgeable, so a "*token*"-named value parsed from them is
+// application data rather than an anti-CSRF defense. This backstops
+// csrfForgeableContentType for requests whose body parses as JSON/XML without a
+// matching Content-Type header.
+func isForgeableTokenLocation(pt httpmsg.ParamType) bool {
+	switch pt {
+	case httpmsg.ParamJSON, httpmsg.ParamXML, httpmsg.ParamXMLAttr:
+		return false
+	default:
+		return true
+	}
 }
 
 // csrfProbe defines a CSRF verification strategy.
@@ -104,6 +152,30 @@ func (m *Module) ScanPerRequest(
 		return nil, nil
 	}
 
+	// CSRF preconditions — mirror the passive csrf_detect module. The attack only
+	// works against a request a browser will replay cross-site using AMBIENT
+	// credentials, so "token not enforced" is moot (and a false positive) unless
+	// all of these hold:
+	//
+	//  1. A simple/form content type. A non-simple body (application/json,
+	//     application/xml, …) cannot be produced by a cross-site HTML form and
+	//     forces a CORS preflight — so a "*token*"-named field there is app data,
+	//     not an anti-CSRF token (the reported FP: a Cloudflare RUM beacon's
+	//     JSON siteToken).
+	//  2. No header-based auth. Authorization: Bearer/Basic is never attached
+	//     automatically cross-site, so the endpoint is not CSRF-able.
+	//  3. A Cookie is present. No Cookie means no ambient session for an attacker
+	//     to ride, so token enforcement is irrelevant.
+	if !csrfForgeableContentType(ctx.Request().Header("Content-Type")) {
+		return nil, nil
+	}
+	if ctx.Request().Header("Authorization") != "" {
+		return nil, nil
+	}
+	if ctx.Request().Header("Cookie") == "" {
+		return nil, nil
+	}
+
 	// Dedup by method:host:path
 	dedupKey := utils.Sha1(fmt.Sprintf("%s:%s:%s", method, urlx.Host, urlx.Path))
 	diskSet := m.ds.Get(scanCtx.DedupMgr())
@@ -120,6 +192,9 @@ func (m *Module) ScanPerRequest(
 	var csrfParamName string
 	var csrfParamType httpmsg.ParamType
 	for _, param := range params {
+		if !isForgeableTokenLocation(param.Type()) {
+			continue
+		}
 		if csrfParamPattern.MatchString(param.Name()) {
 			csrfParamName = param.Name()
 			csrfParamType = param.Type()

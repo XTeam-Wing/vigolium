@@ -66,9 +66,9 @@ type ResolvedPhasePace struct {
 // matching the values shown in the example YAML config.
 func DefaultScanningPaceConfig() *ScanningPaceConfig {
 	return &ScanningPaceConfig{
-		Concurrency: 50,
+		Concurrency: 40,
 		RateLimit:   100,
-		MaxPerHost:  50,
+		MaxPerHost:  40,
 		MaxDuration: "45m",
 
 		Discovery:         PhasePace{DurationFactor: 0.5},

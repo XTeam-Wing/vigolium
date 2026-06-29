@@ -219,6 +219,12 @@ Run 'vigolium <command> --help' for command-specific flags and examples, or 'vig
 		// each isolated child scan process inherits the same ceiling.
 		applyScanMemLimit(cmd)
 
+		// Check npm for a newer release (cached to once/day). Either schedules a
+		// notice printed at the end of the run or, when VIGOLIUM_AUTO_UPDATE is
+		// set, silently updates and re-execs the new binary to continue. Honors
+		// VIGOLIUM_DISABLE_UPDATE_CHECK and stays silent under --json/CI/non-TTY.
+		maybeCheckForUpdate(cmd)
+
 		// Handle -M/--list-modules shortcut
 		if globalListModules {
 			printModuleTable(moduleOpts, "")
@@ -271,7 +277,7 @@ func init() {
 	pf.IntVar(&globalWidth, "width", 70, "Maximum column width for table output")
 
 	pf.StringVar(&globalScanUUID, "scan-uuid", "", "Pin scan UUID for this session (use to sync results across nodes; defaults to a freshly-minted UUID)")
-	pf.StringVar(&globalFormat, "format", "console", "Output format (comma-separated for multiple): console, jsonl, html, sqlite (sqlite needs -S/--stateless)")
+	pf.StringVar(&globalFormat, "format", "console", "Output format (comma-separated for multiple): console, jsonl, html, sqlite (needs -S), fs (flat traffic/finding tree)")
 	pf.BoolVar(&globalCIOutput, "ci-output-format", false, "CI-friendly output: JSONL findings only, no color, no banners")
 	pf.BoolVar(&globalNoColor, "no-color", false, "Disable ANSI color in all output (also honored via the NO_COLOR env var)")
 	pf.BoolVar(&globalFullExample, "full-example", false, "Show full example commands organized by section")
@@ -312,7 +318,14 @@ func applyScanMemLimit(cmd *cobra.Command) {
 }
 
 func Execute() {
-	if err := rootCmd.Execute(); err != nil {
+	err := rootCmd.Execute()
+
+	// Print any pending "new version available" notice last, so it lands at the
+	// bottom of the output instead of scrolling away. Runs on both the success
+	// and error paths (but before the os.Exit calls below).
+	flushUpdateNotice()
+
+	if err != nil {
 		// Cobra has already printed the error to stderr. --soft-fail forces a
 		// successful exit code so wrapping scripts/CI pipelines aren't aborted
 		// by errors the operator considers expected. The persistent flag is

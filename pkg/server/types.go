@@ -46,6 +46,10 @@ type ServerConfig struct {
 	Author               string
 	Commit               string
 	BuildTime            string
+	// MirrorFSPath, when set, mirrors every ingested HTTP record and finding to
+	// a flat filesystem tree under this directory (in addition to the database),
+	// so an external agent can read live traffic as files. See --mirror-fs.
+	MirrorFSPath string
 	// ConfigPath is the effective config file the server loaded settings from
 	// (honors the --config flag). The config watcher watches this file for
 	// hot-reload. Empty falls back to config.ConfigFilePath() (the default

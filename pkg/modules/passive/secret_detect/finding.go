@@ -6,6 +6,21 @@ import (
 	"github.com/vigolium/vigolium/pkg/types/severity"
 )
 
+// SecretDedupKey builds the identity used to collapse duplicate secret findings:
+// the same secret value (snippet), from the same rule, on the same URL is the
+// same leak no matter how many times it is re-observed. The same page is fetched
+// across discovery, spidering, targeted re-spider, and the dynamic-assessment
+// baseline, so the passive module buffers — and Kingfisher re-matches — it once
+// per pass, yielding several findings that differ only by a few dynamic bytes in
+// the body. Deduping on (host, url, rule_id, snippet) keeps one finding per unique
+// secret per URL, which stops near-identical request/response copies from piling
+// up as redundant Additional Evidence when the storage layer later merges them.
+// The same secret on a *different* URL keeps a distinct key (and is grouped by
+// value later if warranted).
+func SecretDedupKey(host, url, ruleID, snippet string) string {
+	return host + "\x00" + url + "\x00" + ruleID + "\x00" + snippet
+}
+
 // NewSecretFinding builds the ResultEvent shared by both secret-finding emission
 // paths — the passive module's batch flush and the known-issue-scan batch — so
 // the two can't drift in title, tags, evidence, or metadata (they already did

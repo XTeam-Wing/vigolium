@@ -17,8 +17,16 @@ func TestCsrfParamPattern(t *testing.T) {
 		{"csrfmiddlewaretoken", "csrfmiddlewaretoken", true},
 		{"__RequestVerificationToken", "__RequestVerificationToken", true},
 		{"nonce", "nonce", true},
+		{"csrfToken camelCase", "csrfToken", true},
+		{"xsrfToken camelCase", "xsrfToken", true},
 		{"username", "username", false},
 		{"password", "password", false},
+		// Generic camelCase *Token application fields are NOT anti-CSRF tokens and
+		// must not match the bare \btoken\b alternative.
+		{"siteToken", "siteToken", false},
+		{"accessToken", "accessToken", false},
+		{"deviceToken", "deviceToken", false},
+		{"pageToken", "pageToken", false},
 	}
 
 	for _, tt := range tests {
@@ -26,6 +34,32 @@ func TestCsrfParamPattern(t *testing.T) {
 			got := csrfParamPattern.MatchString(tt.param)
 			if got != tt.expected {
 				t.Errorf("csrfParamPattern.MatchString(%q) = %v, want %v", tt.param, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestCsrfForgeableContentType(t *testing.T) {
+	tests := []struct {
+		name string
+		ct   string
+		want bool
+	}{
+		{"empty", "", true},
+		{"urlencoded", "application/x-www-form-urlencoded", true},
+		{"urlencoded with charset", "application/x-www-form-urlencoded; charset=utf-8", true},
+		{"multipart", "multipart/form-data; boundary=xyz", true},
+		{"text/plain", "text/plain", true},
+		{"json", "application/json", false},
+		{"json with charset", "application/json; charset=utf-8", false},
+		{"xml", "application/xml", false},
+		{"text/xml", "text/xml", false},
+		{"json suffix", "application/vnd.api+json", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := csrfForgeableContentType(tt.ct); got != tt.want {
+				t.Errorf("csrfForgeableContentType(%q) = %v, want %v", tt.ct, got, tt.want)
 			}
 		})
 	}

@@ -23,6 +23,10 @@ import (
 const (
 	pendingTimeout  = 15 * time.Second // Timeout for pending requests (reduced from 30s)
 	cleanupInterval = 5 * time.Second  // Cleanup check interval (reduced from 10s)
+	// browserPagesTimeout bounds the browser-level Pages() CDP calls this capture
+	// makes on the background context, so a wedged/unresponsive browser can't hang
+	// the capture goroutine forever.
+	browserPagesTimeout = 5 * time.Second
 )
 
 // authHeaders defines headers included in deduplication hash.
@@ -252,7 +256,10 @@ func (c *Capture) isSessionValid(sessionID proto.TargetSessionID) bool {
 	if c.browser == nil {
 		return false
 	}
-	pages, err := c.browser.Pages()
+	// Bound the CDP call: c.browser runs on the deadline-less background context,
+	// so a wedged/unresponsive browser would hang this capture-goroutine call
+	// forever otherwise.
+	pages, err := c.browser.Timeout(browserPagesTimeout).Pages()
 	if err != nil {
 		return false
 	}
@@ -478,7 +485,9 @@ func (c *Capture) fetchResponseBody(sessionID proto.TargetSessionID, requestID p
 		return nil, fmt.Errorf("browser not set")
 	}
 
-	pages, err := c.browser.Pages()
+	// Bound the CDP call (background-context browser) so a wedged browser can't
+	// hang the capture goroutine forever before we even reach the body fetch.
+	pages, err := c.browser.Timeout(browserPagesTimeout).Pages()
 	if err != nil {
 		return nil, err
 	}

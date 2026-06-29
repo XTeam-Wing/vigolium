@@ -160,6 +160,13 @@ func ProbeURL(ctx context.Context, cfg ProbeConfig) (*ProbeResult, error) {
 	}
 	defer func() { _ = br.Close() }()
 
+	// Bind the probe context onto every page this browser creates so the caller's
+	// deadline/cancellation reaches rod's per-operation CDP calls — including the
+	// raw page.RodPage().SetExtraHeaders escape hatch below and NavigateCtx — not
+	// just the loop-level checks. Capture runs on the raw browser (RodBrowser), so
+	// it is unaffected and keeps flushing.
+	br.SetCrawlContext(ctx)
+
 	// Optional network capture: spin up a CDP-level recorder and let it
 	// run for the lifetime of this probe. Records flow through the
 	// internal RepositoryWriter into the sink (typically database.Repo).

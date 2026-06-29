@@ -836,6 +836,7 @@ func runRunnerScan(rr *httpmsg.HttpRequestResponse, target string) (err error) {
 	// maybeGenerateReports self-guards on opts.Output=="" (blanked above for the
 	// stateless path, where finishStatelessExport handles reports instead).
 	maybeGenerateReports(db, opts)
+	finishFSExport(db, opts)
 	if !opts.Silent {
 		fmt.Fprintf(os.Stderr, "\n%s %s\n", terminal.Aqua(terminal.SymbolSparkle), terminal.BoldAqua("Native scan completed"))
 		printScanCompletionSummary(repo, time.Since(scanStart))

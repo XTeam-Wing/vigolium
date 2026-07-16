@@ -37,7 +37,6 @@ type DetectedInput struct {
 	// page so the filler can prefer a value the app itself suggests over a
 	// synthetic one. DefaultValue is the input's pre-filled value; DatalistOptions
 	// are the suggested values of an associated <datalist>.
-	DefaultValue    string   // value the page pre-filled into the field
 	DatalistOptions []string // suggested values from a linked <datalist>
 
 	// Hidden file input detection (Go extension)

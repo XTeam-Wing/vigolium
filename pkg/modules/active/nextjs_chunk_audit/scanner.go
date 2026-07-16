@@ -8,9 +8,10 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/samber/lo"
-	"github.com/vigolium/vigolium/pkg/deparos/jsscan/linkfinder"
+	"github.com/vigolium/vigolium/pkg/deparos/jstangle/linkfinder"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/pkg/modules/infra"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/modules/shared/jsframework"
 	"github.com/vigolium/vigolium/pkg/output"
@@ -37,6 +38,11 @@ type Module struct {
 	hostsMu sync.Mutex
 	hosts   map[string]*hostState
 }
+
+// Fresh implements modules.PerScanModule so the runner gives each scan its own
+// instance — the per-host chunk/route discovery map (hosts) is scan-scoped and
+// must not accumulate or bleed across concurrent server-mode scans.
+func (m *Module) Fresh() any { return New() }
 
 func New() *Module {
 	m := &Module{
@@ -125,11 +131,23 @@ func (m *Module) ScanPerRequest(
 		scheme = "https"
 	}
 	baseOrigin := scheme + "://" + host
+	cleanRaw, err := modkit.StripCredentialHeaders(ctx.Request().Raw())
+	if err != nil {
+		return nil, nil
+	}
+	anonymousClient, err := httpClient.CloneWithoutCredentials()
+	if err != nil {
+		return nil, nil
+	}
+	anonymousCtx := httpmsg.NewHttpRequestResponse(
+		httpmsg.NewHttpRequestWithService(ctx.Service(), cleanRaw),
+		ctx.Response(),
+	)
 
 	var results []*output.ResultEvent
 	for _, chunkPath := range newChunks {
 		chunkURL := baseOrigin + chunkPath
-		chunkBody, ok := m.fetchBytes(ctx, httpClient, chunkPath, MaxChunkBytes)
+		chunkBody, ok := m.fetchBytes(anonymousCtx, anonymousClient, chunkPath, MaxChunkBytes)
 		if !ok {
 			continue
 		}
@@ -137,11 +155,11 @@ func (m *Module) ScanPerRequest(
 			scanCtx: scanCtx, state: state, host: host, scheme: scheme, sourceURL: chunkURL,
 		})...)
 		// Re-emit the chunk URL through the feeder so the passive pipeline
-		// (notably secret_detect's kingfisher batch) gets coverage.
+		// (notably secret_detect's secret scan) gets coverage.
 		m.feedURL(scanCtx, chunkURL)
 
 		mapPath := chunkPath + ".map"
-		mapBody, ok := m.fetchBytes(ctx, httpClient, mapPath, MaxMapBytes)
+		mapBody, ok := m.fetchBytes(anonymousCtx, anonymousClient, mapPath, MaxMapBytes)
 		if !ok {
 			continue
 		}
@@ -187,13 +205,26 @@ func (m *Module) fetchBytes(
 	// re-parsing on this hot path.
 	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
 
-	resp, _, err := httpClient.Execute(req, http.Options{NoRedirects: true})
+	resp, _, err := httpClient.Execute(req, http.Options{NoRedirects: true, NoClustering: true})
 	if err != nil {
 		return nil, false
 	}
 	defer resp.Close()
 
-	if resp.Response() == nil || resp.Response().StatusCode != 200 {
+	if resp.Response() == nil || resp.Response().StatusCode != 200 || infra.IsBlockedResponse(resp) {
+		return nil, false
+	}
+
+	// Catch-all / echo-server guard: a real Next.js chunk (.js) or its source map
+	// (.map) is served as application/javascript, text/javascript, or
+	// application/json — NEVER a full HTML document. A 200 text/html body for a
+	// chunk path is the host's catch-all / SPA shell served for literally any path
+	// (or, under a gzip + bogus `Content-Length: 0` transport quirk, a truncated
+	// TAIL fragment of it), whose reflected/echoed text can forge a bogus secret or
+	// route-intel match. The Content-Type header survives that truncation, so
+	// classify it and drop an HTML document here. A missing/unknown Content-Type
+	// fails open so a real bundle served without one is still analysed.
+	if modkit.ClassifyContentType(resp.Response().Header.Get("Content-Type")) == modkit.ContentClassHTML {
 		return nil, false
 	}
 
@@ -211,8 +242,14 @@ func (m *Module) fetchBytes(
 func (m *Module) analyzeBody(body []byte, cc chunkCtx) []*output.ResultEvent {
 	var events []*output.ResultEvent
 
-	if secrets := FindSecrets(body, 0); len(secrets) > 0 {
-		events = append(events, buildSecretEvent(cc, secrets))
+	if matches := FindSecrets(body, 0); len(matches) > 0 {
+		privateCredentials, publicIdentifiers := classifyCredentialMatches(matches)
+		if len(privateCredentials) > 0 {
+			events = append(events, buildSecretEvent(cc, privateCredentials))
+		}
+		if len(publicIdentifiers) > 0 {
+			events = append(events, buildPublicIdentifierEvent(cc, publicIdentifiers))
+		}
 	}
 
 	relativeRoutes := linkfinder.ExtractPaths(body)
@@ -225,11 +262,7 @@ func (m *Module) analyzeBody(body []byte, cc chunkCtx) []*output.ResultEvent {
 	}
 
 	if len(relativeRoutes) > 0 || len(absoluteURLs) > 0 || len(crossOrigin) > 0 {
-		events = append(events, buildSummaryEvent(cc, len(relativeRoutes), len(absoluteURLs), len(crossOrigin)))
-	}
-
-	for _, origin := range crossOrigin {
-		events = append(events, buildCrossOriginEvent(cc, origin))
+		events = append(events, buildSummaryEvent(cc, len(relativeRoutes), len(absoluteURLs), crossOrigin))
 	}
 
 	return events
@@ -292,10 +325,8 @@ func classifyExtractions(cc chunkCtx, relativeRoutes, absoluteURLs []string) (fe
 }
 
 func buildSecretEvent(cc chunkCtx, secrets []SecretMatch) *output.ResultEvent {
-	conf := severity.Firm
-	if distinctPatterns(secrets) > 1 {
-		conf = severity.Certain
-	}
+	conf := severity.Tentative
+	sev := severity.Medium
 	patterns := make([]string, 0, len(secrets))
 	extracted := make([]string, 0, len(secrets))
 	additional := make([]string, 0, len(secrets))
@@ -304,36 +335,78 @@ func buildSecretEvent(cc chunkCtx, secrets []SecretMatch) *output.ResultEvent {
 		extracted = append(extracted, fmt.Sprintf("[%s] %s", s.Pattern, s.Value))
 		additional = append(additional, s.Snippet)
 	}
-	desc := fmt.Sprintf("Found %d potential secret(s) in %s (patterns: %s)",
+	if containsHighRiskPrivatePattern(secrets) {
+		conf = severity.Firm
+		sev = severity.High
+	}
+	desc := fmt.Sprintf("Found %d private-credential-shaped value(s) in %s (patterns: %s). The bundle is anonymously reachable, but provider-side validity and privileges were not tested.",
 		len(secrets), cc.sourceURL, strings.Join(lo.Uniq(patterns), ", "))
 	return &output.ResultEvent{
 		ModuleID:           ModuleID,
+		RecordKind:         output.RecordKindCandidate,
+		EvidenceGrade:      output.EvidenceGradeCandidate,
 		Host:               cc.host,
 		URL:                cc.sourceURL,
 		Matched:            cc.sourceURL,
 		ExtractedResults:   extracted,
 		AdditionalEvidence: additional,
 		Info: output.Info{
-			Name:        "Embedded Secret in Next.js Bundle",
+			Name:        "Potential Private Credential in Next.js Bundle",
 			Description: desc,
-			Severity:    severity.High,
+			Severity:    sev,
 			Confidence:  conf,
 			Tags:        []string{"nextjs", "secret", "info-disclosure"},
 		},
 		Metadata: map[string]any{
-			"source":   cc.sourceURL,
-			"from_map": cc.fromMap,
-			"count":    len(secrets),
+			"source":             cc.sourceURL,
+			"from_map":           cc.fromMap,
+			"count":              len(secrets),
+			"credential_free":    true,
+			"provider_validated": false,
 		},
 	}
 }
 
-func buildSummaryEvent(cc chunkCtx, routes, urls, crossOrigin int) *output.ResultEvent {
+func buildPublicIdentifierEvent(cc chunkCtx, identifiers []SecretMatch) *output.ResultEvent {
+	patterns := make([]string, 0, len(identifiers))
+	extracted := make([]string, 0, len(identifiers))
+	for _, identifier := range identifiers {
+		patterns = append(patterns, identifier.Pattern)
+		extracted = append(extracted, fmt.Sprintf("[%s] %s", identifier.Pattern, identifier.Value))
+	}
 	return &output.ResultEvent{
-		ModuleID: ModuleID,
-		Host:     cc.host,
-		URL:      cc.sourceURL,
-		Matched:  cc.sourceURL,
+		ModuleID:         ModuleID,
+		RecordKind:       output.RecordKindObservation,
+		EvidenceGrade:    output.EvidenceGradeObservation,
+		Host:             cc.host,
+		URL:              cc.sourceURL,
+		Matched:          cc.sourceURL,
+		ExtractedResults: extracted,
+		Info: output.Info{
+			Name:        "Public Client Identifier in Next.js Bundle",
+			Description: fmt.Sprintf("Found %d client-visible identifier(s) in %s (%s). These formats are designed to be publishable; review provider restrictions rather than rotate them as leaked secrets.", len(identifiers), cc.sourceURL, strings.Join(lo.Uniq(patterns), ", ")),
+			Severity:    severity.Info,
+			Confidence:  severity.Firm,
+			Tags:        []string{"nextjs", "client-identifier", "intel"},
+		},
+		Metadata: map[string]any{
+			"source":               cc.sourceURL,
+			"from_map":             cc.fromMap,
+			"count":                len(identifiers),
+			"intentionally_public": true,
+		},
+	}
+}
+
+func buildSummaryEvent(cc chunkCtx, routes, urls int, crossOrigin []string) *output.ResultEvent {
+	return &output.ResultEvent{
+		ModuleID:         ModuleID,
+		RecordKind:       output.RecordKindObservation,
+		EvidenceGrade:    output.EvidenceGradeObservation,
+		Host:             cc.host,
+		URL:              cc.sourceURL,
+		Matched:          cc.sourceURL,
+		ExtractedResults: crossOrigin,
 		Info: output.Info{
 			Name:        "Next.js Static Chunk Analysed",
 			Description: fmt.Sprintf("Extracted intel from %s", cc.sourceURL),
@@ -346,34 +419,15 @@ func buildSummaryEvent(cc chunkCtx, routes, urls, crossOrigin int) *output.Resul
 			"from_map":     cc.fromMap,
 			"routes":       routes,
 			"urls":         urls,
-			"cross_origin": crossOrigin,
-		},
-	}
-}
-
-func buildCrossOriginEvent(cc chunkCtx, origin string) *output.ResultEvent {
-	return &output.ResultEvent{
-		ModuleID:         ModuleID,
-		Host:             cc.host,
-		URL:              cc.sourceURL,
-		Matched:          origin,
-		ExtractedResults: []string{origin},
-		Info: output.Info{
-			Name:        "Third-Party Domain Referenced in Next.js Bundle",
-			Description: fmt.Sprintf("Bundle %s references cross-origin domain %s", cc.sourceURL, origin),
-			Severity:    severity.Info,
-			Confidence:  severity.Tentative,
-			Tags:        []string{"nextjs", "intel", "third-party"},
-		},
-		Metadata: map[string]any{
-			"source":      cc.sourceURL,
-			"third_party": origin,
-			"from_map":    cc.fromMap,
+			"cross_origin": len(crossOrigin),
 		},
 	}
 }
 
 func (m *Module) feedURL(scanCtx *modkit.ScanContext, target string) {
+	if scanCtx == nil {
+		return
+	}
 	feeder := scanCtx.Feeder()
 	if feeder == nil {
 		return
@@ -391,4 +445,38 @@ func distinctPatterns(matches []SecretMatch) int {
 		seen[m.Pattern] = struct{}{}
 	}
 	return len(seen)
+}
+
+var publicClientIdentifierPatterns = map[string]bool{
+	"aws-access-key-id":       true,
+	"google-api-key":          true,
+	"stripe-live-publishable": true,
+	"stripe-test-publishable": true,
+}
+
+var highRiskPrivateCredentialPatterns = map[string]bool{
+	"github-pat":              true,
+	"github-fine-grained-pat": true,
+	"stripe-live-secret":      true,
+	"slack-token":             true,
+}
+
+func classifyCredentialMatches(matches []SecretMatch) (privateCredentials, publicIdentifiers []SecretMatch) {
+	for _, match := range matches {
+		if publicClientIdentifierPatterns[match.Pattern] {
+			publicIdentifiers = append(publicIdentifiers, match)
+			continue
+		}
+		privateCredentials = append(privateCredentials, match)
+	}
+	return privateCredentials, publicIdentifiers
+}
+
+func containsHighRiskPrivatePattern(matches []SecretMatch) bool {
+	for _, match := range matches {
+		if highRiskPrivateCredentialPatterns[match.Pattern] {
+			return true
+		}
+	}
+	return false
 }

@@ -13,6 +13,7 @@ type DiscoveryConfig struct {
 	Wordlists                DiscoveryWordlistConfig  `yaml:"wordlists"`
 	Extensions               DiscoveryExtensionConfig `yaml:"extensions"`
 	Engine                   DiscoveryEngineConfig    `yaml:"engine"`
+	JSTangle                 DiscoveryJSTangleConfig  `yaml:"jstangle"`
 	SaveResponseBody         bool                     `yaml:"save_response_body"`
 	EnableMalformedPathProbe bool                     `yaml:"enable_malformed_path_probe"`
 	DedupClusterCap          *int                     `yaml:"dedup_cluster_cap"`   // cap near-identical discovery responses (same host/status/content-type, size & words within 0.5%) per cluster; nil=default(10), 0=disabled, N=keep at most N
@@ -22,6 +23,30 @@ type DiscoveryConfig struct {
 	PassiveModuleTags        []string                 `yaml:"passive_module_tags"` // run passive modules matching these tags during discovery (e.g., ["fingerprint"])
 	ReSpider                 DiscoveryReSpiderConfig  `yaml:"respider"`            // targeted re-spider of rich/SPA routes found after discovery dedup
 	DeparosDedup             DeparosDedupConfig       `yaml:"deparos_dedup"`       // post-discovery status-retention + reflected-URL-robust record dedup
+}
+
+type DiscoveryJSTangleConfig struct {
+	Enabled            *bool  `yaml:"enabled"`
+	ReplayMode         string `yaml:"replay_mode"`
+	ReplaySafety       string `yaml:"replay_safety"`
+	SourceMaps         *bool  `yaml:"source_maps"`
+	AssetGraph         *bool  `yaml:"asset_graph"`
+	ProtocolHandshake  bool   `yaml:"protocol_handshake"`
+	WorkerCount        int    `yaml:"worker_count"`
+	MemoryBudgetMB     int    `yaml:"memory_budget_mb"`
+	CacheMB            int    `yaml:"cache_mb"`
+	WorkerMaxJobs      int    `yaml:"worker_max_jobs"`
+	WorkerMaxRSSMB     int    `yaml:"worker_max_rss_mb"`
+	JobTimeout         string `yaml:"job_timeout"`
+	NormalInputMB      int    `yaml:"normal_input_mb"`
+	MaxASTInputMB      int    `yaml:"max_ast_input_mb"`
+	HardInputMB        int    `yaml:"hard_input_mb"`
+	MaxRequestsPerFile int    `yaml:"max_requests_per_file"`
+	MaxASTNodes        int    `yaml:"max_ast_nodes"`
+	MaxAssetDepth      int    `yaml:"max_asset_depth"`
+	MaxAssetsPerParent int    `yaml:"max_assets_per_parent"`
+	MaxAssetsPerHost   int    `yaml:"max_assets_per_host"`
+	MaxAssetsTotal     int    `yaml:"max_assets_total"`
 }
 
 // DeparosDedupConfig controls the post-discovery cleanup of stored deparos
@@ -34,9 +59,19 @@ type DiscoveryConfig struct {
 //   - reflected-URL-robust dedup that collapses records differing only by an
 //     echoed request URL/path or per-request dynamic tokens.
 type DeparosDedupConfig struct {
-	Enabled            *bool `yaml:"enabled"`             // nil = default (true)
-	DropClientErrors   *bool `yaml:"drop_client_errors"`  // drop 4xx discovery records; nil = default (true)
-	KeepOnePerHost     []int `yaml:"keep_one_per_host"`   // statuses collapsed to one representative per host instead of dropped; nil = default ([401]); empty slice = collapse none
+	Enabled          *bool `yaml:"enabled"`            // nil = default (true)
+	DropClientErrors *bool `yaml:"drop_client_errors"` // drop 4xx discovery records; nil = default (true)
+	// KeepOnePerHost statuses are collapsed to one representative per host instead
+	// of dropped. nil = default ([401,403,429]: authz walls + pacing); empty slice
+	// = collapse none.
+	KeepOnePerHost []int `yaml:"keep_one_per_host"`
+	// KeepPerPath statuses preserve every distinct path (each is a real endpoint
+	// hit with the wrong method/payload), capped per host by PerPathCap. nil =
+	// default ([405,415,422]); empty slice = keep none per-path.
+	KeepPerPath []int `yaml:"keep_per_path"`
+	// PerPathCap bounds distinct KeepPerPath paths kept per (host, status). 0 =
+	// default (100); negative = unbounded.
+	PerPathCap         int   `yaml:"per_path_cap"`
 	NormalizeReflected *bool `yaml:"normalize_reflected"` // collapse records differing only by a reflected URL/path or dynamic tokens; nil = default (true)
 }
 
@@ -58,17 +93,40 @@ func (c *DeparosDedupConfig) NormalizeReflectedEnabled() bool {
 }
 
 // KeepOneStatuses returns the statuses collapsed to a single record per host
-// rather than dropped. nil (absent YAML) defaults to {401}; an explicit empty
-// slice keeps the default off (collapse nothing, so every 4xx is dropped).
+// rather than dropped. nil (absent YAML) defaults to {401,403,429} — an authz
+// wall (401/403) or a pacing signal (429) is worth keeping, but one record per
+// host is enough. An explicit empty slice collapses none.
 func (c *DeparosDedupConfig) KeepOneStatuses() []int {
 	if c.KeepOnePerHost == nil {
-		return []int{401}
+		return []int{401, 403, 429}
 	}
 	return c.KeepOnePerHost
 }
 
+// KeepPerPathStatuses returns the statuses whose distinct paths are preserved
+// (each is a discovered endpoint hit with the wrong method/payload). nil (absent
+// YAML) defaults to {405,415,422}; an explicit empty slice keeps none per-path.
+func (c *DeparosDedupConfig) KeepPerPathStatuses() []int {
+	if c.KeepPerPath == nil {
+		return []int{405, 415, 422}
+	}
+	return c.KeepPerPath
+}
+
+// PerPathCapValue returns the per-(host,status) cap on distinct KeepPerPath
+// paths. 0 (absent YAML) defaults to 100; negative disables the cap.
+func (c *DeparosDedupConfig) PerPathCapValue() int {
+	if c.PerPathCap == 0 {
+		return 100
+	}
+	if c.PerPathCap < 0 {
+		return 0
+	}
+	return c.PerPathCap
+}
+
 // DiscoveryReSpiderConfig controls the targeted re-spider step that runs after
-// discovery dedup. Discovery (fuzzing/jsscan/linkfinder) can surface new routes
+// discovery dedup. Discovery (fuzzing/jstangle/linkfinder) can surface new routes
 // (e.g. /ui/, /console/) after the one-shot browser spidering already ran. When
 // such a route's already-fetched response looks like a JS/SPA shell or an
 // interactive page (and not a login/SSO wall), this step re-crawls it with a
@@ -186,7 +244,7 @@ type DiscoveryExtensionConfig struct {
 
 	// SPA-gated JS-bundle name sweep: probe common JS bundle names (main.js,
 	// admin.js, config.js, …) on monolith / server-rendered apps and feed hits
-	// to jsscan. Skipped on JS-shell SPAs (content-hashed, unguessable bundles).
+	// to jstangle. Skipped on JS-shell SPAs (content-hashed, unguessable bundles).
 	JSBundleSweep *bool    `yaml:"js_bundle_sweep"` // nil = default (true)
 	JSBundleNames []string `yaml:"js_bundle_names"` // override curated names; empty = built-in
 }
@@ -200,7 +258,7 @@ type DiscoveryEngineConfig struct {
 	MaxConsecutiveErrors    int                          `yaml:"max_consecutive_errors"`
 	MaxConsecutiveWAFBlocks int                          `yaml:"max_consecutive_waf_blocks"`
 	ObservedMaxItems        int                          `yaml:"observed_max_items"`
-	DisableKingfisher       bool                         `yaml:"disable_kingfisher"`
+	DisableSecretScan       bool                         `yaml:"disable_secret_scan"`
 	PrefixBreaker           DiscoveryPrefixBreakerConfig `yaml:"prefix_breaker"`
 }
 
@@ -241,6 +299,13 @@ func DefaultDiscoveryConfig() *DiscoveryConfig {
 			CaseSensitivity:  "auto_detect",
 			Timeout:          "10s",
 			ObservedMaxItems: 4000,
+		},
+		JSTangle: DiscoveryJSTangleConfig{
+			ReplayMode: "exact", ReplaySafety: "read-only", WorkerCount: 0, MemoryBudgetMB: 768, CacheMB: 128,
+			WorkerMaxJobs: 100, WorkerMaxRSSMB: 1024, JobTimeout: "60s",
+			NormalInputMB: 1, MaxASTInputMB: 4, HardInputMB: 10, MaxRequestsPerFile: 500,
+			MaxASTNodes:   500_000,
+			MaxAssetDepth: 4, MaxAssetsPerParent: 64, MaxAssetsPerHost: 512, MaxAssetsTotal: 2048,
 		},
 		SaveResponseBody: true,
 	}
@@ -293,6 +358,27 @@ func (c *DiscoveryConfig) Validate() error {
 		// valid
 	default:
 		return fmt.Errorf("discovery.engine.case_sensitivity: must be auto_detect, sensitive, or insensitive, got %q", c.Engine.CaseSensitivity)
+	}
+	switch c.JSTangle.ReplayMode {
+	case "", "exact", "conservative", "off":
+	default:
+		return fmt.Errorf("discovery.jstangle.replay_mode must be exact, conservative, or off")
+	}
+	switch c.JSTangle.ReplaySafety {
+	case "", "metadata-only", "read-only", "safe-baseline", "state-changing":
+	default:
+		return fmt.Errorf("discovery.jstangle.replay_safety must be metadata-only, read-only, safe-baseline, or state-changing")
+	}
+	if c.JSTangle.JobTimeout != "" {
+		if duration, err := time.ParseDuration(c.JSTangle.JobTimeout); err != nil || duration < time.Second || duration > 5*time.Minute {
+			return fmt.Errorf("discovery.jstangle.job_timeout must be a duration between 1s and 5m")
+		}
+	}
+	if c.JSTangle.WorkerCount < 0 || c.JSTangle.WorkerCount > 16 || c.JSTangle.MemoryBudgetMB < 0 || c.JSTangle.CacheMB < 0 {
+		return fmt.Errorf("discovery.jstangle worker/cache budgets are invalid")
+	}
+	if c.JSTangle.MaxASTNodes != 0 && (c.JSTangle.MaxASTNodes < 1_000 || c.JSTangle.MaxASTNodes > 5_000_000) {
+		return fmt.Errorf("discovery.jstangle.max_ast_nodes must be 1000-5000000")
 	}
 
 	if c.ReSpider.PerSeedMaxDuration != "" {

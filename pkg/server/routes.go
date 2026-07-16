@@ -99,7 +99,8 @@ func registerRoutes(app *fiber.App, handlers *Handlers, cfg ServerConfig) {
 	app.Use(ProjectUUIDMiddleware(handlers.repo))
 
 	// Routes (public — no role guard needed, auth already skips these)
-	app.Get("/health", handlers.HandleHealth)
+	app.Get("/health", handlers.HandleHealth) // liveness (no DB dependency)
+	app.Get("/ready", handlers.HandleReady)   // readiness (DB ping)
 	app.Get("/server-info", handlers.HandleServerInfo)
 
 	// API group
@@ -186,6 +187,7 @@ func registerRoutes(app *fiber.App, handlers *Handlers, cfg ServerConfig) {
 	operator.Post("/scans/:uuid/pause", handlers.HandlePauseScan)
 	operator.Post("/scans/:uuid/resume", handlers.HandleResumeScan)
 	operator.Post("/ingest-http", handlers.HandleIngestHTTP)
+	operator.Post("/burp/sitemap/snapshot", handlers.HandleBurpSiteMapSnapshot)
 	operator.Post("/import", handlers.HandleImport)
 	operator.Post("/scans/:uuid/update", handlers.HandleUpdateScan)
 	operator.Post("/agent/scans/:uuid/update", handlers.HandleUpdateAgenticScan)

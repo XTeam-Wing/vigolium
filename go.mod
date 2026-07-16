@@ -31,6 +31,7 @@ require (
 	github.com/andybalholm/brotli v1.2.1
 	github.com/andybalholm/cascadia v1.3.3
 	github.com/antchfx/htmlquery v1.3.6
+	github.com/coregx/ahocorasick v0.2.1
 	github.com/evanw/esbuild v0.28.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/getkin/kin-openapi v0.133.0
@@ -68,6 +69,7 @@ require (
 	github.com/uptrace/bun/driver/pgdriver v1.2.18
 	github.com/uptrace/bun/driver/sqliteshim v1.2.18
 	github.com/vmihailenco/msgpack/v5 v5.4.1
+	github.com/wasilibs/go-re2 v1.12.0
 	github.com/ysmood/gson v0.7.3
 	github.com/yuin/goldmark v1.8.2
 	go.uber.org/goleak v1.3.0
@@ -89,6 +91,8 @@ require (
 	github.com/moby/moby/client v0.4.0 // indirect
 	github.com/moby/sys/atomicwriter v0.1.0 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
+	github.com/tetratelabs/wazero v1.12.0 // indirect
+	github.com/wasilibs/wazero-helpers v0.0.0-20250123031827-cd30c44769bb // indirect
 	github.com/ysmood/fetchup v0.2.3 // indirect
 	github.com/ysmood/goob v0.4.0 // indirect
 	github.com/ysmood/got v0.40.0 // indirect
@@ -481,7 +485,7 @@ require (
 	golang.org/x/exp v0.0.0-20260218203240-3dfff04db8fa // indirect
 	golang.org/x/mod v0.35.0
 	golang.org/x/oauth2 v0.36.0
-	golang.org/x/sys v0.45.0
+	golang.org/x/sys v0.46.0
 	golang.org/x/tools v0.44.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260209200024-4cfbd4190f57 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260209200024-4cfbd4190f57 // indirect
@@ -495,6 +499,6 @@ require (
 	modernc.org/libc v1.68.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.46.1 // indirect
+	modernc.org/sqlite v1.46.1
 	moul.io/http2curl v1.0.0 // indirect
 )

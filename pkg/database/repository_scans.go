@@ -100,6 +100,7 @@ func (r *Repository) aggregateScanFindings(ctx context.Context, scanUUID string)
 		ColumnExpr("severity").
 		ColumnExpr("COUNT(*) AS count").
 		Where("scan_uuid = ?", scanUUID).
+		Where("(record_kind IS NULL OR record_kind = '' OR record_kind = ?)", RecordKindFinding).
 		GroupExpr("severity").
 		Scan(ctx, &rows)
 
@@ -126,16 +127,17 @@ func (r *Repository) aggregateScanFindings(ctx context.Context, scanUUID string)
 
 // applySeverityCounts sets severity count fields on an UPDATE query builder.
 func applySeverityCounts(q *bun.UpdateQuery, sc scanSeverityCounts) *bun.UpdateQuery {
-	q = q.Set("critical_count = ?", sc.Critical).
+	// total_findings is set unconditionally alongside the severity counts: a
+	// recompute yielding zero (all findings deleted/reclassified) must be able to
+	// reset it to 0, otherwise the row keeps a stale non-zero total while every
+	// severity count reads 0 — an internally inconsistent scan record.
+	return q.Set("critical_count = ?", sc.Critical).
 		Set("high_count = ?", sc.High).
 		Set("medium_count = ?", sc.Medium).
 		Set("low_count = ?", sc.Low).
 		Set("info_count = ?", sc.Info).
-		Set("suspect_count = ?", sc.Suspect)
-	if sc.Total > 0 {
-		q = q.Set("total_findings = ?", sc.Total)
-	}
-	return q
+		Set("suspect_count = ?", sc.Suspect).
+		Set("total_findings = ?", sc.Total)
 }
 
 // CompleteScan marks a scan as completed (or failed if errMsg is non-empty)
@@ -211,40 +213,34 @@ func (r *Repository) ListScans(ctx context.Context, projectUUID string, limit, o
 }
 
 // LoadEnabledScopes loads enabled scope rules for a project, ordered by priority.
-// Falls back to the default project's scopes if no project-specific scopes exist.
+// An empty projectUUID means the default project — never "all projects". Falls
+// back to the default project's scopes when a non-default project has none, but
+// if the default project itself has no enabled scopes it returns empty rather
+// than an unscoped query that would leak every project's rules across engagements.
 func (r *Repository) LoadEnabledScopes(ctx context.Context, projectUUID string) ([]*Scope, error) {
+	projectUUID = defaultProjectUUID(projectUUID)
+
 	var scopes []*Scope
-
-	if projectUUID != "" {
-		err := r.db.NewSelect().
-			Model(&scopes).
-			Where("project_uuid = ?", projectUUID).
-			Where("enabled = ?", true).
-			Order("priority ASC").
-			Scan(ctx)
-		if err != nil {
-			zap.L().Debug("Failed to load project scopes", zap.Error(err))
-			return nil, err
-		}
-		if len(scopes) > 0 {
-			return scopes, nil
-		}
-		// Fall back to default project scopes
-		if projectUUID != DefaultProjectUUID {
-			return r.LoadEnabledScopes(ctx, DefaultProjectUUID)
-		}
-	}
-
-	// No project filter or default project — load all enabled scopes
 	err := r.db.NewSelect().
 		Model(&scopes).
+		Where("project_uuid = ?", projectUUID).
 		Where("enabled = ?", true).
 		Order("priority ASC").
 		Scan(ctx)
 	if err != nil {
-		zap.L().Debug("Failed to load scopes", zap.Error(err))
+		zap.L().Debug("Failed to load project scopes", zap.Error(err))
 		return nil, err
 	}
+	if len(scopes) > 0 {
+		return scopes, nil
+	}
+
+	// A non-default project with no scopes inherits the default project's scopes.
+	if projectUUID != DefaultProjectUUID {
+		return r.LoadEnabledScopes(ctx, DefaultProjectUUID)
+	}
+
+	// Default project has no enabled scopes — return empty, not every project's.
 	return scopes, nil
 }
 
@@ -258,11 +254,15 @@ func (r *Repository) CreateScanWithCursor(ctx context.Context, scan *Scan) error
 	scan.ProjectUUID = defaultProjectUUID(scan.ProjectUUID)
 
 	if scan.ScanMode == "incremental" && scan.Modules != "" {
-		// Find the last completed scan with the same modules to copy cursor
+		// Find the last completed scan with the same modules to copy cursor. The
+		// lookup must stay within this scan's project: a cursor is a per-tenant
+		// (created_at, uuid) position, so inheriting one from another project would
+		// make this incremental scan skip records up to that foreign timestamp.
 		var prev Scan
 		err := r.db.NewSelect().
 			Model(&prev).
 			Column("cursor_at", "cursor_uuid").
+			Where("project_uuid = ?", scan.ProjectUUID).
 			Where("status = ?", "completed").
 			Where("modules = ?", scan.Modules).
 			OrderExpr("finished_at DESC").
@@ -310,7 +310,7 @@ func (r *Repository) AdvanceScanCursorBy(ctx context.Context, scanUUID string, r
 	}
 	// Format cursor_at to match SQLite's CURRENT_TIMESTAMP format (no timezone suffix).
 	// Go's time.Time serialization adds timezone info that breaks SQLite text comparison.
-	cursorAt := recordCreatedAt.UTC().Format("2006-01-02 15:04:05")
+	cursorAt := dbTimestampString(recordCreatedAt)
 	_, err := r.db.NewUpdate().
 		Model((*Scan)(nil)).
 		Set("cursor_at = ?", cursorAt).
@@ -336,30 +336,28 @@ func (r *Repository) ResetScanCursor(ctx context.Context, scanUUID string) error
 }
 
 // CountRecordsAfterCursor counts records after the given cursor position.
-// A zero cursorAt means count all records. When hostnames is non-empty,
-// only records matching those hostnames are counted.
-func (r *Repository) CountRecordsAfterCursor(ctx context.Context, cursorAt time.Time, cursorUUID string, hostnames ...string) (int64, error) {
-	return r.countRecordsAfterCursor(ctx, cursorAt, cursorUUID, nil, hostnames)
+// A zero cursorAt means count all records. When hosts is non-empty, only records
+// matching those in-scope origins (scheme+hostname+port) are counted.
+func (r *Repository) CountRecordsAfterCursor(ctx context.Context, cursorAt time.Time, cursorUUID string, hosts ...HostTarget) (int64, error) {
+	return r.countRecordsAfterCursor(ctx, cursorAt, cursorUUID, nil, hosts)
 }
 
 // CountRecordsAfterCursorBySource is like CountRecordsAfterCursor but also
 // filters on http_records.source. Used by scan-on-receive shallow mode to
 // report only user-ingested traffic in the "new ingested records" status,
 // excluding finding/scanner artefacts produced by the scan itself.
-func (r *Repository) CountRecordsAfterCursorBySource(ctx context.Context, cursorAt time.Time, cursorUUID string, sources []string, hostnames []string) (int64, error) {
-	return r.countRecordsAfterCursor(ctx, cursorAt, cursorUUID, sources, hostnames)
+func (r *Repository) CountRecordsAfterCursorBySource(ctx context.Context, cursorAt time.Time, cursorUUID string, sources []string, hosts []HostTarget) (int64, error) {
+	return r.countRecordsAfterCursor(ctx, cursorAt, cursorUUID, sources, hosts)
 }
 
-func (r *Repository) countRecordsAfterCursor(ctx context.Context, cursorAt time.Time, cursorUUID string, sources []string, hostnames []string) (int64, error) {
+func (r *Repository) countRecordsAfterCursor(ctx context.Context, cursorAt time.Time, cursorUUID string, sources []string, hosts []HostTarget) (int64, error) {
 	q := r.db.NewSelect().Model((*HTTPRecord)(nil))
 
 	if !cursorAt.IsZero() {
 		q = q.Where("(created_at > ? OR (created_at = ? AND uuid > ?))", cursorAt, cursorAt, cursorUUID)
 	}
 
-	if len(hostnames) > 0 {
-		q = q.Where("hostname IN (?)", bun.List(hostnames))
-	}
+	q = applyHostScopeFilter(q, hosts)
 
 	if len(sources) > 0 {
 		q = q.Where("source IN (?)", bun.List(sources))
@@ -370,6 +368,31 @@ func (r *Repository) countRecordsAfterCursor(ctx context.Context, cursorAt time.
 		return 0, fmt.Errorf("failed to count records after cursor: %w", err)
 	}
 	return int64(count), nil
+}
+
+// CountRecordsByStatusCode returns http_record counts grouped by HTTP status
+// code, restricted to the same in-scope origins as CountRecordsAfterCursor
+// (empty hosts = every record). Keys are the raw numeric status codes (0 for a
+// missing/unset status); callers bucket them into 2xx/3xx/… classes. Powers the
+// scan-completion summary's status-class line, so its host scope matches the
+// record count printed alongside it.
+func (r *Repository) CountRecordsByStatusCode(ctx context.Context, hosts ...HostTarget) (map[int]int64, error) {
+	var rows []struct {
+		StatusCode int   `bun:"status_code"`
+		Count      int64 `bun:"count"`
+	}
+	q := r.db.NewSelect().
+		Model((*HTTPRecord)(nil)).
+		ColumnExpr("status_code, COUNT(*) AS count")
+	q = applyHostScopeFilter(q, hosts)
+	if err := q.GroupExpr("status_code").Scan(ctx, &rows); err != nil {
+		return nil, fmt.Errorf("failed to count records by status code: %w", err)
+	}
+	out := make(map[int]int64, len(rows))
+	for _, row := range rows {
+		out[row.StatusCode] = row.Count
+	}
+	return out, nil
 }
 
 // PauseScan sets a scan's status to "paused".

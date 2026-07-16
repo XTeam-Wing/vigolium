@@ -10,6 +10,7 @@ import (
 
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/modules/modtest"
+	"github.com/vigolium/vigolium/pkg/output"
 )
 
 // TestScanPerRequest_CatchAllEndpoint reproduces the reported false positive:
@@ -52,8 +53,11 @@ func TestScanPerRequest_DangerousMethodEnabled(t *testing.T) {
 		switch r.Method {
 		case "GET":
 			_, _ = io.WriteString(w, "<html><body>resource listing: alpha beta gamma delta epsilon zeta</body></html>")
+		case "OPTIONS":
+			w.Header().Set("Allow", "GET, PUT, DELETE, PATCH")
+			w.WriteHeader(http.StatusNoContent)
 		case "PUT", "DELETE", "PATCH", "MKCOL", "MOVE", "COPY":
-			_, _ = io.WriteString(w, "<html><body>resource modified by "+r.Method+" successfully, new state persisted</body></html>")
+			t.Fatal("safe capability audit must never send a state-changing method: " + r.Method)
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			_, _ = io.WriteString(w, "method not allowed")
@@ -73,7 +77,10 @@ func TestScanPerRequest_DangerousMethodEnabled(t *testing.T) {
 		t.Fatalf("scan: %v", err)
 	}
 	if len(res) == 0 {
-		t.Fatal("expected a finding: write methods are enabled and the sentinel method is rejected (not a catch-all)")
+		t.Fatal("expected an observation for methods declared by OPTIONS")
+	}
+	if res[0].RecordKind != output.RecordKindObservation {
+		t.Fatalf("declared capability must be an observation, got %q", res[0].RecordKind)
 	}
 }
 
@@ -149,18 +156,23 @@ func TestScanPerRequest_OverrideIgnored_SameBody(t *testing.T) {
 // guard fires), leaving the override differential as the sole, confirmed signal.
 func TestScanPerRequest_OverrideRespected(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "POST" && r.Header.Get("X-HTTP-Method-Override") == "DELETE" {
-			_, _ = io.WriteString(w, "<html><body>resource 42 was permanently deleted from the collection</body></html>")
+		if r.Method == "GET" && r.Header.Get("X-HTTP-Method-Override") == "OPTIONS" {
+			w.Header().Set("Allow", "GET, PUT")
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, "GET, PUT")
 			return
 		}
 		switch r.Method {
 		case "GET":
+			w.Header().Set("Content-Type", "text/html")
 			_, _ = io.WriteString(w, "<html><body>resource 42 listing: created updated owner tags status</body></html>")
-		case "POST":
-			_, _ = io.WriteString(w, "<html><body>nothing to submit here, this form has no fields to process</body></html>")
-		default: // direct PUT/DELETE/PATCH/... and the VIGOLIUMX sentinel
+		case "OPTIONS":
+			w.Header().Set("Allow", "GET, PUT")
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, "GET, PUT")
+		default:
+			t.Fatal("safe override audit sent an unexpected method: " + r.Method)
 			w.WriteHeader(http.StatusMethodNotAllowed)
-			_, _ = io.WriteString(w, "method not allowed")
 		}
 	}))
 	defer srv.Close()
@@ -174,7 +186,163 @@ func TestScanPerRequest_OverrideRespected(t *testing.T) {
 		t.Fatalf("scan: %v", err)
 	}
 	if len(res) == 0 {
-		t.Fatal("expected a finding: the override is honored and materially changes the response vs a plain POST")
+		t.Fatal("expected observations for declared methods and a reproducible safe override")
+	}
+	foundOverride := false
+	for _, result := range res {
+		if result.Info.Name == "HTTP Method Override Mechanism Observed" {
+			foundOverride = true
+			if result.RecordKind != output.RecordKindObservation {
+				t.Fatalf("override capability must be an observation, got %q", result.RecordKind)
+			}
+		}
+	}
+	if !foundOverride {
+		t.Fatal("expected safe OPTIONS override observation")
+	}
+}
+
+// TestScanPerRequest_OverrideNonDeterministicToken reproduces the dominant
+// reported false positive: an analytics/attestation endpoint (à la
+// /web-analytics/web/init_client or BootstrapAttestationSession) that mints a
+// FRESH random token on every POST and ignores the method-override header. The
+// override response differs from a single plain-POST control only because of the
+// per-request token, so the old single-sample differential concluded the override
+// was "respected". The determinism gate takes a SECOND no-override control, sees
+// the two controls differ from each other by the same random amount, and reports
+// nothing. The direct write methods and the sentinel are rejected with 405 so the
+// override differential is the sole candidate signal.
+func TestScanPerRequest_OverrideNonDeterministicToken(t *testing.T) {
+	// freshToken mimics a base64 attestation token: ~120 non-hex letters (so the
+	// similarity normalizer, which collapses long hex/digit runs, does NOT erase
+	// it) that changes completely from one request to the next.
+	freshToken := func(c int64) string {
+		const alpha = "ghijklmnopqrstuvwxyzGHIJKLMNOPQRSTUVWXYZ+/" // all non-hex
+		b := make([]byte, 120)
+		for i := range b {
+			b[i] = alpha[(int(c)*31+i*7)%len(alpha)]
+		}
+		return string(b)
+	}
+	var n int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "GET", "POST":
+			// Fresh high-entropy token on every request, verb/override ignored.
+			c := atomic.AddInt64(&n, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"cid":"c%d","token":"%s"}`, c, freshToken(c))
+		default: // direct PUT/DELETE/... and the VIGOLIUMX sentinel
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_, _ = io.WriteString(w, "method not allowed")
+		}
+	}))
+	defer srv.Close()
+
+	client := modtest.Requester(t)
+	rr := modtest.Response(modtest.Request(t, srv.URL+"/web-analytics/web/init_client"),
+		"application/json", `{"cid":"c0","token":"`+freshToken(0)+`"}`)
+
+	res, err := New().ScanPerRequest(rr, client, &modkit.ScanContext{})
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(res) != 0 {
+		t.Fatalf("a non-deterministic per-request-token endpoint (override ignored) must not be reported, got %d: %+v", len(res), res)
+	}
+}
+
+// TestScanPerRequest_AuraSoftError reproduces the Salesforce Aura false positive:
+// the framework endpoint answers a DELETE with an HTTP 200 aura:invalidSession
+// event (the CSRF/session token was rejected, so nothing was performed). Such a
+// soft-error 200 must not count as an enabled write method.
+func TestScanPerRequest_AuraSoftError(t *testing.T) {
+	const auraErr = `{"event":{"descriptor":"markup://aura:invalidSession","attributes":{"values":{"newToken":"x"}}},"exceptionEvent":true}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == "GET" {
+			_, _ = io.WriteString(w, `{"actions":[{"state":"SUCCESS","returnValue":{"listing":"alpha beta"}}]}`)
+			return
+		}
+		// Any other verb (incl. DELETE and the sentinel) → 200 invalidSession event.
+		_, _ = io.WriteString(w, auraErr)
+	}))
+	defer srv.Close()
+
+	client := modtest.Requester(t)
+	rr := modtest.Response(modtest.Request(t, srv.URL+"/s/sfsites/aura?r=4&aura.ApexAction.execute=1"),
+		"application/json", `{"actions":[{"state":"SUCCESS","returnValue":{"listing":"alpha beta"}}]}`)
+
+	res, err := New().ScanPerRequest(rr, client, &modkit.ScanContext{})
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(res) != 0 {
+		t.Fatalf("an Aura invalidSession 200 (action not performed) must not be reported, got %d: %+v", len(res), res)
+	}
+}
+
+// TestScanPerRequest_VerbAgnosticRead reproduces the geo/beacon false positive
+// (à la /cookies/api/user_location answering any verb with the same location
+// JSON): a MOVE/PUT returns exactly what a benign GET returns because the server
+// routed it to the same read handler. The GET control is similar to the
+// dangerous-method response, so the verb was ignored and nothing is reported. The
+// sentinel is accepted too, but the verb-agnostic gate fires first regardless.
+func TestScanPerRequest_VerbAgnosticRead(t *testing.T) {
+	const loc = `{"country":"AU","region":"nsw","regionSubdivision":"AUNSW","city":"sydney"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Same read response for EVERY method (GET, PUT, DELETE, MOVE, sentinel).
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, loc)
+	}))
+	defer srv.Close()
+
+	client := modtest.Requester(t)
+	rr := modtest.Response(modtest.Request(t, srv.URL+"/cookies/api/user_location"), "application/json", loc)
+
+	res, err := New().ScanPerRequest(rr, client, &modkit.ScanContext{})
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(res) != 0 {
+		t.Fatalf("a verb-agnostic read endpoint (MOVE returns same as GET) must not be reported, got %d: %+v", len(res), res)
+	}
+}
+
+// TestScanPerRequest_ContentTypeFlipSPA reproduces the static-asset-on-a-SPA
+// false positive (à la /site.webmanifest): a GET serves the real asset
+// (non-HTML), but a PUT is swallowed by the catch-all SPA renderer and returns an
+// HTML document. The content-type flip (non-HTML GET → HTML write) marks the SPA
+// render, so the "PUT enabled" candidate is dropped. Direct write methods 2xx
+// (SPA render) but the sentinel is rejected so the catch-all guard does not fire.
+func TestScanPerRequest_ContentTypeFlipSPA(t *testing.T) {
+	const manifest = `{"name":"Easy Lens","short_name":"EasyLens","icons":[],"start_url":"/","display":"standalone"}`
+	const shell = `<!doctype html><html><head><title>Easy Lens</title></head><body><div id="root">loading the app now</div></body></html>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "GET":
+			w.Header().Set("Content-Type", "application/manifest+json")
+			_, _ = io.WriteString(w, manifest)
+		case "PUT", "DELETE", "PATCH", "MKCOL", "MOVE", "COPY":
+			// Catch-all SPA renderer: HTML shell for any write verb.
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = io.WriteString(w, shell)
+		default: // VIGOLIUMX sentinel rejected → catch-all guard does not fire
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_, _ = io.WriteString(w, "method not allowed")
+		}
+	}))
+	defer srv.Close()
+
+	client := modtest.Requester(t)
+	rr := modtest.Response(modtest.Request(t, srv.URL+"/site.webmanifest"), "application/manifest+json", manifest)
+
+	res, err := New().ScanPerRequest(rr, client, &modkit.ScanContext{})
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(res) != 0 {
+		t.Fatalf("a content-type flip to an HTML SPA shell (verb swallowed by the renderer) must not be reported, got %d: %+v", len(res), res)
 	}
 }
 
@@ -219,6 +387,12 @@ func TestIsSuccessfulMethod(t *testing.T) {
 			name:       "200 with login redirect is not successful",
 			statusCode: 200,
 			body:       "<html>Redirecting to /login please authenticate first</html>",
+			want:       false,
+		},
+		{
+			name:       "200 aura:invalidSession soft-error is not successful",
+			statusCode: 200,
+			body:       `{"event":{"descriptor":"markup://aura:invalidSession"},"exceptionEvent":true}`,
 			want:       false,
 		},
 		{

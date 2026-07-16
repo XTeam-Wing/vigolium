@@ -25,9 +25,10 @@ const (
 
 // FindingSink is the subset of the database repository the report_finding
 // tool needs. Keeping this narrow lets us swap in a test double and keeps
-// the tool's import surface tight.
+// the tool's import surface tight. SaveFindingReported reports whether a new
+// row was inserted (vs a dedup) so the tool only counts distinct findings.
 type FindingSink interface {
-	SaveFindingDirect(ctx context.Context, finding *database.Finding) error
+	SaveFindingReported(ctx context.Context, finding *database.Finding) (inserted bool, err error)
 }
 
 // ReportFindingContext pins the scope under which findings are recorded.
@@ -116,6 +117,11 @@ func (*reportFindingTool) Schema() map[string]any {
 				"type":        "string",
 				"description": "Optional raw HTTP response demonstrating the issue.",
 			},
+			"record_uuids": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "UUIDs of the http_records that prove this finding (from query_records / inspect_record / replay_request's replay_record_uuid / web_fetch's record_uuid). Link the exchange(s) that demonstrate the bug so the finding is reproducible after the session ends. Prefer this over pasting large raw request/response text.",
+			},
 			"dedup_key": map[string]any{
 				"type":        "string",
 				"description": "Optional explicit dedup identifier. When set, overrides the default content hash (title + severity + location + description fingerprint). Use this to force dedup of the same bug across phrasings, or to avoid accidental collapse of two different bugs that share a title.",
@@ -200,6 +206,14 @@ func (c *ReportFindingContext) PersistFromArgs(ctx context.Context, args map[str
 		}
 	}
 
+	// Evidence linkage: the http_records that prove this finding. The model
+	// only ever learns valid UUIDs from project-scoped tools (query_records,
+	// inspect_record, replay_request, web_fetch), so these are in-project by
+	// construction — no DB round-trip to re-verify here (the narrow FindingSink
+	// deliberately has no record-read capability). Deduped and bounded so a
+	// looping model can't attach an unbounded list.
+	recordUUIDs := parseRecordUUIDs(args["record_uuids"])
+
 	var findingHash string
 	if trimmed := strings.TrimSpace(dedupKey); trimmed != "" {
 		findingHash = hashDedupKey(trimmed)
@@ -209,7 +223,7 @@ func (c *ReportFindingContext) PersistFromArgs(ctx context.Context, args map[str
 
 	finding := &database.Finding{
 		ProjectUUID:     c.ProjectUUID,
-		HTTPRecordUUIDs: []string{}, // agent-originated; no scanner HTTP records attached
+		HTTPRecordUUIDs: recordUUIDs, // evidence records the model linked (may be empty)
 		ScanUUID:        c.ScanUUID,
 		AgenticScanUUID: c.AgenticScanUUID,
 		URL:             url,
@@ -233,10 +247,25 @@ func (c *ReportFindingContext) PersistFromArgs(ctx context.Context, args map[str
 		FoundAt:         time.Now().UTC(),
 	}
 
-	if err := c.Repo.SaveFindingDirect(ctx, finding); err != nil {
+	inserted, err := c.Repo.SaveFindingReported(ctx, finding)
+	if err != nil {
 		return PersistResult{
 			Message: fmt.Sprintf("failed to save finding: %v", err),
 			IsError: true,
+		}
+	}
+	if !inserted {
+		// Deduplicated against an existing finding. Don't bump the counter — it
+		// tracks distinct findings and feeds the soft-warn / hard-cap gates.
+		n := c.Count.Load()
+		return PersistResult{
+			Message: fmt.Sprintf("Finding deduplicated (hash=%s) — already recorded; not re-counted", finding.FindingHash[:12]),
+			Count:   n,
+			Details: map[string]any{
+				"deduplicated": true,
+				"severity":     severity,
+				"title":        title,
+			},
 		}
 	}
 
@@ -266,6 +295,30 @@ type PersistResult struct {
 	Details map[string]any // structured info passed through to tool.Result.Details
 	IsError bool
 }
+
+// Exported thin wrappers so the verify-before-promote pipeline (pkg/agent) can
+// build a promoted Finding from a candidate with exactly the same composition
+// and hashing the report_finding tool uses — keeping dedup consistent between a
+// directly-reported finding and a verified-then-promoted one.
+
+// HashFinding is the exported form of hashFinding.
+func HashFinding(title, severity, sourceFile, url, description string) string {
+	return hashFinding(title, severity, sourceFile, url, description)
+}
+
+// HashDedupKey is the exported form of hashDedupKey.
+func HashDedupKey(key string) string { return hashDedupKey(key) }
+
+// ComposeDescription is the exported form of composeDescription.
+func ComposeDescription(title, description, remediation string) string {
+	return composeDescription(title, description, remediation)
+}
+
+// ExtractHostname is the exported form of extractHostname.
+func ExtractHostname(rawURL string) string { return extractHostname(rawURL) }
+
+// Truncate is the exported form of truncate.
+func Truncate(s string, max int) string { return truncate(s, max) }
 
 // hashFinding builds a deterministic fingerprint so duplicate calls are
 // squashed by SaveFindingDirect's ON CONFLICT handling. Includes a
@@ -332,6 +385,32 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max-1] + "…"
+}
+
+// maxEvidenceRecords bounds how many http_record UUIDs a single finding may
+// link. A well-scoped finding cites a handful; past this a looping model is
+// almost certainly over-attaching.
+const maxEvidenceRecords = 50
+
+// parseRecordUUIDs normalizes the record_uuids arg into a deduped, bounded,
+// non-nil slice of trimmed non-empty UUIDs. The []any / []string coercion is
+// delegated to stringSlice; the dedup, maxEvidenceRecords cap, and non-nil
+// guarantee (so the DB column matches the prior []string{} when the model
+// links no evidence) are finding-specific and stay here.
+func parseRecordUUIDs(raw any) []string {
+	out := make([]string, 0)
+	seen := map[string]struct{}{}
+	for _, v := range stringSlice(raw) {
+		if v = strings.TrimSpace(v); v == "" || len(out) >= maxEvidenceRecords {
+			continue
+		}
+		if _, dup := seen[v]; dup {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
 }
 
 func extractHostname(rawURL string) string {

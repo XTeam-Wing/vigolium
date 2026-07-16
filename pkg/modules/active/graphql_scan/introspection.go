@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
+
+	"github.com/vigolium/vigolium/pkg/graphqlx"
 )
 
 // graphqlPaths are common GraphQL endpoint locations to probe.
@@ -22,13 +24,10 @@ var graphqlPaths = []string{
 const typenameQuery = `{"query":"{ __typename }"}`
 
 // introspectionQuery is the full introspection query to enumerate the schema.
-const introspectionQuery = `{"query":"{ __schema { types { name fields { name args { name type { name kind ofType { name } } } } } } }"}`
-
-// batchQuery tests if the endpoint supports query batching.
-const batchQuery = `[{"query":"{ __typename }"},{"query":"{ __typename }"},{"query":"{ __typename }"}]`
-
-// aliasBatchQuery tests if the endpoint supports alias-based batching (alternative to array batching).
-const aliasBatchQuery = `{"query":"{ a1: __typename a2: __typename a3: __typename }"}`
+// It uses the shared canonical query (queryType/mutationType names, deep ofType
+// chains, inputFields, enumValues) so both the SQLi field-picker below and the
+// operations expander can build valid documents from one fetch.
+var introspectionQuery = graphqlx.IntrospectionBody()
 
 // genericFieldNames are common GraphQL field names to try when introspection is disabled.
 var genericFieldNames = []string{
@@ -107,45 +106,49 @@ func parseIntrospectionResponse(body string) []introspectionField {
 	return fields
 }
 
-// containsSQLError checks if the body contains any SQL error pattern.
+// containsSQLError only considers messages in a structured GraphQL errors
+// envelope. A proxy, HTML error page, response header, or arbitrary JSON string
+// containing a database token is not backend injection evidence.
 func containsSQLError(body string) bool {
-	for _, pattern := range sqlErrorPatterns {
-		if pattern.MatchString(body) {
-			return true
+	var response struct {
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if json.Unmarshal([]byte(strings.TrimSpace(body)), &response) != nil || len(response.Errors) == 0 {
+		return false
+	}
+	for _, graphQLError := range response.Errors {
+		for _, pattern := range sqlErrorPatterns {
+			if pattern.MatchString(graphQLError.Message) {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-// isGraphQLEndpoint checks if the response indicates a valid GraphQL endpoint.
+// isGraphQLEndpoint validates the exact result of the { __typename } probe. A
+// generic JSON endpoint carrying a "data" key is not GraphQL evidence.
 func isGraphQLEndpoint(body string) bool {
-	return strings.Contains(body, "__typename") ||
-		strings.Contains(body, `"data"`)
+	var response struct {
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	if json.Unmarshal([]byte(strings.TrimSpace(body)), &response) != nil {
+		return false
+	}
+	raw, ok := response.Data["__typename"]
+	if !ok {
+		return false
+	}
+	var typename string
+	return json.Unmarshal(raw, &typename) == nil && strings.TrimSpace(typename) != ""
 }
 
-// hasIntrospection checks if the response contains a full introspection result.
+// hasIntrospection requires a parseable schema with a usable query or mutation
+// root. Merely reflecting the words "__schema", "types", or "fields" is not
+// enough.
 func hasIntrospection(body string) bool {
-	return strings.Contains(body, "__schema") &&
-		strings.Contains(body, "types") &&
-		strings.Contains(body, "fields")
-}
-
-// isAliasBatchResponse checks if the response contains multiple aliased results.
-func isAliasBatchResponse(body string) bool {
-	return strings.Contains(body, `"a1"`) &&
-		strings.Contains(body, `"a2"`) &&
-		strings.Contains(body, `"a3"`)
-}
-
-// isBatchResponse checks if the response is an array of results.
-func isBatchResponse(body string) bool {
-	body = strings.TrimSpace(body)
-	if !strings.HasPrefix(body, "[") {
-		return false
-	}
-	var arr []json.RawMessage
-	if err := json.Unmarshal([]byte(body), &arr); err != nil {
-		return false
-	}
-	return len(arr) >= 3
+	_, ok := graphqlx.ParseSchema([]byte(strings.TrimSpace(body)))
+	return ok
 }

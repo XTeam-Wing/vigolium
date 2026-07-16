@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -46,13 +47,26 @@ var authHeaders = map[string]struct{}{
 // Capture handles HTTP traffic capture using Chrome DevTools Protocol.
 // Uses browser-level event subscription to capture traffic from ALL pages.
 type Capture struct {
-	mu                     sync.Mutex
-	writer                 Writer
-	pending                map[proto.NetworkRequestID]*pendingEntry
-	logged                 map[string]struct{} // Track logged entries by hash to prevent stderr duplicates
-	seenHashes             map[string]bool     // Track written hashes to prevent file duplicates
-	duplicateCount         int                 // Count skipped duplicates
-	writtenCount           int                 // Count successfully written entries
+	mu         sync.Mutex
+	writer     Writer
+	pending    map[proto.NetworkRequestID]*pendingEntry
+	logged     map[string]struct{} // Track logged entries by hash to prevent stderr duplicates
+	seenHashes map[string]bool     // Track written hashes to prevent file duplicates
+	// workerSessions holds the CDP sessionIDs of attached service-worker targets.
+	// Worker sessions are not page targets, so they never appear in Browser.Pages();
+	// tracking them lets isSessionValid accept them and fetchResponseBody pull their
+	// bodies over the worker's own session instead of resolving a *Page.
+	workerSessions map[proto.TargetSessionID]struct{}
+	// shapeVariants counts how many DISTINCT query-value variants of each endpoint
+	// shape (the value-blind computeHash key) have been written, so up to
+	// maxParamVariants of them survive instead of collapsing to one. Keyed by shape
+	// hash. Only parameterized (has-query) entries touch it.
+	shapeVariants map[string]int
+	// maxParamVariants caps the distinct value-variants kept per shape (see
+	// Config.MaxParamValueVariants). 0 or 1 restores the original value-blind dedup.
+	maxParamVariants       int
+	duplicateCount         int // Count skipped duplicates
+	writtenCount           int // Count successfully written entries
 	stopped                bool
 	browser                *rod.Browser // Browser reference for fetching response bodies
 	noColor                bool         // Disable colored output
@@ -85,6 +99,8 @@ func New(writer Writer, noColor, silent, verbose, includeResponseBody, includeRe
 		pending:                make(map[proto.NetworkRequestID]*pendingEntry),
 		logged:                 make(map[string]struct{}),
 		seenHashes:             make(map[string]bool),
+		shapeVariants:          make(map[string]int),
+		workerSessions:         make(map[proto.TargetSessionID]struct{}),
 		noColor:                noColor,
 		silent:                 silent,
 		verbose:                verbose,
@@ -94,6 +110,16 @@ func New(writer Writer, noColor, silent, verbose, includeResponseBody, includeRe
 	}
 	c.SetTargetHost(targetHost)
 	return c
+}
+
+// SetMaxParamValueVariants sets how many distinct query-value variants of one
+// endpoint shape the capture keeps before falling back to value-blind dedup (see
+// Config.MaxParamValueVariants). Call once before the crawl starts; n<=1 keeps
+// the original behavior of one representative per shape.
+func (c *Capture) SetMaxParamValueVariants(n int) {
+	c.mu.Lock()
+	c.maxParamVariants = n
+	c.mu.Unlock()
 }
 
 // SetTargetHost re-points the cross-origin stderr-log filter at host. The
@@ -229,6 +255,9 @@ func (c *Capture) onWorkerAttached(browser *rod.Browser, e *proto.TargetAttached
 	url := e.TargetInfo.URL
 	wtype := string(e.TargetInfo.Type)
 	waiting := e.WaitingForDebugger
+	// Record the worker session so its later responses are treated as valid and
+	// their bodies are fetched over this session rather than looked up in Pages().
+	c.registerWorkerSession(sid)
 	go func() {
 		browser.EnableDomain(sid, proto.NetworkEnable{})
 		if waiting {
@@ -250,11 +279,34 @@ func (c *Capture) isStopped() bool {
 	return c.stopped
 }
 
+// registerWorkerSession records an attached service-worker CDP session.
+func (c *Capture) registerWorkerSession(sessionID proto.TargetSessionID) {
+	c.mu.Lock()
+	if c.workerSessions == nil {
+		c.workerSessions = make(map[proto.TargetSessionID]struct{})
+	}
+	c.workerSessions[sessionID] = struct{}{}
+	c.mu.Unlock()
+}
+
+// isWorkerSession reports whether sessionID belongs to an attached service worker.
+func (c *Capture) isWorkerSession(sessionID proto.TargetSessionID) bool {
+	c.mu.Lock()
+	_, ok := c.workerSessions[sessionID]
+	c.mu.Unlock()
+	return ok
+}
+
 // isSessionValid checks if a sessionID still has an active page in the browser.
 // This prevents expensive CDP calls for stale/invalid sessions after navigation.
 func (c *Capture) isSessionValid(sessionID proto.TargetSessionID) bool {
 	if c.browser == nil {
 		return false
+	}
+	// Service-worker sessions are not page targets, so they never appear in
+	// Pages(); accept them explicitly so their response bodies are still fetched.
+	if c.isWorkerSession(sessionID) {
+		return true
 	}
 	// Bound the CDP call: c.browser runs on the deadline-less background context,
 	// so a wedged/unresponsive browser would hang this capture-goroutine call
@@ -417,9 +469,17 @@ func (c *Capture) onLoadingFinished(e *proto.NetworkLoadingFinished, sessionID p
 	c.mu.Unlock()
 
 	if pending.entry.Response != nil {
-		// ALWAYS fetch body to compute httpx fields (content_length, words, lines)
-		// Validate session BEFORE attempting to fetch response body
-		if !c.isSessionValid(pending.sessionID) {
+		// Fetch the body only when it's worth it: HTML/JS/JSON/XML/API responses
+		// (always) or a retained, reasonably-sized static asset. Skipping a static
+		// body we'd discard also skips this response's page enumeration + CDP body
+		// transfer — the dominant per-response cost — instead of fetching every
+		// image/font/media body just to throw it away.
+		if !shouldFetchResponseBody(pending.entry, includeBody, e.EncodedDataLength) {
+			zap.L().Debug("Skipping body fetch for static/discarded response",
+				zap.String("url", pending.entry.Request.URL),
+				zap.String("content_type", pending.entry.ContentType))
+		} else if !c.isSessionValid(pending.sessionID) {
+			// Validate session BEFORE attempting to fetch response body.
 			zap.L().Debug("Skipping body fetch for invalid session",
 				zap.String("sessionID", string(pending.sessionID)),
 				zap.String("requestID", string(e.RequestID)),
@@ -485,6 +545,12 @@ func (c *Capture) fetchResponseBody(sessionID proto.TargetSessionID, requestID p
 		return nil, fmt.Errorf("browser not set")
 	}
 
+	// A service-worker session has no *Page in Pages(); fetch its body directly
+	// over the worker's own CDP session instead.
+	if c.isWorkerSession(sessionID) {
+		return c.fetchResponseBodyBySession(sessionID, requestID)
+	}
+
 	// Bound the CDP call (background-context browser) so a wedged browser can't
 	// hang the capture goroutine forever before we even reach the body fetch.
 	pages, err := c.browser.Timeout(browserPagesTimeout).Pages()
@@ -515,18 +581,101 @@ func (c *Capture) fetchResponseBody(sessionID proto.TargetSessionID, requestID p
 				return nil, err
 			}
 
-			if result.Base64Encoded {
-				return base64.StdEncoding.DecodeString(result.Body)
-			}
-			return []byte(result.Body), nil
+			return decodeResponseBody(result)
 		}
 	}
 
 	return nil, fmt.Errorf("page not found for sessionID: %s", sessionID)
 }
 
+// fetchResponseBodyBySession fetches a response body over an attached
+// service-worker CDP session directly (workers have no *Page in Pages()). Bounded
+// with a 5s timeout like the page path so a wedged worker can't hang the goroutine.
+func (c *Capture) fetchResponseBodyBySession(sessionID proto.TargetSessionID, requestID proto.NetworkRequestID) ([]byte, error) {
+	if c.browser == nil {
+		return nil, fmt.Errorf("browser not set")
+	}
+	ctx, cancel := context.WithTimeout(c.browser.GetContext(), 5*time.Second)
+	defer cancel()
+	req := proto.NetworkGetResponseBody{RequestID: requestID}
+	raw, err := c.browser.Call(ctx, string(sessionID), req.ProtoReq(), req)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("timeout fetching worker body after 5s: %w", err)
+		}
+		return nil, err
+	}
+	var result proto.NetworkGetResponseBodyResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, err
+	}
+	return decodeResponseBody(&result)
+}
+
+// decodeResponseBody returns the raw body from a Network.getResponseBody result,
+// base64-decoding it when CDP flagged the body as base64-encoded.
+func decodeResponseBody(result *proto.NetworkGetResponseBodyResult) ([]byte, error) {
+	if result.Base64Encoded {
+		return base64.StdEncoding.DecodeString(result.Body)
+	}
+	return []byte(result.Body), nil
+}
+
 // staticContentTypes lists MIME type substrings that identify static resources.
 var staticContentTypes = []string{"font", "image", "video", "audio"}
+
+// maxStaticBodyFetchBytes caps the size of a static/binary response body we're
+// willing to pull over CDP even when bodies are being retained. Beyond this a
+// static asset (an image, font, media file) is not worth the transfer.
+const maxStaticBodyFetchBytes = 5 * 1024 * 1024
+
+// isBinaryStaticContentType reports whether a content type is binary static
+// media (font/image/video/audio) whose body carries no useful text metrics.
+func isBinaryStaticContentType(contentType string) bool {
+	ct := strings.ToLower(contentType)
+	for _, s := range staticContentTypes {
+		if strings.Contains(ct, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasStaticExtension reports whether a URL path ends in a known static-asset
+// extension (css/map/fonts/images/media). It scans the raw string (no url.Parse
+// allocation — this is on the per-response capture path): strip the query/
+// fragment, then take the last dot only if it falls after the last path slash
+// (so a host dot like "example.com" with no path doesn't match).
+func hasStaticExtension(rawURL string) bool {
+	if i := strings.IndexAny(rawURL, "?#"); i != -1 {
+		rawURL = rawURL[:i]
+	}
+	dot := strings.LastIndexByte(rawURL, '.')
+	if dot == -1 || dot < strings.LastIndexByte(rawURL, '/') {
+		return false
+	}
+	return staticExtensions[strings.ToLower(rawURL[dot:])]
+}
+
+// shouldFetchResponseBody decides whether to pull a response body over CDP.
+// Fetching a body we won't retain AND can't derive useful text metrics from
+// (binary media/fonts/static assets) is pure overhead — and it's the dominant
+// per-response cost because the fetch also enumerates browser pages. HTML/JS/
+// JSON/XML/API responses are always fetched (they drive discovery); static
+// bodies are fetched only when retained (includeBody) and under a size cap.
+func shouldFetchResponseBody(entry *TrafficEntry, includeBody bool, encodedLen float64) bool {
+	if entry == nil || entry.Response == nil {
+		return false
+	}
+	if !isBinaryStaticContentType(entry.ContentType) && !hasStaticExtension(entry.Request.URL) {
+		return true // prioritize HTML/JS/JSON/XML/API — always fetch
+	}
+	// Static/binary asset.
+	if !includeBody {
+		return false // body would be discarded; skip the fetch (and its page scan)
+	}
+	return encodedLen <= 0 || encodedLen <= maxStaticBodyFetchBytes
+}
 
 // staticExtensions lists URL path extensions for static resources suppressed from stderr.
 var staticExtensions = map[string]bool{
@@ -686,7 +835,27 @@ func (c *Capture) writeEntry(entry *TrafficEntry) {
 		return
 	}
 
-	entry.Hash = computeHash(entry)
+	// The dedup key has two layers. shapeHash is value-blind (method, path, param
+	// NAMES, auth, body, response shape) — the classic key. For a parameterized
+	// request we additionally fold the query VALUES into fullHash, so distinct
+	// value-variants of the same shape (…?category=Books vs ?category=Gin) are kept
+	// apart up to maxParamVariants representatives; beyond that they collapse back
+	// onto the shape. Path-only and POST-body-only requests are unaffected
+	// (fullHash == shapeHash for them). writeEntry is the per-event capture hot
+	// path, so the URL is parsed (and its query decoded) exactly once here and
+	// threaded into both hashers.
+	parsedURL, parseErr := url.Parse(entry.Request.URL)
+	var query url.Values
+	if parseErr == nil {
+		query = parsedURL.Query()
+	}
+	hasQuery := len(query) > 0
+	shapeHash := computeShapeHash(entry, parsedURL, query, parseErr)
+	fullHash := shapeHash
+	if hasQuery {
+		fullHash = computeVariantHash(shapeHash, query)
+	}
+	entry.Hash = fullHash
 	entry.TargetHost = c.targetHostValue()
 
 	c.mu.Lock()
@@ -702,10 +871,26 @@ func (c *Capture) writeEntry(entry *TrafficEntry) {
 		return
 	}
 
-	// Check if hash already written to file
+	// Check if this exact request (shape + values) was already written.
 	_, alreadyWritten := c.seenHashes[entry.Hash]
-	if alreadyWritten {
-		// Duplicate detected - skip file write
+
+	// For a parameterized request that is a NEW value-variant, enforce the
+	// per-shape cap: once maxParamVariants distinct variants of this shape have
+	// been kept, further variants collapse back onto the shape (dropped as dups).
+	shapeCapExceeded := false
+	if !alreadyWritten && hasQuery {
+		limit := c.maxParamVariants
+		if limit < 1 {
+			limit = 1
+		}
+		if c.shapeVariants[shapeHash] >= limit {
+			shapeCapExceeded = true
+		}
+	}
+
+	if alreadyWritten || shapeCapExceeded {
+		// Duplicate (exact repeat, or this shape already has enough distinct
+		// value-variants) - skip file write.
 		c.duplicateCount++
 
 		// Still handle stderr logging independently
@@ -731,6 +916,15 @@ func (c *Capture) writeEntry(entry *TrafficEntry) {
 
 	// Hash is NEW - mark as seen and write to file
 	c.seenHashes[entry.Hash] = true
+	if hasQuery {
+		// Lazy-init guards the write: New() always makes this map, but tests
+		// construct Capture{} via struct literal without it. (Nil-map reads above
+		// are safe — they return 0 — so only this write needs the guard.)
+		if c.shapeVariants == nil {
+			c.shapeVariants = make(map[string]int)
+		}
+		c.shapeVariants[shapeHash]++
+	}
 	err := c.writer.Write(entry)
 	if err == nil {
 		c.writtenCount++
@@ -823,22 +1017,37 @@ func (c *Capture) cleanupStalePending() {
 	}
 }
 
-// computeHash generates a SHA256 hash for deduplication based on:
-// method, path, param names, auth headers, request body, response content-type, status, server header.
+// computeHash generates the value-blind shape hash for an entry by parsing its
+// URL. It is the convenience entry point used by tests and any caller that does
+// not already have the URL parsed; writeEntry calls computeShapeHash directly to
+// avoid re-parsing on the hot path.
 func computeHash(entry *TrafficEntry) string {
+	parsedURL, err := url.Parse(entry.Request.URL)
+	var query url.Values
+	if err == nil {
+		query = parsedURL.Query()
+	}
+	return computeShapeHash(entry, parsedURL, query, err)
+}
+
+// computeShapeHash generates a SHA256 hash for deduplication based on: method,
+// path, param names, auth headers, request body, response content-type, status,
+// server header. parsedURL/query are the pre-parsed request URL and decoded query
+// (query may be nil); parseErr is url.Parse's error, in which case the raw URL is
+// hashed instead. The values are value-BLIND — only param names participate.
+func computeShapeHash(entry *TrafficEntry, parsedURL *url.URL, query url.Values, parseErr error) string {
 	h := sha256.New()
 
 	// 1. Method
 	h.Write([]byte(entry.Request.Method))
 
 	// 2. Full URL path (scheme://host/path, no query)
-	parsedURL, err := url.Parse(entry.Request.URL)
-	if err == nil {
+	if parseErr == nil {
 		h.Write([]byte(parsedURL.Scheme + "://" + parsedURL.Host + parsedURL.Path))
 
 		// 3. Param names only, sorted alphabetically
 		var paramNames []string
-		for k := range parsedURL.Query() {
+		for k := range query {
 			paramNames = append(paramNames, k)
 		}
 		sort.Strings(paramNames)
@@ -885,6 +1094,21 @@ func computeHash(entry *TrafficEntry) string {
 		}
 	}
 
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// computeVariantHash derives a per-value-variant dedup key from the value-blind
+// shapeHash plus the sorted, fully-encoded query (names AND values). Two requests
+// to the same endpoint shape that differ only in a parameter value get distinct
+// variant hashes, so the writeEntry per-shape cap can keep several of them apart
+// instead of collapsing every value onto one representative. query is the entry's
+// pre-decoded, non-empty query (writeEntry only calls this for has-query entries).
+func computeVariantHash(shapeHash string, query url.Values) string {
+	h := sha256.New()
+	h.Write([]byte(shapeHash))
+	// url.Values.Encode() sorts by key and percent-encodes, so the same query in a
+	// different textual order hashes identically (a stable variant identity).
+	h.Write([]byte(query.Encode()))
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 

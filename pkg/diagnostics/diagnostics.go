@@ -12,17 +12,24 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/audit/bin"
+	"github.com/vigolium/vigolium/pkg/browserprobe"
 	"github.com/vigolium/vigolium/pkg/cftbrowser"
 	"github.com/vigolium/vigolium/pkg/database"
-	"github.com/vigolium/vigolium/pkg/deparos/jsscan"
+	"github.com/vigolium/vigolium/pkg/deparos/jstangle"
 	"github.com/vigolium/vigolium/pkg/olium/auth"
 	"github.com/vigolium/vigolium/pkg/piolium"
 	"github.com/vigolium/vigolium/pkg/queue"
 )
+
+// browserLaunchProbe smoke-launches a resolved browser binary to prove it can
+// actually render, not just print a version. Indirected through a var so tests
+// can stub it (a real probe spawns a headless browser). See checkChromium.
+var browserLaunchProbe = browserprobe.Launchable
 
 // validReasoningEfforts is the set of values accepted by olium's reasoning_effort knob.
 var validReasoningEfforts = map[string]struct{}{
@@ -100,6 +107,12 @@ type Deps struct {
 	DBErr    error
 	Queue    queue.Queue
 	Settings *config.Settings
+	// ProbeBrowserLaunch, when set, makes the chromium check actually launch the
+	// resolved browser headless (catching a binary that passes --version but
+	// crashes on real startup). It spawns a browser process (~1-2s), so only the
+	// one-shot CLI paths (doctor, first-run init) enable it; the server
+	// /diagnostics endpoint leaves it off to stay a cheap, poll-safe readout.
+	ProbeBrowserLaunch bool
 }
 
 // AuditPathStatus describes one of the two driver paths under "Audit mode"
@@ -172,6 +185,9 @@ func Run(deps Deps) *Report {
 		)
 	}
 	r.Tools["chromium"] = checkTool("chromium", chromiumFallbacks)
+	if deps.ProbeBrowserLaunch {
+		r.Tools["chromium"] = probeChromium(r.Tools["chromium"])
+	}
 	r.Tools["bun"] = checkTool("bun", []string{config.ExpandPath("~/.bun/bin/bun")})
 	r.Tools["npm"] = checkTool("npm", nil)
 	r.Tools["agent-browser"] = checkTool("agent-browser", nil)
@@ -212,18 +228,38 @@ func Run(deps Deps) *Report {
 	}
 	// Still nothing? Attach a package-manager-specific install hint so the
 	// user can either grab a system chromium or fall back to the bundled
-	// Chrome for Testing download.
-	if t := r.Tools["chromium"]; t != nil && t.Status != StatusOK {
+	// Chrome for Testing download. A launch-failure downgrade already carries a
+	// more specific tip (see probeChromium), so don't clobber it.
+	if t := r.Tools["chromium"]; t != nil && t.Status != StatusOK && t.Tip == "" {
 		t.Tip = chromiumInstallHint()
 	}
 
 	r.SessionsDir = checkSessionsDir(settings)
+
+	// The two embedded-binary probes and the piolium probe each block on a
+	// subprocess (jstangle extraction + JS probe, `vigolium-audit list`, and
+	// `pi -h`). Run serially they sum to ~10s on a machine that has all three
+	// installed; run concurrently the wall time is bounded by the slowest single
+	// probe. Each goroutine writes only its own local, so the shared Report and
+	// its maps are populated single-threaded after the join — no data race.
+	var (
+		probeWG       sync.WaitGroup
+		jstangleCheck *CheckResult
+		auditBinCheck *CheckResult
+		pioliumCheck  *CheckResult
+	)
+	probeWG.Add(3)
+	go func() { defer probeWG.Done(); jstangleCheck = checkJSTangleBinary() }()
+	go func() { defer probeWG.Done(); auditBinCheck = checkAuditBinary() }()
+	go func() { defer probeWG.Done(); pioliumCheck = checkPiolium() }()
+	probeWG.Wait()
+
 	r.EmbeddedBinaries = map[string]*CheckResult{
-		"jsscan":         checkJSScanBinary(),
-		"vigolium-audit": checkAuditBinary(),
+		"jstangle":       jstangleCheck,
+		"vigolium-audit": auditBinCheck,
 	}
 	r.Audit = checkAudit(settings, r.EmbeddedBinaries["vigolium-audit"])
-	r.Piolium = checkPiolium()
+	r.Piolium = pioliumCheck
 	// When claude (Path A) is available, frame a missing piolium as optional
 	// rather than a problem to fix — the user already has a working audit
 	// driver. The status stays as-is (still reflects whether piolium itself
@@ -507,7 +543,9 @@ func checkAgent(settings *config.Settings) *AgentCheck {
 				Tip:      "Run `claude setup-token` and export the result as $ANTHROPIC_API_KEY, or set agent.olium.oauth_token in ~/.vigolium/vigolium-configs.yaml.",
 			}
 		}
-	case "openai-api-key":
+	case "openai-api-key", "openai-responses":
+		// openai-responses uses the same OpenAI key resolution as openai-api-key;
+		// only the wire format differs (Responses vs Chat Completions).
 		if cfg.LLMAPIKey == "" && os.Getenv("OPENAI_API_KEY") == "" {
 			return &AgentCheck{
 				Status:   StatusError,
@@ -544,17 +582,19 @@ func checkAgent(settings *config.Settings) *AgentCheck {
 		if envPath := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); envPath != "" {
 			details = append(details, fmt.Sprintf("GOOGLE_APPLICATION_CREDENTIALS: %s", envPath))
 		}
-	case "openai-compatible":
-		// Any backend speaking the OpenAI Chat Completions wire format
-		// (Ollama, LM Studio, vLLM, OpenRouter, …). base_url is the only
-		// hard requirement; api_key is optional (local backends omit it).
+	case "openai-compatible", "anthropic-compatible":
+		// A backend fronting a custom base_url — openai-compatible speaks the
+		// OpenAI Chat Completions wire format (Ollama, LM Studio, vLLM,
+		// OpenRouter, …); anthropic-compatible speaks the Anthropic Messages
+		// format against a gateway/proxy. Both require base_url + a model;
+		// api_key is optional (local backends omit it).
 		baseURL := cfg.CustomProvider.BaseURL
 		if baseURL == "" {
 			return &AgentCheck{
 				Status:   StatusError,
 				Name:     "olium",
 				Protocol: provider,
-				Message:  "openai-compatible provider requires a base URL",
+				Message:  fmt.Sprintf("%s provider requires a base URL", provider),
 				Details:  details,
 				Tip:      "Set agent.olium.custom_provider.base_url in ~/.vigolium/vigolium-configs.yaml (e.g. `http://localhost:11434/v1` for Ollama).",
 			}
@@ -565,7 +605,7 @@ func checkAgent(settings *config.Settings) *AgentCheck {
 				Status:   StatusError,
 				Name:     "olium",
 				Protocol: provider,
-				Message:  "openai-compatible provider requires a model",
+				Message:  fmt.Sprintf("%s provider requires a model", provider),
 				Details:  details,
 				Tip:      "Set agent.olium.model or agent.olium.custom_provider.model_id in ~/.vigolium/vigolium-configs.yaml.",
 			}
@@ -577,7 +617,7 @@ func checkAgent(settings *config.Settings) *AgentCheck {
 			Protocol: provider,
 			Message:  fmt.Sprintf("unknown olium provider %q", provider),
 			Details:  details,
-			Tip:      "Set agent.olium.provider to one of: openai-codex-oauth, openai-api-key, anthropic-api-key, anthropic-oauth, anthropic-cli, anthropic-vertex, google-vertex, openai-compatible.",
+			Tip:      "Set agent.olium.provider to one of: openai-codex-oauth, openai-api-key, openai-responses, anthropic-api-key, anthropic-oauth, anthropic-cli, anthropic-vertex, google-vertex, openai-compatible, anthropic-compatible.",
 		}
 	}
 
@@ -713,19 +753,19 @@ func checkAudit(settings *config.Settings, auditBinary *CheckResult) *CheckResul
 	}
 }
 
-func checkJSScanBinary() *CheckResult {
+func checkJSTangleBinary() *CheckResult {
 	details := []string{
 		fmt.Sprintf("runtime: %s/%s", runtime.GOOS, runtime.GOARCH),
-		"extracting embedded jsscan and validating cache checksum",
+		"extracting embedded jstangle and validating cache checksum",
 	}
 
-	scanner, err := jsscan.NewScanner(jsscan.DefaultConfig())
+	scanner, err := jstangle.NewScanner(jstangle.DefaultConfig())
 	if err != nil {
 		return &CheckResult{
 			Status:  StatusError,
 			Message: fmt.Sprintf("not available: %v", err),
 			Details: details,
-			Tip:     "This installed Vigolium binary does not contain a usable jsscan for this platform. Reinstall the latest release; if it persists, report the package platform and `vigolium version` output.",
+			Tip:     "This installed Vigolium binary does not contain a usable jstangle for this platform. Reinstall the latest release; if it persists, report the package platform and `vigolium version` output.",
 		}
 	}
 	if err := scanner.EnsureBinary(); err != nil {
@@ -742,18 +782,48 @@ func checkJSScanBinary() *CheckResult {
 	details = append(details,
 		fmt.Sprintf("path: %s", config.ContractPath(path)),
 		fmt.Sprintf("sha256: %s", checksum),
+	)
+
+	capabilities, err := scanner.Capabilities()
+	if err != nil {
+		return &CheckResult{
+			Status:  StatusError,
+			Message: fmt.Sprintf("capability handshake failed: %v", err),
+			Details: details,
+			Tip:     "The embedded helper and Go wrapper use incompatible protocols. Rebuild with `make ensure-jstangle`, or reinstall a matching Vigolium release.",
+		}
+	}
+	details = append(details,
+		fmt.Sprintf("protocol: v%d", capabilities.ProtocolVersion),
+		fmt.Sprintf("tool version: %s", capabilities.ToolVersion),
+		fmt.Sprintf("source hash: %s", capabilities.SourceHash),
+		fmt.Sprintf("profiles: %s", strings.Join(capabilities.Profiles, ", ")),
+		fmt.Sprintf("capabilities: %s", strings.Join(capabilities.Capabilities, ", ")),
+		fmt.Sprintf("framing: %s", strings.Join(capabilities.Framing, ", ")),
 		"running JavaScript extraction probe",
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	result, err := scanner.Scan(ctx, []byte(`fetch("/vigolium-doctor-jsscan", {method: "POST", body: JSON.stringify({ok: true})});`))
+	// Run the probe through the worker-pool Service — the same length-prefixed
+	// path production scans use — rather than a one-shot invocation.
+	service, err := jstangle.NewService(nil)
+	if err != nil {
+		return &CheckResult{
+			Status:  StatusError,
+			Message: fmt.Sprintf("worker pool init failed: %v", err),
+			Details: details,
+			Tip:     "The embedded jstangle extracted but its worker pool could not start. Reinstall the correct platform build; if it persists, report the package platform and this doctor output.",
+		}
+	}
+	defer func() { _ = service.Close() }()
+	result, err := service.ScanWithOptions(ctx, []byte(`fetch("/vigolium-doctor-jstangle", {method: "POST", body: JSON.stringify({ok: true})});`), jstangle.ScanOptions{Profile: jstangle.ProfileEndpoints})
 	if err != nil {
 		return &CheckResult{
 			Status:  StatusError,
 			Message: fmt.Sprintf("probe failed: %v", err),
 			Details: details,
-			Tip:     "The embedded jsscan extracted but could not execute. Reinstall the correct platform build; if it persists, report the package platform and this doctor output.",
+			Tip:     "The embedded jstangle extracted but could not execute. Reinstall the correct platform build; if it persists, report the package platform and this doctor output.",
 		}
 	}
 
@@ -766,10 +836,18 @@ func checkJSScanBinary() *CheckResult {
 	details = append(details, fmt.Sprintf("probe: ok, requests=%d, bytes=%d", requests, bytesScanned))
 
 	return &CheckResult{
-		Status:  StatusOK,
-		Message: fmt.Sprintf("runtime=%s/%s, probe=ok", runtime.GOOS, runtime.GOARCH),
+		Status: StatusOK,
+		Message: fmt.Sprintf("protocol=v%d, source=%s, capabilities=%d, probe=ok",
+			capabilities.ProtocolVersion, shortDigest(capabilities.SourceHash), len(capabilities.Capabilities)),
 		Details: details,
 	}
+}
+
+func shortDigest(value string) string {
+	if len(value) <= 12 {
+		return value
+	}
+	return value[:12]
 }
 
 func checkAuditBinary() *CheckResult {
@@ -905,6 +983,38 @@ func chromiumInstallHint() string {
 	}
 }
 
+// probeChromium hardens a resolved chromium ToolCheck by actually launching the
+// binary headless. A binary on PATH that prints a version is NOT proof it runs:
+// some distro Chromium builds crash on real headless startup (e.g. SIGTRAP on a
+// KVM guest) and a downloaded Chrome can miss a shared library — both pass a
+// `--version` check yet fail every spider. When the launch probe fails, the row
+// is downgraded to a warning so the Chrome-for-Testing fallback (and the
+// `--fix --only chrome` install) takes over instead of the doctor reporting a
+// browser that will fail at scan time. A row that wasn't resolved, or has no
+// path, is returned unchanged.
+func probeChromium(t *ToolCheck) *ToolCheck {
+	if t == nil || t.Status != StatusOK || t.Path == "" {
+		return t
+	}
+	if err := browserLaunchProbe(t.Path); err != nil {
+		return &ToolCheck{
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("%s found but failed to launch headless", t.Path),
+			Details: append(append([]string{}, t.Details...),
+				fmt.Sprintf("launch probe failed: %v", err),
+				"a --version check passes but the browser crashes on real startup"),
+			// A launch-failure needs a different remedy than "not found": the
+			// system browser is present but broken, so installing more of the
+			// same won't help — download a known-good Chrome for Testing (or
+			// point spidering.browser_path at a working browser). Set here so
+			// the generic install hint below doesn't override it.
+			Tip: "system browser crashes on launch — run `vigolium doctor --fix --only chrome` to download a working Chrome for Testing, or set `spidering.browser_path` to a working browser",
+		}
+	}
+	t.Details = append(t.Details, "launch probe: ok")
+	return t
+}
+
 func checkTool(name string, fallbacks []string) *ToolCheck {
 	candidates := append([]string{name}, fallbacks...)
 	details := []string{fmt.Sprintf("searching PATH for candidates: %v", candidates)}
@@ -1004,7 +1114,7 @@ func checkNucleiTemplates(settings *config.Settings) *CheckResult {
 //   - Core: only Database. A DB failure is the single condition that drops
 //     the system to "not_ready" — every scan path needs storage.
 //   - Native scan (vigolium scan / vigolium run): chromium, nuclei templates,
-//     and the embedded jsscan binary. Failures here drop to "degraded" —
+//     and the embedded jstangle binary. Failures here drop to "degraded" —
 //     native scans are partially broken but the rest of the system still works.
 //   - Olium-based agentic modes (autopilot + swarm + query): olium provider,
 //     sessions dir, prompt templates dir, and (when explicitly enabled) the
@@ -1029,7 +1139,7 @@ func computeOverallStatus(r *Report) Status {
 		return "degraded"
 	}
 	if r.EmbeddedBinaries != nil {
-		if c := r.EmbeddedBinaries["jsscan"]; c != nil && c.Status != StatusOK {
+		if c := r.EmbeddedBinaries["jstangle"]; c != nil && c.Status != StatusOK {
 			return "degraded"
 		}
 	}

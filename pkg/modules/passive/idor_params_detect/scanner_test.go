@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
 )
 
@@ -70,6 +71,7 @@ func TestScanPerRequest_HighSignalParamPlusInt(t *testing.T) {
 	assert.Contains(t, r.ExtractedResults, "user_id=12345")
 	assert.Contains(t, r.Info.Tags, "idor")
 	assert.Contains(t, r.Info.Tags, "bola")
+	assert.Equal(t, output.RecordKindFinding, r.EffectiveRecordKind())
 
 	meta := r.Metadata
 	assert.Equal(t, "sequential-int", meta["id_type"])
@@ -99,11 +101,40 @@ func TestScanPerRequest_NoSignalNonID(t *testing.T) {
 	results, err := m.ScanPerRequest(ctx, scanCtx)
 	require.NoError(t, err)
 
-	// "page=2" has no name signal (0) + sequential int (3) = 3 which meets threshold
-	// but "q=hello" has 0+0=0 so it won't appear
-	// Filter results that are NOT about "page"
-	for _, r := range results {
-		assert.NotEqual(t, "q", r.FuzzingParameter)
+	// Neither param is an object-ID candidate: "q=hello" has no signal at all, and
+	// "page=2" is a bare sequential int with no name signal and no resource-noun
+	// path context — a pagination cursor, not an object reference. The corroboration
+	// gate rejects it, so no finding is produced.
+	assert.Empty(t, results)
+}
+
+// TestScanPerRequest_TelemetryNumericNotIDOR is the regression for the noisiest
+// idor-params-detect false positive observed across the Hooli scan corpus:
+// analytics/telemetry parameters carry big integers (a bandwidth reading, a
+// metric, an HTTP status echoed back, a page number) that are not object
+// references. A bare numeric value with no identifier name and no resource-noun
+// path context must not be reported as a potential IDOR parameter.
+func TestScanPerRequest_TelemetryNumericNotIDOR(t *testing.T) {
+	m := New()
+	query := "connection_download_bandwidth_bps=1520435&responseStatus=200&value=48741&page_number=5&per_page=100"
+	ctx := makeHTTPCtx("/web-analytics/web/events", query, "text/html", "<html></html>")
+
+	results, err := m.ScanPerRequest(ctx, &modkit.ScanContext{})
+	require.NoError(t, err)
+	assert.Empty(t, results, "bare numeric telemetry/pagination params are not object IDs")
+}
+
+// TestScanPerRequest_ErrorPagePathNotIDOR guards the other bare-number false
+// positive: a crawler landing on an error page (/404, /500) turned the status
+// code in the URL path into a "sequential-int object ID". A numeric path segment
+// with no preceding resource noun is not an IDOR candidate.
+func TestScanPerRequest_ErrorPagePathNotIDOR(t *testing.T) {
+	m := New()
+	for _, p := range []string{"/404", "/500", "/8"} {
+		ctx := makeHTTPCtx(p, "", "text/html", "<html>not found</html>")
+		results, err := m.ScanPerRequest(ctx, &modkit.ScanContext{})
+		require.NoError(t, err)
+		assert.Empty(t, results, "numeric path segment %q without a resource noun is not an IDOR candidate", p)
 	}
 }
 
@@ -175,7 +206,7 @@ func TestScanPerRequest_MediaSkipped(t *testing.T) {
 
 func TestScanPerRequest_ExcessiveDataExposure(t *testing.T) {
 	m := New()
-	jsonBody := `{"user": "john", "email": "john@test.com", "password_hash": "abc123", "is_admin": true}`
+	jsonBody := `{"user": "john", "email": "john@test.com", "password_hash": "$2b$12$0123456789abcdefghijklmnopqrstuv", "is_admin": true}`
 	ctx := makeHTTPCtx("/api/user", "", "application/json", jsonBody)
 	scanCtx := &modkit.ScanContext{}
 
@@ -185,9 +216,10 @@ func TestScanPerRequest_ExcessiveDataExposure(t *testing.T) {
 	// Find the excessive data exposure result
 	var foundExcessive bool
 	for _, r := range results {
-		if r.Info.Name == "Excessive Data Exposure" {
+		if r.Info.Name == "Potential Excessive Data Exposure" {
 			foundExcessive = true
 			assert.Equal(t, severity.Low, r.Info.Severity)
+			assert.Equal(t, output.RecordKindFinding, r.EffectiveRecordKind())
 			assert.Contains(t, r.Info.Tags, "bopla")
 			assert.Contains(t, r.Info.Tags, "excessive-data")
 			// Should detect password_hash and is_admin
@@ -195,6 +227,28 @@ func TestScanPerRequest_ExcessiveDataExposure(t *testing.T) {
 		}
 	}
 	assert.True(t, foundExcessive, "expected an Excessive Data Exposure finding")
+}
+
+func TestScanPerRequest_NameOnlyExcessiveDataIsFinding(t *testing.T) {
+	m := New()
+	jsonBody := `{"password_hash":null,"is_admin":false,"secret_key":"REDACTED"}`
+	ctx := makeHTTPCtx("/api/user", "", "application/json", jsonBody)
+
+	results, err := m.ScanPerRequest(ctx, &modkit.ScanContext{})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, "Security-Relevant API Field Names", results[0].Info.Name)
+	assert.Equal(t, output.RecordKindFinding, results[0].EffectiveRecordKind())
+}
+
+func TestScanPerRequest_SensitiveKeyTextInsideStringIgnored(t *testing.T) {
+	m := New()
+	jsonBody := `{"message":"Documentation uses the key \"password_hash\" for examples"}`
+	ctx := makeHTTPCtx("/api/docs", "", "application/json", jsonBody)
+
+	results, err := m.ScanPerRequest(ctx, &modkit.ScanContext{})
+	require.NoError(t, err)
+	assert.Empty(t, results)
 }
 
 func TestScanPerRequest_ExcessiveDataExposure_NoSensitiveFields(t *testing.T) {
@@ -207,7 +261,7 @@ func TestScanPerRequest_ExcessiveDataExposure_NoSensitiveFields(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, r := range results {
-		assert.NotEqual(t, "Excessive Data Exposure", r.Info.Name)
+		assert.NotEqual(t, "Potential Excessive Data Exposure", r.Info.Name)
 	}
 }
 

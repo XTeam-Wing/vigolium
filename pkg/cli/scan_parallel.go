@@ -197,7 +197,12 @@ func readChildStatsSQLite(output string) (childStats, bool) {
 		return childStats{}, false
 	}
 
-	rows, err := db.QueryContext(ctx, "SELECT severity, COUNT(*) FROM findings GROUP BY severity")
+	rows, err := db.QueryContext(ctx, "SELECT severity, COUNT(*) FROM findings WHERE record_kind IS NULL OR record_kind = '' OR record_kind = 'finding' GROUP BY severity")
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "record_kind") {
+		// Older standalone exports predate record_kind; every row in those files is
+		// a finding, so retain the legacy query as a read-only compatibility path.
+		rows, err = db.QueryContext(ctx, "SELECT severity, COUNT(*) FROM findings GROUP BY severity")
+	}
 	if err != nil {
 		return childStats{}, false
 	}
@@ -365,9 +370,15 @@ func runStatelessTargetsParallel(cmd *cobra.Command, settings *config.Settings, 
 
 	if !scanOpts.Silent {
 		budget := parallel * scanOpts.Concurrency
-		fmt.Fprintf(os.Stderr, "\n%s %s scanning %s targets, %s at a time\n",
+		// "Parallel scanning …" only when more than one runs at a time; at -P 1
+		// the fan-out serializes, so call it a plain sequential scan.
+		scanKind := terminal.BoldHiBlue("Parallel") + " scanning"
+		if parallel <= 1 {
+			scanKind = terminal.BoldHiBlue("Scanning")
+		}
+		fmt.Fprintf(os.Stderr, "\n%s %s %s targets, %s at a time\n",
 			terminal.Purple(terminal.SymbolTarget),
-			terminal.BoldHiBlue("Parallel"),
+			scanKind,
 			terminal.HiCyan(fmt.Sprintf("%d", len(targets))),
 			terminal.HiCyan(fmt.Sprintf("%d", parallel)))
 		if budget > parallelSocketWarnThreshold {

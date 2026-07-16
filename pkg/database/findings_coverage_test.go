@@ -58,6 +58,15 @@ func TestFindingGettersAndListing(t *testing.T) {
 		t.Errorf("severity = %q", got.Severity)
 	}
 
+	// Retained candidates share storage but must stay out of finding-oriented
+	// repository helpers and default lists.
+	saveFindingFull(t, repo, &Finding{
+		HTTPRecordUUIDs: []string{recUUID},
+		Severity:        SeverityHigh,
+		RecordKind:      RecordKindCandidate,
+		URL:             "https://find.example.com/x",
+	})
+
 	byRec, err := repo.GetFindingsByRecordUUID(ctx, recUUID)
 	if err != nil {
 		t.Fatalf("GetFindingsByRecordUUID: %v", err)
@@ -83,6 +92,16 @@ func TestFindingGettersAndListing(t *testing.T) {
 	}
 	if total != 2 || len(list) != 2 {
 		t.Errorf("ListFindings total=%d len=%d, want 2/2", total, len(list))
+	}
+	candidates, candidateTotal, err := repo.ListFindings(ctx, QueryFilters{
+		ProjectUUID: DefaultProjectUUID,
+		RecordKinds: []string{RecordKindCandidate},
+	})
+	if err != nil {
+		t.Fatalf("ListFindings(candidates): %v", err)
+	}
+	if candidateTotal != 1 || len(candidates) != 1 {
+		t.Errorf("candidate total=%d len=%d, want 1/1", candidateTotal, len(candidates))
 	}
 }
 
@@ -206,11 +225,13 @@ func TestFindingCountAggregations(t *testing.T) {
 		t.Errorf("CountFindingsByAgenticScan(empty) = %v, %v", m, err)
 	}
 
-	byURL, err := CountFindingsByURL(ctx, db, DefaultProjectUUID)
+	// CountFindingsByURL is run-scoped: only the two findings attributed to
+	// agUUID (both on /a) are counted; the unattributed /b finding is excluded.
+	byURL, err := CountFindingsByURL(ctx, db, agUUID)
 	if err != nil {
 		t.Fatalf("CountFindingsByURL: %v", err)
 	}
-	if byURL["https://x.example.com/a"] != 2 || byURL["https://x.example.com/b"] != 1 {
+	if byURL["https://x.example.com/a"] != 2 || byURL["https://x.example.com/b"] != 0 {
 		t.Errorf("byURL = %v", byURL)
 	}
 

@@ -5,6 +5,8 @@ package spitolas
 
 import (
 	"context"
+	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/vigolium/vigolium/pkg/httpmsg"
@@ -41,6 +43,29 @@ type SpiderConfig struct {
 	ScopeFilter         func(host, path string) bool
 	ProjectUUID         string
 	Source              string // http_records source tag; "" defaults to "spidering"
+
+	// Authentication bridged into the browser so the crawl explores authenticated
+	// content instead of only the unauthenticated shell. These mirror the session
+	// (--auth/--auth-file) and custom-header context the HTTP scan phases use.
+	//   - InitialCookies: seeded into the browser cookie jar before navigation.
+	//   - ExtraHeaders:   non-cookie headers (Authorization, X-Api-Key, -H headers)
+	//                     applied to every browser request via CDP.
+	//   - BasicAuthUser/Pass: HTTP Basic credentials embedded in the start URL.
+	InitialCookies []*http.Cookie
+	ExtraHeaders   map[string]string
+	BasicAuthUser  string
+	BasicAuthPass  string
+
+	// LoginCredentialAttempts enables trying a small documented list of common
+	// default credentials against a CONFIRMED local login form so the crawl can
+	// proceed authenticated. Single-flighted per host, negative-control gated,
+	// never a wordlist. Off by default; the runner enables it at balanced and deep.
+	LoginCredentialAttempts bool
+
+	// LoginCredentialFullList selects the full documented credential list (deep)
+	// versus the minimal set (balanced: admin:admin, admin:123456). Ignored when
+	// LoginCredentialAttempts is false.
+	LoginCredentialFullList bool
 }
 
 // SpiderResult contains the results of a spidering run.
@@ -77,11 +102,46 @@ type SpiderResult struct {
 	// is the CTA's visible label.
 	LoginCTADriven bool
 	LoginCTAText   string
+
+	// LoginCredsTried / LoginCredsSucceeded report the common-credential login
+	// pass: the number of credential pairs submitted and the number of login
+	// forms where a pair authenticated. LoginCredsURL is the last login form the
+	// pass ran against.
+	LoginCredsTried     int
+	LoginCredsSucceeded int
+	LoginCredsURL       string
+
+	// HarvestedCookies is the browser's cookie jar at end of crawl and
+	// BrowserUserAgent the UA it presented. The runner carries these forward into
+	// content discovery and dynamic assessment so those phases inherit the
+	// WAF/bot-cleared session the real browser established. Empty when the crawl
+	// harvested nothing (e.g. the browser wedged before teardown).
+	HarvestedCookies []*http.Cookie
+	BrowserUserAgent string
+
+	// HarvestedAuthorization is a bare JWT/Bearer token read from the app's client
+	// storage after a confirmed default-credential login, carried forward so
+	// token-auth SPAs are scanned authenticated. Empty when no login succeeded.
+	HarvestedAuthorization string
+
+	// DOMXssFindings holds browser-confirmed DOM-based XSS on reflected client
+	// routes (SPA hash routes / query params) discovered during the crawl.
+	DOMXssFindings []DOMXssFinding
 }
 
-// RunSpider executes browser-based spidering against the target URL,
-// saving all captured traffic to the repository via the "spidering" source.
-func RunSpider(ctx context.Context, cfg SpiderConfig, repo RecordSaver) (*SpiderResult, error) {
+// DOMXssFinding is a browser-confirmed DOM-based XSS on a client route: an
+// execution canary placed in a reflected query parameter ran in the page.
+type DOMXssFinding struct {
+	URL      string // exact route + injected param that executed the canary
+	Param    string // the injected query parameter name
+	Payload  string // the canary payload (decoded)
+	Evidence string // the sink element as rendered
+}
+
+// buildCrawlerConfig maps a public SpiderConfig onto the internal crawler config,
+// including the browser-auth bridge and the operator-scope→CrawlScope adapter.
+// Shared by RunSpider (one-shot) and SpiderSession (browser reused across seeds).
+func buildCrawlerConfig(cfg SpiderConfig) (*config.Config, error) {
 	crawlerCfg, err := config.New(cfg.TargetURL)
 	if err != nil {
 		return nil, err
@@ -112,8 +172,95 @@ func RunSpider(ctx context.Context, cfg SpiderConfig, repo RecordSaver) (*Spider
 	}
 	crawlerCfg.UseCDPDetection = !cfg.NoCDP
 	crawlerCfg.FormFillEnabled = !cfg.NoForms
+	// GET- and POST-form submission ride on form filling: with --no-forms the crawler
+	// neither fills nor submits.
+	crawlerCfg.SubmitGetForms = !cfg.NoForms
+	crawlerCfg.SubmitPostForms = !cfg.NoForms
+	crawlerCfg.LoginCredentialAttempts = cfg.LoginCredentialAttempts
+	crawlerCfg.LoginCredentialFullList = cfg.LoginCredentialFullList
 	if cfg.ProxyURL != "" {
 		crawlerCfg.ProxyURL = cfg.ProxyURL
+	}
+
+	// Bridge operator authentication into the browser (cookies + non-cookie
+	// headers + HTTP Basic) so the crawl runs authenticated.
+	crawlerCfg.InitialCookies = cfg.InitialCookies
+	crawlerCfg.ExtraHeaders = cfg.ExtraHeaders
+	crawlerCfg.BasicAuthUser = cfg.BasicAuthUser
+	crawlerCfg.BasicAuthPass = cfg.BasicAuthPass
+
+	// Enforce the operator's scope inside the browser too, not just at the
+	// persistence writer. Without this the crawler falls back to a broad
+	// same-domain rule and only discards out-of-scope traffic AFTER navigating —
+	// paying for a real browser request that gets thrown away. Assigning CrawlScope
+	// makes the crawler reject out-of-scope pages using the operator's exact
+	// boundary, so it stops wandering off-scope in the first place.
+	if cfg.ScopeFilter != nil {
+		scope := cfg.ScopeFilter
+		crawlerCfg.CrawlScope = func(rawURL string) bool {
+			u, perr := url.Parse(rawURL)
+			if perr != nil || u.Hostname() == "" {
+				// Un-parseable or scheme-relative — let the crawler's other logic
+				// decide rather than hard-dropping it here.
+				return true
+			}
+			return scope(u.Hostname(), u.Path)
+		}
+	}
+	return crawlerCfg, nil
+}
+
+// spiderResultFromCrawl converts an internal crawl Result into the public
+// SpiderResult. recordsSaved is supplied by the caller because the writer is
+// per-run (RunSpider) or shared (SpiderSession, which reports a per-seed delta).
+// mapDOMXssFindings converts the internal crawler DOM-XSS findings to the public
+// spider type so callers never depend on internal/crawler.
+func mapDOMXssFindings(in []crawler.DOMXssFinding) []DOMXssFinding {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]DOMXssFinding, 0, len(in))
+	for _, f := range in {
+		out = append(out, DOMXssFinding{URL: f.URL, Param: f.Param, Payload: f.Payload, Evidence: f.Evidence})
+	}
+	return out
+}
+
+func spiderResultFromCrawl(result *crawler.Result, recordsSaved int) *SpiderResult {
+	// Start-redirect handling is decided inside the crawler (it alone has the
+	// rendered landing page to classify login vs. relocated app); surface its
+	// verdict verbatim so the caller can report it without re-deriving anything.
+	return &SpiderResult{
+		StatesDiscovered: result.Stats.StatesDiscovered,
+		ActionsExecuted:  result.Stats.ActionsExecuted,
+		ActionsFailed:    result.Stats.ActionsFailed,
+		FormsSubmitted:   result.Stats.FormsSubmitted,
+		Duration:         result.Duration(),
+		RecordsSaved:     recordsSaved,
+		LandingURL:       result.Stats.LandingURL,
+		OffHostRedirect:  result.Stats.OffHostLanding,
+		LandingIsLogin:   result.Stats.LandingIsLogin,
+		HostAdopted:      result.Stats.HostAdopted,
+		LoginCTADriven:   result.Stats.LoginCTADriven,
+		LoginCTAText:     result.Stats.LoginCTAText,
+
+		LoginCredsTried:     result.Stats.LoginCredsTried,
+		LoginCredsSucceeded: result.Stats.LoginCredsSucceeded,
+		LoginCredsURL:       result.Stats.LoginCredsURL,
+
+		HarvestedCookies:       result.HarvestedCookies,
+		BrowserUserAgent:       result.BrowserUserAgent,
+		HarvestedAuthorization: result.HarvestedAuthorization,
+		DOMXssFindings:         mapDOMXssFindings(result.DOMXssFindings),
+	}
+}
+
+// RunSpider executes browser-based spidering against the target URL,
+// saving all captured traffic to the repository via the "spidering" source.
+func RunSpider(ctx context.Context, cfg SpiderConfig, repo RecordSaver) (*SpiderResult, error) {
+	crawlerCfg, err := buildCrawlerConfig(cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	// Create writer that saves to vigolium's HTTPRecord table. The source tag
@@ -125,6 +272,11 @@ func RunSpider(ctx context.Context, cfg SpiderConfig, repo RecordSaver) (*Spider
 	}
 	writer := network.NewRepositoryWriter(repo, source, cfg.ProjectUUID)
 	writer.ScopeFilter = cfg.ScopeFilter
+	// NewRepositoryWriter starts a background flush goroutine, so it must be closed
+	// on every exit path — including the crawler.New / c.Run error paths below,
+	// which return before the crawler's capture would otherwise close it. Close is
+	// idempotent (closeOnce), so the capture's own close on the success path is safe.
+	defer func() { _ = writer.Close() }()
 
 	c, err := crawler.New(crawlerCfg)
 	if err != nil {
@@ -137,21 +289,5 @@ func RunSpider(ctx context.Context, cfg SpiderConfig, repo RecordSaver) (*Spider
 		return nil, err
 	}
 
-	// Start-redirect handling is decided inside the crawler (it alone has the
-	// rendered landing page to classify login vs. relocated app); surface its
-	// verdict verbatim so the caller can report it without re-deriving anything.
-	return &SpiderResult{
-		StatesDiscovered: result.Stats.StatesDiscovered,
-		ActionsExecuted:  result.Stats.ActionsExecuted,
-		ActionsFailed:    result.Stats.ActionsFailed,
-		FormsSubmitted:   result.Stats.FormsSubmitted,
-		Duration:         result.Duration(),
-		RecordsSaved:     writer.Count(),
-		LandingURL:       result.Stats.LandingURL,
-		OffHostRedirect:  result.Stats.OffHostLanding,
-		LandingIsLogin:   result.Stats.LandingIsLogin,
-		HostAdopted:      result.Stats.HostAdopted,
-		LoginCTADriven:   result.Stats.LoginCTADriven,
-		LoginCTAText:     result.Stats.LoginCTAText,
-	}, nil
+	return spiderResultFromCrawl(result, writer.Count()), nil
 }

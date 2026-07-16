@@ -3,12 +3,14 @@ package graphql_scan
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/pkg/errors"
 	httputil "github.com/projectdiscovery/utils/http"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
+	"github.com/vigolium/vigolium/pkg/graphqlx"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/infra"
@@ -66,7 +68,10 @@ func (m *Module) ScanPerRequest(
 	host := service.Host()
 
 	// Dedup by host
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
+	var diskSet *dedup.DiskSet
+	if scanCtx != nil {
+		diskSet = m.ds.Get(scanCtx.DedupMgr())
+	}
 	if diskSet != nil && diskSet.IsSeen(host) {
 		return nil, nil
 	}
@@ -85,61 +90,76 @@ func (m *Module) ScanPerRequest(
 	introBody, err := m.sendGraphQLQuery(ctx, httpClient, endpointPath, introspectionQuery)
 	if err == nil && hasIntrospection(introBody) {
 		results = append(results, &output.ResultEvent{
-			URL:     target,
-			Matched: target + endpointPath,
+			ModuleID:      ModuleID,
+			RecordKind:    output.RecordKindObservation,
+			EvidenceGrade: output.EvidenceGradeObservation,
+			DedupKey:      fmt.Sprintf("graphql-introspection|%s|%s", host, endpointPath),
+			URL:           target,
+			Matched:       target + endpointPath,
 			ExtractedResults: []string{
 				fmt.Sprintf("GraphQL endpoint: %s", endpointPath),
 				"Introspection enabled",
 			},
 			Info: output.Info{
-				Name:        "GraphQL Introspection Enabled",
-				Description: "GraphQL introspection is enabled, exposing the complete API schema including types, fields, and arguments. This information aids attackers in crafting targeted queries.",
-				Severity:    severity.Medium,
+				Name:        "GraphQL Schema Introspection Observed",
+				Description: "The endpoint returned a complete, parseable GraphQL schema. Introspection is useful reconnaissance, but public and developer-facing APIs may intentionally expose it; this observation is not an authorization bypass or sensitive-data finding.",
+				Severity:    severity.Info,
 				Confidence:  severity.Certain,
+				Tags:        ModuleTags,
+			},
+			Metadata: map[string]any{
+				"security_primitive": "schema-introspection",
+				"impact_proven":      false,
 			},
 		})
 	}
 
-	// Phase 3: Test SQL injection through GraphQL arguments
+	// Phase 3: Test error-based SQL injection through GraphQL arguments
 	sqliResults := m.testInjection(ctx, httpClient, endpointPath, introBody, target)
 	results = append(results, sqliResults...)
 
-	// Phase 4: Test batching (array-based)
-	batchBody, err := m.sendGraphQLQuery(ctx, httpClient, endpointPath, batchQuery)
-	if err == nil && isBatchResponse(batchBody) {
-		results = append(results, &output.ResultEvent{
-			URL:     target,
-			Matched: target + endpointPath,
-			ExtractedResults: []string{
-				fmt.Sprintf("GraphQL endpoint: %s", endpointPath),
-				"Query batching supported",
-			},
-			Info: output.Info{
-				Name:        "GraphQL Query Batching",
-				Description: "GraphQL endpoint supports query batching, which can be abused to bypass rate limiting or perform denial of service attacks.",
-				Severity:    severity.Low,
-				Confidence:  severity.Certain,
-			},
-		})
+	// The remaining phases each perform their own multi-round confirmation and
+	// only fire on a confirmed live GraphQL endpoint (reached only after
+	// discoverEndpoint succeeded above), so a non-GraphQL host never triggers them.
+	// The introspection schema is parsed once here and shared; a nil schema
+	// (introspection disabled or unparseable) skips the schema-driven phases.
+	schema, _ := graphqlx.ParseSchema([]byte(introBody))
+
+	// Phase 4: Expand the introspection schema into concrete operations and feed
+	// them into the pipeline so every detector evaluates real GraphQL responses.
+	if scanCtx != nil {
+		if op := m.phaseOperations(ctx, scanCtx, endpointPath, schema, target); op != nil {
+			results = append(results, op)
+		}
 	}
 
-	// Phase 5: Test alias-based batching
-	aliasBody, err := m.sendGraphQLQuery(ctx, httpClient, endpointPath, aliasBatchQuery)
-	if err == nil && isAliasBatchResponse(aliasBody) {
-		results = append(results, &output.ResultEvent{
-			URL:     target,
-			Matched: target + endpointPath,
-			ExtractedResults: []string{
-				fmt.Sprintf("GraphQL endpoint: %s", endpointPath),
-				"Alias-based query batching supported",
-			},
-			Info: output.Info{
-				Name:        "GraphQL Alias-Based Query Batching",
-				Description: "GraphQL endpoint supports alias-based query batching, which can be abused to bypass rate limiting even when array batching is disabled.",
-				Severity:    severity.Low,
-				Confidence:  severity.Certain,
-			},
-		})
+	// Phase 5: Exposed in-browser GraphQL IDE (GraphiQL/Playground/Altair/…).
+	results = append(results, m.phaseConsole(ctx, httpClient, endpointPath, target)...)
+
+	// Phase 6: Weaponized (uncapped) query batching — rate-limit/brute-force bypass.
+	if b := m.phaseBatching(ctx, httpClient, endpointPath, target); b != nil {
+		results = append(results, b)
+	}
+
+	// Phase 7: Broken object-level authorization (IDOR/BOLA) on predictable ids.
+	results = append(results, m.phaseAuthz(ctx, httpClient, endpointPath, schema, target)...)
+
+	// Phase 8: Reflected XSS in error messages.
+	if x := m.phaseXSSError(ctx, httpClient, endpointPath, schema, target); x != nil {
+		results = append(results, x)
+	}
+
+	// Phase 9: Boolean-based SQL injection (corroborates the error-based path).
+	if s := m.phaseBooleanSQLi(ctx, httpClient, endpointPath, schema, target); s != nil {
+		results = append(results, s)
+	}
+
+	// Phase 10: Missing query-depth/complexity limit — deep scans only (heavier
+	// than the default surface, though the probe itself is bounded).
+	if scanCtx != nil && scanCtx.DeepScan {
+		if d := m.phaseDoS(ctx, httpClient, endpointPath, schema, target); d != nil {
+			results = append(results, d)
+		}
 	}
 
 	return results, nil
@@ -157,28 +177,43 @@ func (m *Module) discoverEndpoint(
 	candidates := m.candidatePaths(ctx)
 
 	for _, path := range candidates {
-		body, err := m.sendGraphQLQuery(ctx, httpClient, path, typenameQuery)
-		if err != nil {
-			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
-				return "", err
+		var terminalErr error
+		confirmed := confirmRounds(defaultConfirmRounds, func() (bool, error) {
+			r, err := m.send(ctx, httpClient, "POST", path, "application/json", typenameQuery)
+			if err != nil {
+				if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
+					terminalErr = err
+				}
+				return false, err
 			}
-			continue
+			return !r.blocked && r.status >= 200 && r.status < 300 && isGraphQLEndpoint(r.body), nil
+		})
+		if terminalErr != nil {
+			return "", terminalErr
 		}
-		if isGraphQLEndpoint(body) {
+		if confirmed {
 			return path, nil
 		}
 	}
 
 	// Fallback: try GET method with query parameter
 	for _, path := range candidates {
-		body, err := m.sendGraphQLGET(ctx, httpClient, path, "{ __typename }")
-		if err != nil {
-			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
-				return "", err
+		fullPath := graphQLGETPath(path, "{ __typename }")
+		var terminalErr error
+		confirmed := confirmRounds(defaultConfirmRounds, func() (bool, error) {
+			r, err := m.send(ctx, httpClient, "GET", fullPath, "", "")
+			if err != nil {
+				if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
+					terminalErr = err
+				}
+				return false, err
 			}
-			continue
+			return !r.blocked && r.status >= 200 && r.status < 300 && isGraphQLEndpoint(r.body), nil
+		})
+		if terminalErr != nil {
+			return "", terminalErr
 		}
-		if isGraphQLEndpoint(body) {
+		if confirmed {
 			return path, nil
 		}
 	}
@@ -239,44 +274,46 @@ func (m *Module) testInjection(
 
 	sqliPayload := `' OR '1'='1`
 	for _, field := range fieldsToTest {
-		query := fmt.Sprintf(`{"query":"{ %s(%s: \"%s\") { __typename } }"}`,
-			field.fieldName, field.argName, escapeJSON(sqliPayload))
-
-		body, blocked, err := m.sendGraphQLQueryEx(ctx, httpClient, endpointPath, query)
-		if err != nil {
-			continue
-		}
-		// A WAF/CDN/rate-limit page can carry tokens that trip the SQL-error
-		// patterns; it is not the GraphQL backend surfacing a DB error, so skip it
-		// (the Cloudflare 429 "challenge" false-positive class).
-		if blocked {
-			continue
-		}
-
-		if containsSQLError(body) {
-			// Confirm the error is payload-introduced: a benign value for the same
-			// field must NOT produce it (and must not itself be a blocked page).
-			// Guards against endpoints that return an error string for any input.
+		confirmed := confirmRounds(defaultConfirmRounds, func() (bool, error) {
 			benignQuery := fmt.Sprintf(`{"query":"{ %s(%s: \"%s\") { __typename } }"}`,
 				field.fieldName, field.argName, escapeJSON("vigolium"))
 			controlBody, controlBlocked, cerr := m.sendGraphQLQueryEx(ctx, httpClient, endpointPath, benignQuery)
-			if cerr == nil && !controlBlocked && containsSQLError(controlBody) {
-				continue
+			if cerr != nil || controlBlocked || containsSQLError(controlBody) {
+				return false, cerr
 			}
 
+			attackQuery := fmt.Sprintf(`{"query":"{ %s(%s: \"%s\") { __typename } }"}`,
+				field.fieldName, field.argName, escapeJSON(sqliPayload))
+			attackBody, attackBlocked, attackErr := m.sendGraphQLQueryEx(ctx, httpClient, endpointPath, attackQuery)
+			if attackErr != nil || attackBlocked {
+				return false, attackErr
+			}
+			return containsSQLError(attackBody), nil
+		})
+		if confirmed {
+
 			results = append(results, &output.ResultEvent{
-				URL:     target,
-				Matched: target + endpointPath,
+				ModuleID:      ModuleID,
+				RecordKind:    output.RecordKindCandidate,
+				EvidenceGrade: output.EvidenceGradeDifferential,
+				URL:           target,
+				Matched:       target + endpointPath,
 				ExtractedResults: []string{
 					fmt.Sprintf("GraphQL endpoint: %s", endpointPath),
 					fmt.Sprintf("Vulnerable field: %s(%s:)", field.fieldName, field.argName),
 					fmt.Sprintf("Payload: %s", sqliPayload),
 				},
 				Info: output.Info{
-					Name:        "SQL Injection via GraphQL",
-					Description: fmt.Sprintf("SQL injection detected in GraphQL field '%s' argument '%s'. The server returned database error messages when injecting SQL syntax.", field.fieldName, field.argName),
+					Name:        "GraphQL SQL Injection Candidate",
+					Description: fmt.Sprintf("GraphQL field '%s' argument '%s' reproducibly returned a structured GraphQL database error for SQL syntax while the benign control stayed clean. This is strong injection evidence, but query alteration or data access was not demonstrated.", field.fieldName, field.argName),
 					Severity:    severity.High,
 					Confidence:  severity.Certain,
+					Tags:        ModuleTags,
+				},
+				Metadata: map[string]any{
+					"control_clean":       true,
+					"confirmation_rounds": defaultConfirmRounds,
+					"impact_proven":       false,
 				},
 			})
 			return results // One finding is enough
@@ -306,36 +343,11 @@ func (m *Module) sendGraphQLQueryEx(
 	httpClient *http.Requester,
 	path, queryBody string,
 ) (string, bool, error) {
-	raw := ctx.Request().Raw()
-
-	// Build POST request to GraphQL endpoint
-	modified, err := httpmsg.SetPath(raw, path)
+	r, err := m.send(ctx, httpClient, "POST", path, "application/json", queryBody)
 	if err != nil {
 		return "", false, err
 	}
-	modified, err = httpmsg.SetMethod(modified, "POST")
-	if err != nil {
-		return "", false, err
-	}
-	modified, err = httpmsg.AddOrReplaceHeader(modified, "Content-Type", "application/json")
-	if err != nil {
-		return "", false, err
-	}
-	modified, err = httpmsg.SetBodyString(modified, queryBody)
-	if err != nil {
-		return "", false, err
-	}
-
-	// modified is well-formed raw, so wrap directly instead of re-parsing on this hot path.
-	fuzzedReq := httpmsg.NewRequestResponseRaw(modified, ctx.Service())
-
-	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
-	if err != nil {
-		return "", false, err
-	}
-	defer resp.Close()
-
-	return resp.FullResponseString(), isBlockedResponse(resp), nil
+	return r.body, r.blocked, nil
 }
 
 // isBlockedResponse reports whether resp came from a WAF/CDN challenge, auth gate,
@@ -348,40 +360,12 @@ func isBlockedResponse(resp *httputil.ResponseChain) bool {
 	return infra.IsBlockedResponse(resp)
 }
 
-// sendGraphQLGET sends a GraphQL query via GET with a query parameter.
-func (m *Module) sendGraphQLGET(
-	ctx *httpmsg.HttpRequestResponse,
-	httpClient *http.Requester,
-	path, query string,
-) (string, error) {
-	raw := ctx.Request().Raw()
-
-	fullPath := path + "?query=" + strings.ReplaceAll(strings.ReplaceAll(query, " ", "+"), "{", "%7B")
-	fullPath = strings.ReplaceAll(fullPath, "}", "%7D")
-
-	modified, err := httpmsg.SetPath(raw, fullPath)
-	if err != nil {
-		return "", err
+func graphQLGETPath(path, query string) string {
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
 	}
-	modified, err = httpmsg.SetMethod(modified, "GET")
-	if err != nil {
-		return "", err
-	}
-	modified, err = httpmsg.ClearBody(modified)
-	if err != nil {
-		return "", err
-	}
-
-	// modified is well-formed raw, so wrap directly instead of re-parsing on this hot path.
-	fuzzedReq := httpmsg.NewRequestResponseRaw(modified, ctx.Service())
-
-	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
-	if err != nil {
-		return "", err
-	}
-	defer resp.Close()
-
-	return resp.FullResponseString(), nil
+	return path + separator + "query=" + url.QueryEscape(query)
 }
 
 // escapeJSON escapes a string for use inside a JSON string value.

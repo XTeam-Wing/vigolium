@@ -11,6 +11,7 @@ import (
 
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/modules/modtest"
+	"github.com/vigolium/vigolium/pkg/output"
 )
 
 // TestScanPerRequest_DetectsRESTUsers drives the real scan method against a host
@@ -38,6 +39,8 @@ func TestScanPerRequest_DetectsRESTUsers(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, res, "expected a finding when the REST users endpoint leaks slugs")
 	assert.Contains(t, res[0].ExtractedResults, "admin")
+	assert.Equal(t, output.RecordKindObservation, res[0].RecordKind)
+	assert.False(t, res[0].IsFinding(), "public REST authors are not necessarily private login identities")
 }
 
 // TestScanPerRequest_DetectsAuthorArchive drives the author-archive vector: a
@@ -63,10 +66,12 @@ func TestScanPerRequest_DetectsAuthorArchive(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, res, "expected a finding when /?author=N leaks distinct usernames")
 	assert.Contains(t, res[0].ExtractedResults, "siteadmin")
+	assert.Equal(t, output.RecordKindObservation, res[0].RecordKind)
+	assert.False(t, res[0].IsFinding())
 }
 
 // TestScanPerRequest_NoFP_AuthorIDEcho reproduces the AEM-style self-redirect FP
-// (the diagnostics.roche.com class): a non-WordPress host canonicalises
+// (the diagnostics.acme.com class): a non-WordPress host canonicalises
 // /?author=N to /author/N.html, echoing the requested id back with an extension.
 // Each probe yields a distinct value (N.html), defeating the uniformity guard,
 // yet none is a leaked username — the id-echo guard must drop them all.

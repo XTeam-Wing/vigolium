@@ -6,6 +6,12 @@ import (
 	"github.com/spf13/pflag"
 )
 
+// scanNoCarryBrowserSession backs the --no-carry-browser-session flag. Carrying
+// the spidering browser's cleared session forward is on by default
+// (Options.CarryBrowserSession), so this negative flag inverts it into the
+// option during scan setup.
+var scanNoCarryBrowserSession bool
+
 func registerNativeScanFlags(flags *pflag.FlagSet, includeAuth bool) {
 	// Target-Format group
 	flags.BoolVar(&scanOpts.FormatUseRequiredOnly, "required-only", false, "Parse only required fields from input format (ignore optional)")
@@ -15,6 +21,9 @@ func registerNativeScanFlags(flags *pflag.FlagSet, includeAuth bool) {
 	flags.StringVarP(&scanOpts.Output, "output", "o", "", "Write findings to specified output file")
 	flags.StringVar(&scanFailOn, "fail-on", "", "Exit non-zero if a finding at or above this severity is present (info|low|medium|high|critical) — for CI/agent gating. Scoped to this scan; --soft-fail overrides; with -P it is evaluated per child.")
 	flags.BoolVar(&scanOpts.ShowStats, "stats", false, "Show live progress stats during scanning")
+	flags.BoolVar(&scanPrintFinding, "print-finding", false, "After the scan, print each finding to stdout as Markdown (description + matched evidence + request/response), like 'vigolium finding --markdown'. Pairs well with -S and --silent for a quick scan.")
+	flags.BoolVar(&scanPrintTrafficTree, "print-traffic-tree", false, "After the scan, print the run's HTTP traffic to stdout as a host/path hierarchy tree, like 'vigolium traffic --tree'. Pairs well with -S and --silent.")
+	flags.BoolVar(&scanPrintTraffic, "print-traffic", false, "After the scan, print the run's raw HTTP request/response pairs to stdout, like 'vigolium traffic --raw'. Pairs well with -S and --silent.")
 	flags.BoolVar(&scanOpts.IncludeResponseInOutput, "include-response", false, "Include full HTTP response body in output")
 	flags.BoolVar(&scanOpts.OmitResponse, "omit-response", false, "Omit raw HTTP request/response bytes from output file (keeps metadata, smaller files)")
 	flags.StringVar(&scanReportSharedURL, "report-url", "",
@@ -25,7 +34,7 @@ func registerNativeScanFlags(flags *pflag.FlagSet, includeAuth bool) {
 	flags.BoolVar(&scanOpts.Stream, "stream", false, "Process targets as a stream without buffering or deduplication")
 
 	// Request group
-	flags.StringSliceVarP(&scanOpts.Headers, "header", "H", nil, "Add custom HTTP header (repeatable, e.g. -H 'Auth: Bearer token')")
+	flags.StringArrayVarP(&scanOpts.Headers, "header", "H", nil, "Add custom HTTP header (repeatable, e.g. -H 'Auth: Bearer token'). Commas are literal — repeat -H for multiple headers.")
 	flags.StringToStringVarP(&scanOpts.AdvancedOptions, "advanced-options", "a", nil, "Module-specific options as key=value (e.g. -a xss.dom=true)")
 
 	// Content discovery flags
@@ -45,6 +54,7 @@ func registerNativeScanFlags(flags *pflag.FlagSet, includeAuth bool) {
 	flags.BoolVar(&scanOpts.SpideringHeaded, "headed", false, "Show the browser window during spidering (sugar for --headless=false; wins when both are set)")
 	flags.BoolVar(&scanOpts.SpideringNoCDP, "no-cdp", false, "Disable Chrome DevTools Protocol event listener detection")
 	flags.BoolVar(&scanOpts.SpideringNoForms, "no-forms", false, "Disable automatic form detection and filling during spidering")
+	flags.BoolVar(&scanNoCarryBrowserSession, "no-carry-browser-session", false, "Do not carry the spidering browser's cleared session (cookies + UA) into discovery/scanning (on by default when --spider runs; scoped to the same host, respects -H)")
 
 	// External intelligence harvesting flags
 	flags.BoolVar(&scanOpts.ExternalHarvestEnabled, "external-harvest", false, "Enable external intelligence gathering phase (Wayback, CT logs, etc.)")
@@ -65,7 +75,7 @@ func registerNativeScanFlags(flags *pflag.FlagSet, includeAuth bool) {
 	flags.BoolVar(&globalSplitByHost, "split-by-host", false, "In stateless multi-target mode (-S -T file), write a separate per-host output file (base-<host>.<ext>) instead of one unified file")
 	flags.BoolVar(&globalDBIsolate, "db-isolate", false, "Scan into a private temporary database, then merge results into --db (or the default DB) at the end — lets many parallel scans share one --db without write contention (SQLite only, not with --stateless; combine with -P -T to fan out targets and export one unified output from the merged DB)")
 	flags.IntVarP(&globalParallel, "parallel", "P", 1, "Scan up to N targets concurrently as isolated child processes (requires -S -T --split-by-host, OR --db-isolate -T which merges into --db and exports one unified output; each target keeps its own --concurrency, so real in-flight requests ≈ N × --concurrency)")
-	flags.BoolVar(&globalResume, "resume", false, "Resume a prior -S -T --split-by-host -P run from its progress manifest (<output>.progress.json): skip targets that already completed cleanly and scan only the remainder. Run bare (`vigolium scan --resume`, no other flags) to auto-discover the *.progress.json in the current directory and relaunch the saved run from it (pass -o <prefix> to disambiguate when several exist)")
+	flags.BoolVar(&globalResume, "resume", false, "Resume a prior -S -T --split-by-host -P run from its progress manifest (<output>.progress.json): skip targets that already completed cleanly and scan only the remainder. Run bare ('vigolium scan --resume', no other flags) to auto-discover the *.progress.json in the current directory and relaunch the saved run from it (pass -o <prefix> to disambiguate when several exist)")
 
 	// Internal: set by the -P/--parallel parent on each child so the per-target
 	// <output>.console.log captures the live finding stream (even with deferred
@@ -75,11 +85,11 @@ func registerNativeScanFlags(flags *pflag.FlagSet, includeAuth bool) {
 	_ = flags.MarkHidden("captured-console")
 
 	if includeAuth {
-		flags.StringSliceVar(&scanOpts.AuthFiles, "auth-file", nil,
+		flags.StringArrayVar(&scanOpts.AuthFiles, "auth-file", nil,
 			"Path to auth file (YAML/JSON, single session or sessions: bundle), "+
-				"or bare name resolved against scanning_strategy.session.session_dir. Repeatable.")
-		flags.StringSliceVar(&scanOpts.AuthInline, "auth", nil,
-			"Inline session in 'name:Header:value' format. Repeatable.")
+				"or bare name resolved against scanning_strategy.session.session_dir. Repeatable; commas are literal.")
+		flags.StringArrayVar(&scanOpts.AuthInline, "auth", nil,
+			"Inline session in 'name:Header:value' format. Repeatable; commas are literal (header values may contain commas).")
 
 		// Accept the former flag names (--session / --session-file) shown in older
 		// guides and copy-pasted commands as aliases for --auth / --auth-file. A

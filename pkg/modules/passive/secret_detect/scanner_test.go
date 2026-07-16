@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	pkghttp "github.com/vigolium/vigolium/pkg/deparos/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/types/severity"
@@ -72,15 +73,15 @@ func TestCanProcess_TextContent(t *testing.T) {
 
 func TestCanProcess_OversizedBody(t *testing.T) {
 	m := New()
-	bigBody := strings.Repeat("a", maxBodySize+1)
+	bigBody := strings.Repeat("a", pkghttp.MaxSecretScanBodySize+1)
 	ctx := makeHTTPCtx("text/html", bigBody)
 	assert.False(t, m.CanProcess(ctx))
 }
 
 func TestSecretDedupKey(t *testing.T) {
 	const (
-		host = "usinfo.roche.com"
-		url  = "https://usinfo.roche.com/lp/975-FPO-828/1Roche1StopV2.html"
+		host = "usinfo.example.com"
+		url  = "https://usinfo.example.com/lp/975-FPO-828/landing-page.html"
 		rule = "kingfisher.google.6"
 		snip = "384916164796-8rgnoe66fd9992r0oi4pvuq7c086brk8.apps.googleusercontent.com"
 	)
@@ -118,7 +119,7 @@ func TestIsTextBasedMIME(t *testing.T) {
 		"",
 	}
 	for _, mt := range textTypes {
-		assert.True(t, isTextBasedMIME(mt), "expected true for %q", mt)
+		assert.True(t, pkghttp.IsTextBasedMIME(mt), "expected true for %q", mt)
 	}
 
 	binaryTypes := []string{
@@ -129,6 +130,6 @@ func TestIsTextBasedMIME(t *testing.T) {
 		"video/mp4",
 	}
 	for _, mt := range binaryTypes {
-		assert.False(t, isTextBasedMIME(mt), "expected false for %q", mt)
+		assert.False(t, pkghttp.IsTextBasedMIME(mt), "expected false for %q", mt)
 	}
 }

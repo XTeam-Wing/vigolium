@@ -97,6 +97,14 @@ export interface AdapterRunInput {
   maxTurns?: number;
   /** Externally-driven abort. Adapter should propagate to its runtime. */
   abortSignal?: AbortSignal;
+  /**
+   * Resume a prior conversation by session id (from a previous run's `session`
+   * event). Loads that session's history so a follow-up prompt continues it —
+   * e.g. triage → exploit on the same finding without re-establishing context.
+   * Claude SDK maps this to `query`'s `resume` option; Codex SDK maps it to
+   * `resumeThread()`.
+   */
+  resume?: string;
   /** Hint label for logs / TUI; usually the phase id. */
   label?: string;
   /**
@@ -118,6 +126,19 @@ export interface AdapterRunInput {
    * (SDK).
    */
   bypassPermissions?: boolean;
+  /**
+   * Per-run OS sandbox level. Codex adapters map this to their SandboxMode and
+   * it takes precedence over `bypassPermissions`-derived defaults, so a caller
+   * can grant permission-bypass while still confining filesystem writes (e.g. a
+   * read-only triage). Claude adapters have no per-run OS sandbox and ignore it.
+   */
+  sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  /**
+   * Whether the run may make network requests. Codex adapters enforce this via
+   * `networkAccessEnabled`; Claude adapters cannot confine egress per-run and
+   * treat it as advisory (the system prompt carries the intent).
+   */
+  networkAccessEnabled?: boolean;
 }
 
 export interface Adapter {

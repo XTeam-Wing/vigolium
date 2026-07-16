@@ -24,6 +24,11 @@ import (
 // (csrfToken, xsrfToken) or the explicit _token / authenticity.token alternatives.
 var csrfParamPattern = regexp.MustCompile(`(?i)(csrf|xsrf|\btoken\b|authenticity.token|__RequestVerificationToken|antiforgery|_token|nonce|csrfmiddlewaretoken)`)
 
+// csrfForeignOrigin is the attacker origin used to model a cross-site forgery on
+// the verification probe. It is a non-resolvable .invalid host so it can never be
+// mistaken for a real same-site origin.
+const csrfForeignOrigin = "https://csrf-probe.invalid"
+
 // stateChangingMethods are HTTP methods that modify server state.
 var stateChangingMethods = map[string]bool{
 	"POST":   true,
@@ -172,14 +177,17 @@ func (m *Module) ScanPerRequest(
 	if ctx.Request().Header("Authorization") != "" {
 		return nil, nil
 	}
-	if ctx.Request().Header("Cookie") == "" {
-		return nil, nil
+	// The request must carry a likely SESSION cookie: a CSRF forgery rides ambient
+	// session credentials, so a non-session cookie (preferences, analytics) gives
+	// an attacker nothing to ride. Mirrors the passive csrf_detect precondition.
+	hasSessionCookie := false
+	for _, name := range modkit.RequestCookieNames(ctx.Request().Header("Cookie")) {
+		if modkit.LikelySessionCookie(name) {
+			hasSessionCookie = true
+			break
+		}
 	}
-
-	// Dedup by method:host:path
-	dedupKey := utils.Sha1(fmt.Sprintf("%s:%s:%s", method, urlx.Host, urlx.Path))
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(dedupKey) {
+	if !hasSessionCookie {
 		return nil, nil
 	}
 
@@ -207,6 +215,34 @@ func (m *Module) ScanPerRequest(
 		return nil, nil
 	}
 
+	// SameSite gate: a browser withholds a SameSite=Strict (and normally
+	// SameSite=Lax) session cookie on a cross-site state-changing POST, so a token
+	// bypass there is NOT reproducible in a browser — emitting it would be a
+	// High/Firm false positive. The verifier replays the captured Cookie verbatim,
+	// which no browser would send, so consult the recorded policy for the request's
+	// own session cookie (set on the login response, not echoed here) and drop the
+	// known-protected case.
+	scanCtx.ObserveResponseCookies(ctx)
+	for _, policy := range scanCtx.RequestCookiePolicies(ctx) {
+		if !modkit.LikelySessionCookie(policy.Name) {
+			continue
+		}
+		if policy.SameSite == "strict" || policy.SameSite == "lax" {
+			return nil, nil
+		}
+	}
+
+	// Dedup only after confirming this request actually carries a forgeable CSRF
+	// token. Claiming the route earlier would let a tokenless (or differently
+	// shaped) request suppress a later token-bearing one that IS suitable for
+	// active verification. Include the request identity so distinct authenticated
+	// shapes on the same route are each verified.
+	dedupKey := utils.Sha1(fmt.Sprintf("%s:%s:%s:%s", method, urlx.Host, urlx.Path, ctx.Request().IdentityFingerprint()))
+	diskSet := m.ds.Get(scanCtx.DedupMgr())
+	if diskSet != nil && diskSet.IsSeen(dedupKey) {
+		return nil, nil
+	}
+
 	// Get baseline status code + body (the original request carried a VALID token
 	// and succeeded). The body is used to confirm a mutated-token request was
 	// processed the SAME way, not merely returned some 2xx.
@@ -225,6 +261,17 @@ func (m *Module) ScanPerRequest(
 			continue
 		}
 
+		// Model an actual cross-site forgery: a genuine CSRF attack originates from
+		// a foreign origin. Rewrite Origin/Referer to a foreign origin so an endpoint
+		// that ignores the token but correctly rejects foreign origins is not
+		// misreported as vulnerable.
+		if withOrigin, oerr := httpmsg.AddOrReplaceHeader(mutatedRaw, "Origin", csrfForeignOrigin); oerr == nil {
+			mutatedRaw = withOrigin
+		}
+		if withReferer, rerr := httpmsg.AddOrReplaceHeader(mutatedRaw, "Referer", csrfForeignOrigin+"/"); rerr == nil {
+			mutatedRaw = withReferer
+		}
+
 		// probe.mutate produces well-formed raw, so wrap directly instead of
 		// re-parsing on this hot path.
 		fuzzedReq := httpmsg.NewRequestResponseRaw(mutatedRaw, ctx.Service())
@@ -239,9 +286,17 @@ func (m *Module) ScanPerRequest(
 
 		respStatus := 0
 		respBody := ""
+		respFull := ""
 		if resp.Response() != nil {
 			respStatus = resp.Response().StatusCode
 			respBody = resp.Body().String()
+			// Only a 2xx response can become a finding below (a reject is 4xx/5xx),
+			// so capture the full raw proof response — the forged cross-site request
+			// processed like the valid-token baseline — just for that path, before
+			// Close. Reject responses skip the headers+body copy they'd never use.
+			if respStatus >= 200 && respStatus < 300 {
+				respFull = resp.FullResponseString()
+			}
 		}
 		resp.Close()
 
@@ -264,6 +319,7 @@ func (m *Module) ScanPerRequest(
 				URL:              urlx.String(),
 				Matched:          urlx.String(),
 				Request:          string(mutatedRaw),
+				Response:         respFull,
 				FuzzingParameter: csrfParamName,
 				ExtractedResults: []string{probe.name},
 				Info: output.Info{

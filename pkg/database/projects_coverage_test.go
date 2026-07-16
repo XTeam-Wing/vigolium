@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/google/uuid"
@@ -193,6 +194,104 @@ func TestReassignAndPurgeProjectData(t *testing.T) {
 	dstFindings, _ := db.NewSelect().Model((*Finding)(nil)).Where("project_uuid = ?", dst).Count(ctx)
 	if dstRecords != 0 || dstFindings != 0 {
 		t.Errorf("purge left data: records=%d findings=%d", dstRecords, dstFindings)
+	}
+}
+
+// TestReassignProjectData_MovesAllOwnedTables guards the fix that reassignment
+// covers the full project-owned table set (it previously omitted agentic_scans and
+// authentication_hostnames, which then stayed pinned to the deleted source project).
+func TestReassignProjectData_MovesAllOwnedTables(t *testing.T) {
+	db := newTestDB(t)
+	repo := NewRepository(db)
+	ctx := context.Background()
+
+	src := uuid.NewString()
+	dst := uuid.NewString()
+
+	agentUUID := uuid.NewString()
+	if err := repo.CreateAgenticScan(ctx, &AgenticScan{UUID: agentUUID, ProjectUUID: src, Status: "completed"}); err != nil {
+		t.Fatalf("CreateAgenticScan: %v", err)
+	}
+	if err := repo.SaveAuthenticationHostname(ctx, &AuthenticationHostname{ProjectUUID: src, Hostname: "auth.example.com"}); err != nil {
+		t.Fatalf("SaveAuthenticationHostname: %v", err)
+	}
+	// analysis_artifacts carries project_uuid but was previously omitted from the
+	// owned-table set, so reassignment left its rows pinned to the deleted source.
+	if _, err := db.NewInsert().Model(&AnalysisArtifact{
+		ProjectUUID:    src,
+		HTTPRecordUUID: uuid.NewString(),
+		Kind:           "test",
+		SHA256:         "deadbeef",
+		ByteLength:     3,
+		Content:        []byte("xyz"),
+	}).Exec(ctx); err != nil {
+		t.Fatalf("insert analysis_artifact: %v", err)
+	}
+
+	if err := repo.ReassignProjectData(ctx, src, dst); err != nil {
+		t.Fatalf("ReassignProjectData: %v", err)
+	}
+
+	agentSrc, _ := db.NewSelect().Model((*AgenticScan)(nil)).Where("project_uuid = ?", src).Count(ctx)
+	agentDst, _ := db.NewSelect().Model((*AgenticScan)(nil)).Where("project_uuid = ?", dst).Count(ctx)
+	if agentSrc != 0 || agentDst != 1 {
+		t.Errorf("agentic_scans reassign: src=%d dst=%d, want 0/1 (was previously omitted)", agentSrc, agentDst)
+	}
+	authSrc, _ := db.NewSelect().Model((*AuthenticationHostname)(nil)).Where("project_uuid = ?", src).Count(ctx)
+	authDst, _ := db.NewSelect().Model((*AuthenticationHostname)(nil)).Where("project_uuid = ?", dst).Count(ctx)
+	if authSrc != 0 || authDst != 1 {
+		t.Errorf("authentication_hostnames reassign: src=%d dst=%d, want 0/1 (was previously omitted)", authSrc, authDst)
+	}
+	artSrc, _ := db.NewSelect().Model((*AnalysisArtifact)(nil)).Where("project_uuid = ?", src).Count(ctx)
+	artDst, _ := db.NewSelect().Model((*AnalysisArtifact)(nil)).Where("project_uuid = ?", dst).Count(ctx)
+	if artSrc != 0 || artDst != 1 {
+		t.Errorf("analysis_artifacts reassign: src=%d dst=%d, want 0/1 (was previously omitted)", artSrc, artDst)
+	}
+}
+
+// TestProjectOwnedTablesMatchesSchema is a self-maintaining guard: it enumerates
+// every table in the schema that actually carries a project_uuid column and fails
+// if that set diverges from projectOwnedTables. This would have caught the
+// analysis_artifacts omission the moment the table was added, without anyone
+// remembering to update a hand-maintained seed list.
+func TestProjectOwnedTablesMatchesSchema(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	var tableNames []string
+	if err := db.NewRaw(
+		"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+	).Scan(ctx, &tableNames); err != nil {
+		t.Fatalf("list tables: %v", err)
+	}
+
+	schemaOwned := map[string]bool{}
+	for _, tbl := range tableNames {
+		// Table names come from sqlite_master (trusted); the table-valued
+		// pragma_table_info form lets us project just the column name.
+		var colNames []string
+		if err := db.NewRaw(fmt.Sprintf("SELECT name FROM pragma_table_info('%s')", tbl)).Scan(ctx, &colNames); err != nil {
+			t.Fatalf("table_info(%s): %v", tbl, err)
+		}
+		for _, name := range colNames {
+			if name == "project_uuid" {
+				schemaOwned[tbl] = true
+				break
+			}
+		}
+	}
+
+	listed := map[string]bool{}
+	for _, tbl := range projectOwnedTables {
+		listed[tbl] = true
+		if !schemaOwned[tbl] {
+			t.Errorf("projectOwnedTables lists %q but it has no project_uuid column in the schema", tbl)
+		}
+	}
+	for tbl := range schemaOwned {
+		if !listed[tbl] {
+			t.Errorf("table %q has a project_uuid column but is missing from projectOwnedTables (reassign/purge would orphan its rows)", tbl)
+		}
 	}
 }
 

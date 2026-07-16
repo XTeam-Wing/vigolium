@@ -1,5 +1,5 @@
 import { readFile, rm } from "fs/promises";
-import { resolve, join, dirname } from "path";
+import { resolve, join } from "path";
 import { OutputSyncer, assertOutputNotNested } from "../engine/output-sync.js";
 import { writeCache as writeRateLimitsCache, readCache as readRateLimitsCache, ageMs, formatResetsIn } from "../engine/rate-limits-cache.js";
 import chalk from "chalk";
@@ -8,7 +8,16 @@ import { ClaudeCliAdapter } from "../adapters/claude-cli.js";
 import { ClaudeSdkAdapter } from "../adapters/claude-sdk.js";
 import { CodexCliAdapter } from "../adapters/codex-cli.js";
 import { CodexSdkAdapter } from "../adapters/codex-sdk.js";
-import { chooseAdapter } from "../adapters/detect.js";
+import {
+  chooseAdapter,
+  resolveAgentTransport,
+  type ResolvedAdapterChoice,
+} from "../adapters/detect.js";
+import {
+  detectClaudeVersionDrift,
+  probeClaudeBinaryVersion,
+  sdkTargetClaudeVersion,
+} from "../adapters/version-check.js";
 import { getContentLoader } from "../content-loader.js";
 import { Orchestrator, type OrchestratorResult } from "../engine/orchestrator.js";
 import { finalizeOutput } from "../engine/redact-artifacts.js";
@@ -31,6 +40,7 @@ import { normalizeDirInputs } from "./merge.js";
 import { cloneRemoteTarget, isRemoteTargetUrl } from "./clone-target.js";
 import type { ResumeOptions } from "./resume.js";
 import { compact } from "../engine/util.js";
+import { cleanupConfirmationResources } from "../engine/confirmation-cleanup.js";
 import { parsePositiveUsd, statusArrow } from "./util.js";
 import { resolveModel } from "./run-models.js";
 import { runInteractive } from "./run-interactive.js";
@@ -131,6 +141,11 @@ export async function runCommand(opts: RunOptions): Promise<void> {
   if (platform !== "claude" && platform !== "codex") {
     fail(`--agent must be "claude" or "codex"`);
   }
+  try {
+    opts.transport = resolveAgentTransport(opts.transport);
+  } catch (err) {
+    fail((err as Error).message);
+  }
 
   // Tell Claude Code it's running in a sandboxed context so it doesn't refuse
   // to start as root. Inherited by every claude child (CLI adapter spawn,
@@ -158,10 +173,23 @@ export async function runCommand(opts: RunOptions): Promise<void> {
         `Run without -i, or invoke modes one at a time.`,
     );
   }
+  if (opts.interactive && opts.transport === "sdk") {
+    fail(`--transport sdk is incompatible with -i/--interactive; interactive mode uses the native agent CLI`);
+  }
   if (opts.interactive && requestedModes[0] === "refresh") {
     fail(
       `--mode refresh is headless-only (it dispatches to revisit or deep at startup). ` +
         `Run without -i, or invoke the resolved mode directly.`,
+    );
+  }
+  if (
+    opts.interactive
+    && platform === "codex"
+    && !isCodexHandoffMode(requestedModes[0]!)
+  ) {
+    fail(
+      `--mode ${requestedModes[0]} has no Codex interactive dispatch. ` +
+        `Run without -i to use the phase orchestrator.`,
     );
   }
   const noGit = opts.git === false;
@@ -300,11 +328,14 @@ export async function runCommand(opts: RunOptions): Promise<void> {
         mode: requestedModes[0]!,
         targetDir,
         noGit,
+        tmux: !!opts.tmux,
         ...compact({
           liveTarget: opts.liveTarget,
           model: opts.model,
           focus: interactiveAuditContext.focus,
           expectedBehaviors: interactiveAuditContext.expectedBehaviors,
+          agentBinary: opts.agentBinary,
+          disallowedTools: opts.disallowedTools,
         }),
       });
     }
@@ -391,6 +422,7 @@ export function isResumeAlias(opts: RunOptions): boolean {
 function toResumeOptions(opts: RunOptions): ResumeOptions {
   return compact({
     agent: opts.agent,
+    transport: opts.transport,
     strict: opts.strict,
     maxCost: opts.maxCost,
     output: opts.output,
@@ -490,6 +522,33 @@ async function pruneCompletedArtifacts(args: {
   }
 }
 
+/**
+ * Warn when the vendored Agent SDK's target claude-code version has drifted far
+ * enough from the installed binary to risk truncating an SDK-driven headless
+ * audit mid-run (see `src/adapters/version-check.ts`). The claude SDK adapter
+ * drives the binary over the Agent SDK's stdio control protocol; interactive
+ * (`-i`) and the `--print` CLI adapter speak the binary's own native protocol,
+ * so only the claude SDK path needs this. Strictly advisory — never blocks.
+ */
+function warnClaudeVersionDrift(choice: ResolvedAdapterChoice, json: boolean): void {
+  const drift = detectClaudeVersionDrift(
+    sdkTargetClaudeVersion(),
+    probeClaudeBinaryVersion(choice.binaryPath ?? ""),
+  );
+  if (!drift) return;
+  if (json) {
+    emitJsonEvent({ kind: "versionDrift", ...drift });
+    return;
+  }
+  console.log(
+    chalk.yellow("[warn]") +
+      `     Agent SDK targets claude-code ${chalk.cyan(drift.sdkTarget)} but the installed ` +
+      `binary is ${chalk.cyan(drift.binary)}. This version gap can cause SDK-driven (headless) ` +
+      `runs to stop mid-audit; upgrade vigolium-audit, or use ${chalk.cyan("-i")} (interactive), ` +
+      `which is unaffected.`,
+  );
+}
+
 async function runHeadless(args: {
   platform: AgentPlatform;
   modes: AuditMode[];
@@ -500,7 +559,7 @@ async function runHeadless(args: {
   const { platform, modes, targetDir, opts, noGit } = args;
   const json = !!opts.json;
   const isChain = modes.length > 1;
-  const choice = chooseAdapter(platform);
+  const choice = chooseAdapter(platform, opts.transport);
 
   if (!json) {
     const git = noGit
@@ -555,6 +614,8 @@ async function runHeadless(args: {
       : chalk.dim("runtime default");
     console.log(`${statusArrow("Model")} Model:     ${modelLabel}`);
   }
+
+  if (platform === "claude" && choice.flavor === "sdk") warnClaudeVersionDrift(choice, json);
 
   let auditContext: { focus?: string; expectedBehaviors?: string };
   try {
@@ -762,6 +823,8 @@ async function runHeadless(args: {
             focus: auditContext.focus,
             expectedBehaviors: auditContext.expectedBehaviors,
             liveTarget: opts.liveTarget,
+            model: effectiveModel,
+            noGit: noGit || undefined,
           });
           const driver: { on: typeof Orchestrator.prototype.on; run: () => Promise<OrchestratorResult> } =
             platform === "claude"
@@ -819,6 +882,13 @@ async function runHeadless(args: {
           } catch (err) {
             if (lineLogger) await lineLogger.drain();
             throw err;
+          } finally {
+            if (m === "confirm") {
+              const cleanupDir = platform === "claude" || useCodexHandoffM
+                ? join(targetDir, "vigolium-results")
+                : resultsDir;
+              await cleanupConfirmationResources(cleanupDir).catch(() => {});
+            }
           }
         }),
       ).catch((err: Error) => {
@@ -911,6 +981,8 @@ async function runHeadless(args: {
         focus: auditContext.focus,
         expectedBehaviors: auditContext.expectedBehaviors,
         liveTarget: opts.liveTarget,
+        model: effectiveModel,
+        noGit: noGit || undefined,
         excludePhases: refreshRouting?.excludePhases,
         triggeredVia: refreshRouting?.triggeredVia,
         resume: opts.resume === true || refreshRouting?.resume === true ? true : undefined,
@@ -971,6 +1043,10 @@ async function runHeadless(args: {
         stoppedReason = "fatal";
         if (lineLogger) await lineLogger.drain();
         break;
+      } finally {
+        if (mode === "confirm") {
+          await cleanupConfirmationResources(resultsDir).catch(() => {});
+        }
       }
       if (lineLogger) await lineLogger.drain();
       if (result === null) {

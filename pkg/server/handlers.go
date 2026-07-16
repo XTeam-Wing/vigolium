@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -17,40 +18,80 @@ import (
 	"go.uber.org/zap"
 )
 
+// maxConcurrentNativeScans bounds how many url/request background scans can run
+// at once, so a burst of POST /api/scan-url|scan-request calls can't spawn an
+// unbounded number of detached scan goroutines. Excess calls are rejected with
+// 503 rather than queued.
+const maxConcurrentNativeScans = 8
+
 // countCache caches expensive COUNT(*) query results with a TTL.
 type countCache struct {
-	mu        sync.Mutex
-	records   int64
-	findings  int64
-	updatedAt time.Time
-	ttl       time.Duration
+	mu         sync.Mutex
+	records    int64
+	findings   int64
+	updatedAt  time.Time
+	ttl        time.Duration
+	refreshing bool // a bounded refresh is already in flight
 }
 
 func newCountCache(ttl time.Duration) *countCache {
 	return &countCache{ttl: ttl}
 }
 
-// Get returns cached counts, refreshing from the database if expired.
+// Get returns cached counts using a stale-while-revalidate policy: a fresh value
+// is served directly, and a stale value is served immediately while a single
+// bounded refresh runs in the background. The mutex is never held across the
+// COUNT(*) queries, so a slow count can't block every concurrent /server-info
+// caller (the previous behavior). The very first call (no cached value yet)
+// refreshes synchronously so it returns real counts.
 func (cc *countCache) Get(db *database.DB) (records, findings int64) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
-	if time.Since(cc.updatedAt) < cc.ttl {
-		return cc.records, cc.findings
+	stale := cc.updatedAt.IsZero() || time.Since(cc.updatedAt) >= cc.ttl
+	if stale && !cc.refreshing {
+		cc.refreshing = true
+		if cc.updatedAt.IsZero() {
+			// No value yet: block this first caller on a bounded refresh so it
+			// returns real counts rather than zeros.
+			cc.mu.Unlock()
+			cc.refresh(db)
+			cc.mu.Lock()
+		} else {
+			// Serve the stale value now; refresh off the request path.
+			go cc.refresh(db)
+		}
+	}
+	// Fresh, stale-while-revalidating, or refresh-in-flight: serve what we have.
+	return cc.records, cc.findings
+}
+
+// refresh recomputes the counts under a bounded timeout and republishes them.
+// Runs without holding cc.mu across the queries; clears the refreshing flag when
+// done. A failed count keeps the previous value rather than zeroing it.
+func (cc *countCache) refresh(db *database.DB) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var rec, find int64
+	recOK, findOK := false, false
+	if c, err := db.NewSelect().Model((*database.HTTPRecord)(nil)).Count(ctx); err == nil {
+		rec, recOK = int64(c), true
+	}
+	if c, err := db.NewSelect().Model((*database.Finding)(nil)).Count(ctx); err == nil {
+		find, findOK = int64(c), true
 	}
 
-	// Shared cross-request cache refresh — not owned by any single request, so it
-	// uses a background context rather than one caller's request context.
-	ctx := context.Background()
-	if recordCount, err := db.NewSelect().Model((*database.HTTPRecord)(nil)).Count(ctx); err == nil {
-		cc.records = int64(recordCount)
+	cc.mu.Lock()
+	if recOK {
+		cc.records = rec
 	}
-	if findingCount, err := db.NewSelect().Model((*database.Finding)(nil)).Count(ctx); err == nil {
-		cc.findings = int64(findingCount)
+	if findOK {
+		cc.findings = find
 	}
 	cc.updatedAt = time.Now()
-
-	return cc.records, cc.findings
+	cc.refreshing = false
+	cc.mu.Unlock()
 }
 
 // scanState tracks a running scan for a specific project.
@@ -136,6 +177,18 @@ type Handlers struct {
 	runCancelMu sync.Mutex
 	runCancels  map[string]context.CancelFunc
 
+	// nativeScanSem bounds concurrent url/request background scans (POST
+	// /api/scan-url and /api/scan-request), which otherwise spawned unbounded
+	// detached goroutines. nativeScanWG lets Close wait for them; they derive their
+	// context from runCtx, so runCancel stops them first.
+	nativeScanSem chan struct{}
+	nativeScanWG  sync.WaitGroup
+
+	// shuttingDown is set at the start of Close so per-project queue workers stop
+	// starting newly-dequeued scans (they discard them instead) once the server is
+	// tearing down.
+	shuttingDown atomic.Bool
+
 	// Cached COUNT query results for server-info endpoint
 	counts *countCache
 
@@ -167,6 +220,21 @@ func NewHandlers(q queue.Queue, db *database.DB, repo *database.Repository, rw *
 		lightMax = 10
 	}
 
+	// Invariant: a repository is always derived from a db (NewRepository(db)), so a
+	// non-nil db paired with a nil repo is a half-initialized state — e.g. the
+	// connection opened but schema creation failed. Repo-backed handlers guard only
+	// on h.db == nil before dereferencing h.repo, so admitting that state would turn
+	// each into a nil-pointer panic (HTTP 500). NewHandlers is the single path every
+	// server (CLI, tests, any future entry point) is constructed through, so this is
+	// the universal place to normalize the pairing: drop to a consistent no-DB mode
+	// by nil-ing db, and the h.db == nil guards then return a clean 503. The reverse
+	// pairing (db == nil, repo != nil) is a legitimate, tested config (repo-backed
+	// agent endpoints with no traffic DB) and is deliberately left untouched.
+	if db != nil && repo == nil {
+		zap.L().Warn("database handle present without a repository; disabling database-backed endpoints")
+		db = nil
+	}
+
 	runCtx, runCancel := context.WithCancel(context.Background())
 
 	h := &Handlers{
@@ -190,6 +258,7 @@ func NewHandlers(q queue.Queue, db *database.DB, repo *database.Repository, rw *
 		runCtx:             runCtx,
 		runCancel:          runCancel,
 		runCancels:         make(map[string]context.CancelFunc),
+		nativeScanSem:      make(chan struct{}, maxConcurrentNativeScans),
 	}
 	h.findings = &findingsHandlers{db: db, repo: repo}
 	if !cfg.NoAgent {
@@ -239,11 +308,41 @@ func (h *Handlers) agentDBCleanupLoop() {
 	}
 }
 
-// HandleHealth handles GET /health.
+// HandleHealth handles GET /health — a liveness probe. It reports that the
+// process/event loop is alive and intentionally does NOT touch the database, so
+// it never fails just because the DB is momentarily slow.
 func (h *Handlers) HandleHealth(c fiber.Ctx) error {
 	return c.JSON(HealthResponse{
 		Status:    "healthy",
 		Timestamp: time.Now().Format(time.RFC3339),
+	})
+}
+
+// HandleReady handles GET /ready — a readiness probe distinct from liveness. It
+// reports 200 only when the server can actually serve work: the database
+// responds to a lightweight ping within a short timeout and the record writer is
+// still accepting writes. Otherwise it returns 503 so an orchestrator routes
+// traffic elsewhere without killing the (live) process.
+func (h *Handlers) HandleReady(c fiber.Ctx) error {
+	notReady := func(reason string) error {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"status":    "not_ready",
+			"reason":    reason,
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	if h.db != nil {
+		ctx, cancel := context.WithTimeout(c.Context(), 2*time.Second)
+		defer cancel()
+		if err := h.db.SQLDB().PingContext(ctx); err != nil {
+			return notReady("database unavailable: " + err.Error())
+		}
+	}
+
+	return c.JSON(fiber.Map{
+		"status":    "ready",
+		"timestamp": time.Now().Format(time.RFC3339),
 	})
 }
 
@@ -302,6 +401,18 @@ func (h *Handlers) HandleServerInfo(c fiber.Ctx) error {
 	return c.JSON(resp)
 }
 
+// effectiveConfigPath returns the config file the server actually loaded
+// settings from, honoring the --config flag (ServerConfig.ConfigPath). Config
+// mutations from the API must write here — and the watcher watches this same
+// file — so a custom config isn't silently shadowed by writes to the default
+// ~/.vigolium/vigolium-configs.yaml. Empty falls back to the default path.
+func (h *Handlers) effectiveConfigPath() string {
+	if h.config.ConfigPath != "" {
+		return h.config.ConfigPath
+	}
+	return config.ConfigFilePath()
+}
+
 // getScopeMatcher returns the cached ScopeMatcher, creating it lazily on first call.
 func (h *Handlers) getScopeMatcher() *config.ScopeMatcher {
 	h.scopeMatcherMu.RLock()
@@ -318,9 +429,23 @@ func (h *Handlers) getScopeMatcher() *config.ScopeMatcher {
 		return h.scopeMatcher
 	}
 	if h.settings != nil {
-		h.scopeMatcher = config.NewScopeMatcher(h.settings.Scope)
+		// Read the Scope section under the config-watcher read lock so a live
+		// hot-reload swapping settings.Scope in place can't tear the slice/map
+		// headers we copy into the matcher here.
+		h.scopeMatcher = config.NewScopeMatcher(h.readReloadableScope())
 	}
 	return h.scopeMatcher
+}
+
+// readReloadableScope returns a copy of the Scope section taken under the config
+// watcher's reload read lock (a no-op when no watcher is active), coordinating
+// with reload()'s in-place section swaps to avoid a torn read.
+func (h *Handlers) readReloadableScope() config.ScopeConfig {
+	if h.configWatcher != nil {
+		h.configWatcher.RLock()
+		defer h.configWatcher.RUnlock()
+	}
+	return h.settings.Scope
 }
 
 // resetScopeMatcher invalidates the cached ScopeMatcher so it is rebuilt on next use.
@@ -357,6 +482,16 @@ func (h *Handlers) getProjectScanState(projectUUID string) *scanState {
 // scanQueueWorker processes queued scans for a project sequentially.
 func (h *Handlers) scanQueueWorker(projectUUID string, ch chan *queuedScan) {
 	for qs := range ch {
+		// Server is tearing down: don't start a scan that was still queued. Release
+		// its runner and mark the record terminal so it doesn't linger as "queued".
+		if h.shuttingDown.Load() {
+			qs.runner.Discard()
+			if h.repo != nil {
+				_ = h.repo.CompleteScan(context.Background(), qs.scanID, "cancelled: server shutdown")
+			}
+			continue
+		}
+
 		h.scanMu.Lock()
 		st := h.getProjectScanState(qs.projectUUID)
 		st.running = true
@@ -424,18 +559,59 @@ func (h *Handlers) cancelRun(uuid string) bool {
 }
 
 func (h *Handlers) Close() {
+	// Mark shutdown first so queue workers stop starting newly-dequeued scans
+	// (they discard them) as soon as their channels are closed below.
+	h.shuttingDown.Store(true)
+
 	// Cancel in-flight agent runs first so their streaming connections drain
 	// and go idle before the HTTP server's graceful shutdown waits on them.
 	if h.runCancel != nil {
 		h.runCancel()
 	}
 	close(h.agentCleanupStop)
+
 	h.scanMu.Lock()
 	for _, ch := range h.scanQueues {
 		close(ch)
 	}
 	h.scanQueues = make(map[string]chan *queuedScan)
+	// Snapshot the runners of in-flight full (target) scans. These are launched as
+	// detached goroutines and are NOT tracked by nativeScanWG, so without this they
+	// would neither be cancelled nor awaited on shutdown.
+	var fullScanRunners []*runner.Runner
+	for _, st := range h.scanStates {
+		if st.running && st.runner != nil {
+			fullScanRunners = append(fullScanRunners, st.runner)
+		}
+	}
 	h.scanMu.Unlock()
+
+	// Cancel + release each in-flight full scan concurrently (Runner.Close cancels
+	// its context and waits, bounded by ShutdownTimeout; it's idempotent, so a
+	// concurrent runBackgroundScan.Close is harmless).
+	var fullScanWG sync.WaitGroup
+	for _, r := range fullScanRunners {
+		fullScanWG.Add(1)
+		go func(r *runner.Runner) {
+			defer fullScanWG.Done()
+			r.Close()
+		}(r)
+	}
+
+	// Wait for all background scans to unwind. runCancel above cancelled runCtx
+	// (url/request scans) and the runners above were cancelled; bound the wait so a
+	// wedged scan can't hang shutdown.
+	done := make(chan struct{})
+	go func() {
+		h.nativeScanWG.Wait()
+		fullScanWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		zap.L().Warn("Shutdown: scans did not drain within 30s; proceeding")
+	}
 	// Agent engine is in-process (olium); no resources to release.
 }
 

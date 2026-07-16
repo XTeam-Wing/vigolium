@@ -38,6 +38,7 @@ Control it:
 | `--with-records` | (finding) resolve + embed the linked HTTP records — a self-contained triage bundle |
 | `--full-body` | include complete, decoded bodies (use when you need to write an exploit) |
 | `--raw` | full raw HTTP request/response, human format (not JSON) |
+| `--pick` | (finding) keep only the 1-based position(s) from the result list — `2`, `1,3`, or `2-4`; applied after `--search`/filters + sort |
 
 ## Run a scan and gate on results
 
@@ -69,6 +70,9 @@ vigolium finding --min-severity high --json --compact \
 # One finding, fully self-contained (finding + linked request/response).
 vigolium finding --id 42 --json --with-records
 
+# Narrow a search to the Nth match by list position (1-based), e.g. the 2nd.
+vigolium finding --search 'Reverse Proxy' --pick 2 --raw
+
 # Findings from a specific agent run (autopilot/swarm/audit).
 vigolium finding --agentic-scan <agentic_scan_uuid> --json --with-records
 ```
@@ -76,6 +80,12 @@ vigolium finding --agentic-scan <agentic_scan_uuid> --json --with-records
 Filters (shared with `traffic` / `db ls`): `--host --path --method --status
 --severity --min-severity --from/--to --search --scan-uuid --agentic-scan
 --module-type -n/--limit --offset --sort --asc`.
+
+`--search`/`--header`/`--body` now span the full request/response corpus (URL,
+path, headers, and body). Each has an inverse: `--exclude-search` (repeatable,
+AND-combined — a row is dropped if ANY term appears), `--exclude-header`, and
+`--exclude-body`. Compose them, e.g. keep API traffic but drop noise:
+`vigolium traffic --search api --exclude-search /health --exclude-body heartbeat`.
 
 Output shape:
 ```json
@@ -126,6 +136,39 @@ vigolium scan -S --format sqlite,html -o scan -t target.example   # → scan.sql
 vigolium scan -S --format sqlite -o run --split-by-host -P 4 -T targets.txt  # → run-<host>.sqlite per target
 vigolium finding -S --db ./run-target.example.sqlite --min-severity high
 ```
+
+## Merge external `.sqlite` scans into one DB (`vigolium import`)
+
+The stateless reads above open a foreign `.sqlite` **in place**. To instead
+**fold** those external databases into a single one, `vigolium import` accepts a
+vigolium SQLite database as its source and merges it into the destination DB
+(the `--db` target, or the configured default when `--db` is omitted). The source
+is auto-detected by its SQLite header, so `.sqlite`, `.sqlite3`, `.db`, or a bare
+name all work. It's a lossless, **idempotent** merge — HTTP records, findings,
+scans, agentic scans, and OAST interactions all flow in, deduped on their natural
+keys (records by UUID, findings by `(project_uuid, finding_hash)`), so re-running
+the same import adds nothing. Each row keeps its original `project_uuid`.
+
+```bash
+# Merge one external scan DB into your default database.
+vigolium import other-vigolium-scan.sqlite
+
+# Merge into an explicit destination (--db is the target, not a filter).
+vigolium import --db default-db.sqlite other-vigolium-scan.sqlite
+
+# Collapse a directory of per-host/per-run exports into one combined DB.
+for f in scans/*.sqlite; do vigolium import --db combined.sqlite "$f"; done
+vigolium finding --db combined.sqlite --min-severity high
+
+# -j prints a per-table merge summary for scripting.
+vigolium -j import --db combined.sqlite other-vigolium-scan.sqlite
+```
+
+This is the natural companion to `vigolium scan -S --format sqlite` above: fan out
+scans into standalone per-host `.sqlite` files, then merge them back into one
+queryable database. (`import` also still ingests audit folders, JSONL exports,
+and `.tar.gz`/`.zip` archives — see `vigolium import -h`.) A Postgres destination
+is rejected with a clear error, since the merge is SQLite-to-SQLite.
 
 ## Render one finding/record as Markdown (`--markdown`)
 

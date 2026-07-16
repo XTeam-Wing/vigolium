@@ -66,6 +66,20 @@ type hostEntry struct {
 	healthy  atomic.Int64  // consecutive healthy completions since last change
 	lastDecr atomic.Int64  // unix nanos of last decrease (back-off cooldown)
 	mu       sync.Mutex    // serializes setLimit; never held on the acquire hot path
+
+	// armed gates AIMD adjustment for this host. newEntry stores h.adaptive into it:
+	// plain Adaptive hosts start armed (adjust from the first request); WAF-auto-arm
+	// hosts start unarmed — pinned at MaxPerHost, behaving exactly like the static
+	// limiter — until a confirmed WAF block on this host flips it true (in Feedback),
+	// at which point AIMD back-off/recovery engages.
+	armed atomic.Bool
+
+	// preArmed records that PreArm has proactively paced this entry, exactly once per
+	// entry lifetime. It is distinct from armed so that (a) a birth-armed adaptive
+	// host (armed from the first request) still receives the one-time proactive drop,
+	// and (b) a fresh entry created after idle eviction re-arms rather than staying
+	// pinned at full rate.
+	preArmed atomic.Bool
 }
 
 func (e *hostEntry) touch() {
@@ -113,8 +127,109 @@ type HostRateLimiter struct {
 	minPerHost     int
 	ceilingPerHost int
 
+	// preArmDisabled turns off the proactive edge-fingerprint pacing (PreArm) while
+	// leaving reactive WAF-block back-off (Feedback) untouched. Set from
+	// HostRateLimiterConfig.DisablePreArm (the --no-waf-pacing flag).
+	preArmDisabled bool
+
+	// wafAutoArm enables targeted adaptive throttling that stays dormant until a
+	// confirmed WAF/CDN block. With it on (and adaptive off), every host uses the
+	// adaptive token pool pinned at MaxPerHost — identical concurrency to the static
+	// limiter — until a WAF block on that host arms it (via Feedback's wafBlocked
+	// flag), after which the host AIMD-backs-off like adaptive mode and recovers to
+	// MaxPerHost. A non-WAF scan therefore sees no change in behavior. Mutually
+	// exclusive with adaptive: NewHostRateLimiter normalizes it to
+	// cfg.WafAutoArm && !cfg.Adaptive, so plain Adaptive mode always wins.
+	wafAutoArm bool
+
+	// anyArmed is a global fast-path flag: false until the first host anywhere is
+	// armed by a WAF block. While false, Feedback skips the per-host shard lookup for
+	// every non-block response, keeping the common non-WAF hot path ~free even though
+	// wafAutoArm puts all hosts on the adaptive token pool. Monotonic (never reset):
+	// once any WAF block is seen the target is treated as WAF'd for the run.
+	anyArmed atomic.Bool
+
+	// preArmSink, when set, is invoked once per host the first time PreArm throttles
+	// it for a CDN/WAF edge, so a front-end can tell the operator that host's
+	// active-scan concurrency was reduced (the scan will pace it). It lives on the
+	// limiter — not a requester — because the limiter is the single shared object
+	// every requester feeds, so the notice fires exactly once per host no matter which
+	// requester tripped the pre-arm. Read on the request goroutine that arms the host;
+	// stored in an atomic pointer so a setup-time write can't race those reads.
+	preArmSink atomic.Pointer[func(PreArmNotice)]
+
+	// evictSinks are invoked with the hostname each time an idle host entry is
+	// evicted, letting each requester keep its once-per-host edge-pacing dedup in sync
+	// with the limiter's entry lifetime: after an evicted host's entry is recreated
+	// (fresh, at full rate), the requester re-fingerprints and re-arms it instead of
+	// treating it as permanently paced. Every requester that shares this limiter
+	// registers its own dedup, so this is a list (not a single field): the old single
+	// field kept only the last registrant and raced the eviction goroutine that read
+	// it without synchronization. Subscriptions live for the limiter's lifetime.
+	// Guarded by evictMu. Each sink must be cheap and must NOT re-enter the limiter
+	// (it runs while a shard lock is held).
+	evictMu    sync.Mutex
+	evictSinks []func(string)
+
 	stopEvict chan struct{}
 	evictWg   conc.WaitGroup
+}
+
+// PreArmNotice describes a proactive pacing adjustment. The first time a host is
+// fingerprinted behind a CDN/WAF edge, PreArm drops its per-host concurrency from
+// From to Start (ramping back toward Ceiling on healthy traffic). It is passed to the
+// sink registered via SetPreArmNotifier, once per host.
+type PreArmNotice struct {
+	Host    string // host being paced
+	Vendor  string // fingerprinted edge vendor (e.g. "cloudfront"); "" if unknown
+	From    int    // per-host concurrency before the pre-arm (the ceiling/MaxPerHost)
+	Start   int    // reduced per-host concurrency the host is dropped to
+	Ceiling int    // limit the host ramps back toward on healthy traffic
+}
+
+// SetPreArmNotifier installs a sink invoked once per host the first time PreArm
+// throttles it for a CDN/WAF edge. It lets a front-end warn the operator that the
+// scan will pace (run slower against) that host. The sink runs on the request
+// goroutine, so it must be cheap and non-blocking. Call once during setup, before
+// scanning concurrency starts; a nil sink is a no-op.
+func (h *HostRateLimiter) SetPreArmNotifier(sink func(PreArmNotice)) {
+	if sink == nil {
+		h.preArmSink.Store(nil)
+		return
+	}
+	h.preArmSink.Store(&sink)
+}
+
+// AddEvictNotifier registers a sink invoked with the hostname whenever an idle
+// host entry is evicted. Every requester that shares this limiter registers its
+// own edge-pacing dedup, so all of them are notified (the previous single-field
+// setter kept only the last). Subscriptions live for the limiter's lifetime. The
+// sink is invoked while a shard lock is held, so it must be cheap and must NOT call
+// back into the limiter. A nil sink is ignored.
+func (h *HostRateLimiter) AddEvictNotifier(sink func(string)) {
+	if sink == nil {
+		return
+	}
+	h.evictMu.Lock()
+	h.evictSinks = append(h.evictSinks, sink)
+	h.evictMu.Unlock()
+}
+
+// notifyEvict fires every registered evict sink for host. Sinks are snapshotted
+// under evictMu and then invoked without it (still under the caller's shard lock,
+// per the sink contract) so a sink can never deadlock by touching the registry.
+func (h *HostRateLimiter) notifyEvict(host string) {
+	h.evictMu.Lock()
+	if len(h.evictSinks) == 0 {
+		h.evictMu.Unlock()
+		return
+	}
+	sinks := make([]func(string), len(h.evictSinks))
+	copy(sinks, h.evictSinks)
+	h.evictMu.Unlock()
+	for _, s := range sinks {
+		s(host)
+	}
 }
 
 // HostRateLimiterConfig configures the HostRateLimiter.
@@ -137,6 +252,18 @@ type HostRateLimiterConfig struct {
 	// adaptive never exceeds the configured concurrency). Set above MaxPerHost to
 	// let healthy hosts ramp past it. Ignored when Adaptive is false.
 	CeilingPerHost int
+
+	// WafAutoArm enables WAF-triggered adaptive throttling: hosts run at the static
+	// MaxPerHost until a confirmed WAF/CDN block arms per-host AIMD back-off. Safe to
+	// leave on for every scan — a host that never trips a WAF behaves exactly like the
+	// static limiter. Bounds reuse MinPerHost/CeilingPerHost. Redundant under Adaptive.
+	WafAutoArm bool
+
+	// DisablePreArm turns off only the PROACTIVE pacing (PreArm on a CDN/WAF-edge
+	// fingerprint) while leaving the reactive WAF-block back-off intact. Wired from the
+	// `--no-waf-pacing` CLI flag for operators who would rather keep full opening
+	// concurrency and let the reactive path throttle after the first block.
+	DisablePreArm bool
 }
 
 // DefaultHostRateLimiterConfig returns sensible defaults.
@@ -186,6 +313,10 @@ func NewHostRateLimiter(cfg HostRateLimiterConfig) *HostRateLimiter {
 		adaptive:       cfg.Adaptive,
 		minPerHost:     minPerHost,
 		ceilingPerHost: ceilingPerHost,
+		// Mutually exclusive with Adaptive — plain Adaptive already arms every host,
+		// so WAF-auto-arm is only meaningful when Adaptive is off.
+		wafAutoArm:     cfg.WafAutoArm && !cfg.Adaptive,
+		preArmDisabled: cfg.DisablePreArm,
 		stopEvict:      make(chan struct{}),
 	}
 
@@ -270,9 +401,50 @@ func (h *HostRateLimiter) AcquireWithTimeout(host string) error {
 // deadline unblock a waiting acquire promptly, instead of stranding the
 // goroutine until acquireTimeout elapses.
 func (h *HostRateLimiter) AcquireWithTimeoutContext(ctx context.Context, host string) error {
+	// Fast path: an unsaturated host is by far the common case, and this is the
+	// single hottest path in the scanner (every outgoing request). Try a
+	// non-blocking acquire first so we avoid heap-allocating a timeout context
+	// and arming a runtime timer when a slot is immediately available.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if h.tryAcquire(host) {
+		return nil
+	}
+
+	// Slow path: the host is saturated — block up to acquireTimeout (derived
+	// from ctx so a scan shutdown can unblock the wait promptly).
 	acquireCtx, cancel := context.WithTimeout(ctx, h.acquireTimeout)
 	defer cancel()
 	return h.Acquire(acquireCtx, host)
+}
+
+// tryAcquire attempts a non-blocking slot acquisition. It returns true only if a
+// slot was obtained immediately, and never blocks — callers use it to skip the
+// timeout-context/timer setup on the uncontended hot path. The blocking retry
+// (with the same touch/inflight bookkeeping) lives in Acquire.
+func (h *HostRateLimiter) tryAcquire(host string) bool {
+	shard := h.shardFor(host)
+	entry := h.getOrCreateEntry(shard, host)
+
+	if entry.tokens != nil {
+		select {
+		case <-entry.tokens:
+			entry.inflight.Add(1)
+			entry.touch()
+			return true
+		default:
+			return false
+		}
+	}
+
+	select {
+	case entry.sem <- struct{}{}:
+		entry.touch()
+		return true
+	default:
+		return false
+	}
 }
 
 // Release releases a slot for the given host.
@@ -402,6 +574,7 @@ func (h *HostRateLimiter) evictOldestFromShard(shard *hostShard) {
 	heap.Remove(&shard.evictionHeap, victim.index)
 	delete(shard.heapIndex, victim.host)
 	delete(shard.hosts, victim.host)
+	h.notifyEvict(victim.host)
 	zap.L().Debug("HostRateLimiter: Evicted oldest idle entry", zap.String("host", victim.host))
 }
 
@@ -458,6 +631,7 @@ func (h *HostRateLimiter) evictIdle() {
 			heap.Pop(&shard.evictionHeap)
 			delete(shard.heapIndex, he.host)
 			delete(shard.hosts, he.host)
+			h.notifyEvict(he.host)
 			totalEvicted++
 		}
 		totalRemaining += len(shard.hosts)

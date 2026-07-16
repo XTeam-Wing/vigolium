@@ -535,12 +535,48 @@ func TestOriginMode_Relaxed(t *testing.T) {
 		{"test-example.net", true},
 		{"evil.com", false},
 		{"google.com", false},
+		// A third-party host whose subdomain label merely contains the keyword
+		// but whose registrable domain is unrelated must be out of scope. Guards
+		// against a bare strings.Contains(host, keyword) match.
+		{"example.evil.com", false},
 	}
 
 	for _, tt := range tests {
 		got := m.hostInScope(tt.host)
 		if got != tt.want {
 			t.Errorf("relaxed: hostInScope(%q) = %v, want %v", tt.host, got, tt.want)
+		}
+	}
+}
+
+// TestOriginMode_Relaxed_ThirdPartyKeywordSubstring is a regression test for the
+// SSO/login-wall case where a scan of admin-newcheckbox-test.acme.com (keyword
+// "acme") pulled the Cloudflare Access wall acmegroup.cloudflareaccess.com into
+// scope — because "acmegroup" contains "acme" — and deparos discovery then
+// actively probed that unrelated third-party host. Relaxed must match the keyword
+// against the registrable-domain leading label, not the full hostname.
+func TestOriginMode_Relaxed_ThirdPartyKeywordSubstring(t *testing.T) {
+	cfg := *DefaultScopeConfig()
+	cfg.CLIOriginMode = "relaxed"
+	cfg.IgnoreStaticFile = false
+	m := NewScopeMatcher(cfg, "https://admin-newcheckbox-test.acme.com")
+
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{"admin-newcheckbox-test.acme.com", true}, // the target
+		{"wam.acme.com", true},                    // same registrable domain (acme.com IdP)
+		{"acme.io", true},                         // same org, different TLD
+		{"acmegroup.com", true},                   // brand domain, keyword in registrable label
+		{"acmegroup.cloudflareaccess.com", false}, // third-party wall — registrable label "cloudflareaccess"
+		{"acme.somecdn.net", false},               // keyword only in a subdomain label
+		{"acmegroup", false},                      // single-label host, no eTLD+1 — must not leak via substring
+	}
+
+	for _, tt := range tests {
+		if got := m.hostInScope(tt.host); got != tt.want {
+			t.Errorf("relaxed(acme): hostInScope(%q) = %v, want %v", tt.host, got, tt.want)
 		}
 	}
 }

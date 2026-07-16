@@ -32,6 +32,23 @@ const (
 	// clusterCacheSizeMax caps the LRU so a very high --concurrency can't retain an
 	// unbounded set of response bodies (each entry holds a ref-counted body).
 	clusterCacheSizeMax = 8192
+
+	// clusterCacheMaxEntryBytes is the largest response body eligible for the
+	// post-request cache. Larger responses still get in-flight singleflight dedup
+	// (the high-confidence saving) but are never retained afterward — one huge
+	// body must not consume the whole cache budget.
+	clusterCacheMaxEntryBytes = 2 << 20 // 2 MiB
+
+	// clusterCacheMaxBytes bounds the total retained response-body bytes across all
+	// cache entries. Entry count alone is not a safe memory bound: 8192 entries ×
+	// large bodies could retain gigabytes. LRU entries are evicted until the cache
+	// is back under this budget.
+	clusterCacheMaxBytes = 128 << 20 // 128 MiB
+
+	// clusterEntryOverheadBytes approximates the per-entry header/URL/metadata
+	// retained alongside the body, so the byte budget isn't understated for many
+	// small entries.
+	clusterEntryOverheadBytes = 512
 )
 
 // ClustererSizeForConcurrency returns the LRU entry cap for a clusterer given the
@@ -77,6 +94,15 @@ func snapshotResponse(resp *httpUtils.ResponseChain, duration int) *CachedRespon
 		cr.StatusCode = r.StatusCode
 		cr.Proto = r.Proto
 		cr.Header = r.Header.Clone()
+		// resp.BodyBytes() above was already decoded by responsechain.Fill (per the
+		// response's Content-Encoding), so the captured body no longer matches these
+		// content-coding / framing headers. Strip them here — the single point where
+		// the decoded body and its headers are paired — so the cached entry is
+		// self-consistent and no reconstruction (ToResponseChain) re-decodes the
+		// plaintext body. Del is a safe no-op on a nil header.
+		cr.Header.Del("Content-Encoding")
+		cr.Header.Del("Content-Length")
+		cr.Header.Del("Transfer-Encoding")
 		// Retain a shallow copy of the request with Body and Response nilled: the
 		// response dump only reads Method/URL/Proto, while the original request's
 		// .Response pins the entire redirect chain (each prior response + body) for
@@ -105,15 +131,26 @@ func (c *CachedResponse) ToResponseChain() *httpUtils.ResponseChain {
 	// of falling through to "HTTP/0.0".
 	proto, major, minor := normalizeHTTPVersion(c.Proto)
 
+	// snapshotResponse already stripped the content-coding / framing headers from the
+	// cached header (the body was decoded before capture), so ResponseChain.Fill
+	// won't try to decode this plaintext body a second time. Clone so the
+	// reconstructed response owns its header map; set ContentLength to the decoded
+	// length so the headers-only dump reports the real size instead of 0.
+	header := c.Header.Clone()
+	if header == nil {
+		header = make(http.Header)
+	}
+
 	// Build a synthetic http.Response with body from cache
 	resp := &http.Response{
-		StatusCode: c.StatusCode,
-		Proto:      proto,
-		ProtoMajor: major,
-		ProtoMinor: minor,
-		Header:     c.Header.Clone(),
-		Body:       io.NopCloser(bytes.NewReader(bodyBytes)),
-		Request:    c.Request,
+		StatusCode:    c.StatusCode,
+		Proto:         proto,
+		ProtoMajor:    major,
+		ProtoMinor:    minor,
+		Header:        header,
+		Body:          io.NopCloser(bytes.NewReader(bodyBytes)),
+		ContentLength: int64(len(bodyBytes)),
+		Request:       c.Request,
 	}
 
 	chain := httpUtils.NewResponseChain(resp, MaxBodyRead)
@@ -140,19 +177,38 @@ type singleflightResult struct {
 type RequestClusterer struct {
 	group singleflight.Group
 	cache *lru.Cache[string, *CachedResponse]
-	mu    sync.RWMutex // protects cache access for TTL checks
+	mu    sync.RWMutex // protects cache access, retainedBytes, and TTL checks
+
+	// retainedBytes tracks the approximate response-body bytes currently held by
+	// the cache. Maintained under mu: incremented on admission, decremented by the
+	// LRU evict callback. Used to keep the cache under clusterCacheMaxBytes.
+	retainedBytes int64
 
 	// Stats
-	clustered atomic.Int64
-	cacheHits atomic.Int64
-	total     atomic.Int64
+	clustered     atomic.Int64
+	cacheHits     atomic.Int64
+	total         atomic.Int64
+	byteEvictions atomic.Int64 // entries dropped to stay under the byte budget
+	sizeRejects   atomic.Int64 // bodies too large to post-cache (singleflight only)
+}
+
+// entryWeight approximates the bytes an entry retains: its body plus a fixed
+// overhead for headers/URL/metadata.
+func entryWeight(cr *CachedResponse) int64 {
+	if cr == nil {
+		return clusterEntryOverheadBytes
+	}
+	return int64(len(cr.body)) + clusterEntryOverheadBytes
 }
 
 // ClustererStats holds clusterer metrics.
 type ClustererStats struct {
-	Total     int64
-	Clustered int64
-	CacheHits int64
+	Total         int64
+	Clustered     int64
+	CacheHits     int64
+	RetainedBytes int64 // approximate response-body bytes currently cached
+	ByteEvictions int64 // entries evicted to stay under the byte budget
+	SizeRejects   int64 // responses too large to post-cache
 }
 
 // NewRequestClusterer creates a new RequestClusterer with the default LRU size.
@@ -167,18 +223,33 @@ func NewRequestClustererWithSize(size int) *RequestClusterer {
 	if size < clusterCacheSize {
 		size = clusterCacheSize
 	}
-	cache, _ := lru.New[string, *CachedResponse](size)
-	return &RequestClusterer{
-		cache: cache,
-	}
+	rc := &RequestClusterer{}
+	// Evict callback keeps retainedBytes in sync however an entry leaves the cache
+	// (capacity eviction, byte-budget eviction, TTL removal). It runs synchronously
+	// inside the LRU op, which the caller always performs under rc.mu, so the
+	// bare-field update needs no extra locking.
+	cache, _ := lru.NewWithEvict[string, *CachedResponse](size, func(_ string, cr *CachedResponse) {
+		rc.retainedBytes -= entryWeight(cr)
+		if rc.retainedBytes < 0 {
+			rc.retainedBytes = 0
+		}
+	})
+	rc.cache = cache
+	return rc
 }
 
 // Stats returns current clusterer metrics.
 func (rc *RequestClusterer) Stats() ClustererStats {
+	rc.mu.RLock()
+	retained := rc.retainedBytes
+	rc.mu.RUnlock()
 	return ClustererStats{
-		Total:     rc.total.Load(),
-		Clustered: rc.clustered.Load(),
-		CacheHits: rc.cacheHits.Load(),
+		Total:         rc.total.Load(),
+		Clustered:     rc.clustered.Load(),
+		CacheHits:     rc.cacheHits.Load(),
+		RetainedBytes: retained,
+		ByteEvictions: rc.byteEvictions.Load(),
+		SizeRejects:   rc.sizeRejects.Load(),
 	}
 }
 
@@ -224,10 +295,8 @@ func (rc *RequestClusterer) Execute(
 		cached := snapshotResponse(resp, duration)
 		resp.Close()
 
-		// Store in cache
-		rc.mu.Lock()
-		rc.cache.Add(key, cached)
-		rc.mu.Unlock()
+		// Store in cache under the byte budget (skips bodies too large to retain).
+		rc.admitToCache(key, cached)
 
 		return &singleflightResult{cached: cached}, nil
 	})
@@ -252,6 +321,38 @@ func (rc *RequestClusterer) Execute(
 	return result.cached.ToResponseChain(), result.cached.Duration, nil
 }
 
+// admitToCache stores cached under key subject to the cache's byte budget. A body
+// larger than the per-entry cap is never retained (its in-flight singleflight
+// dedup already happened); otherwise it is added, retainedBytes is updated, and
+// LRU entries are evicted until the cache is back under the total byte budget.
+func (rc *RequestClusterer) admitToCache(key string, cached *CachedResponse) {
+	if int64(len(cached.body)) > clusterCacheMaxEntryBytes {
+		rc.sizeRejects.Add(1)
+		return
+	}
+
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	// Replace any existing entry explicitly so the evict callback subtracts its
+	// old weight before we add the new one (keeps retainedBytes exact).
+	if _, ok := rc.cache.Peek(key); ok {
+		rc.cache.Remove(key)
+	}
+	rc.cache.Add(key, cached) // capacity eviction (if any) runs the evict callback
+	rc.retainedBytes += entryWeight(cached)
+
+	// Evict least-recently-used entries until back under the byte budget. The
+	// just-added entry is the most-recently-used, so RemoveOldest never targets it
+	// (and a single entry can't exceed the budget: it's capped at 2 MiB << 128 MiB).
+	for rc.retainedBytes > clusterCacheMaxBytes {
+		if _, _, ok := rc.cache.RemoveOldest(); !ok {
+			break
+		}
+		rc.byteEvictions.Add(1)
+	}
+}
+
 // computeClusterKey returns the request's cached content hash combined with the
 // option flags that affect HTTP behavior.
 func computeClusterKey(input *httpmsg.HttpRequestResponse, opts Options) string {
@@ -270,7 +371,7 @@ func computeClusterKey(input *httpmsg.HttpRequestResponse, opts Options) string 
 	// the literal request-line target (routing-based SSRF), and collapsing them
 	// would serve the first probe's response for every target.
 	var b strings.Builder
-	b.Grow(len(prefix) + len(opts.RawRequestTarget) + 48)
+	b.Grow(len(prefix) + len(opts.RawRequestTarget) + 64)
 	b.WriteString(prefix)
 	b.WriteString("\x00noRedir=")
 	b.WriteString(strconv.FormatBool(opts.NoRedirects))
@@ -278,6 +379,12 @@ func computeClusterKey(input *httpmsg.HttpRequestResponse, opts Options) string 
 	b.WriteString(strconv.FormatBool(opts.RawRequest))
 	b.WriteString("\x00ignTimeout=")
 	b.WriteString(strconv.FormatBool(opts.IgnoreTimeoutTracking))
+	// DisableCompression changes the request (drops Accept-Encoding) and the
+	// response handling (Go auto-decompression), so two otherwise-identical
+	// requests differing only in this flag must not be coalesced — the second
+	// caller would receive a body produced under the first's compression behavior.
+	b.WriteString("\x00noCompress=")
+	b.WriteString(strconv.FormatBool(opts.DisableCompression))
 	b.WriteString("\x00rawTarget=")
 	b.WriteString(opts.RawRequestTarget)
 	return b.String()
@@ -304,5 +411,8 @@ func (rc *RequestClusterer) LogStats() {
 		zap.Int64("total", stats.Total),
 		zap.Int64("clustered", stats.Clustered),
 		zap.Int64("cache_hits", stats.CacheHits),
+		zap.Int64("retained_bytes", stats.RetainedBytes),
+		zap.Int64("byte_evictions", stats.ByteEvictions),
+		zap.Int64("size_rejects", stats.SizeRejects),
 	)
 }

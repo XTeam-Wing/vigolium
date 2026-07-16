@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/terminal"
 )
 
 func TestCompactRawHTTP(t *testing.T) {
@@ -84,6 +85,36 @@ func TestRenderFindingMarkdownWindowsResponse(t *testing.T) {
 	}
 }
 
+// TestFindingRequestResponseSameExchange is the Claim-4 regression: the rendered
+// request and response must always come from the SAME HTTP exchange, never a
+// request from one record paired with an unrelated record's response.
+func TestFindingRequestResponseSameExchange(t *testing.T) {
+	f := &database.Finding{
+		Request:  "GET /inline HTTP/1.1\r\nHost: x",
+		Response: "HTTP/1.1 500 inline\r\n\r\n",
+	}
+	reqOnly := &database.HTTPRecord{RawRequest: []byte("GET /a HTTP/1.1\r\nHost: x")}
+	respOnly := &database.HTTPRecord{HasResponse: true, RawResponse: []byte("HTTP/1.1 200 OK\r\n\r\nunrelated")}
+
+	// No linked record carries a complete exchange → fall back to the finding's own
+	// inline pair (captured together), NOT reqOnly's request + respOnly's response.
+	req, resp := findingRequestResponse(f, []*database.HTTPRecord{reqOnly, respOnly})
+	if req != f.Request || resp != f.Response {
+		t.Fatalf("expected inline matched pair, got req=%q resp=%q", req, resp)
+	}
+
+	// A linked record carrying a COMPLETE exchange wins as a single transaction.
+	complete := &database.HTTPRecord{
+		RawRequest:  []byte("POST /login HTTP/1.1\r\nHost: x"),
+		HasResponse: true,
+		RawResponse: []byte("HTTP/1.1 302 Found\r\n\r\n"),
+	}
+	req, resp = findingRequestResponse(f, []*database.HTTPRecord{reqOnly, complete, respOnly})
+	if req != "POST /login HTTP/1.1\r\nHost: x" || resp != "HTTP/1.1 302 Found\r\n\r\n" {
+		t.Fatalf("expected the complete-exchange record, got req=%q resp=%q", req, resp)
+	}
+}
+
 func TestRenderRecordMarkdownRequestOnly(t *testing.T) {
 	rec := &database.HTTPRecord{
 		Method:      "GET",
@@ -101,6 +132,35 @@ func TestRenderRecordMarkdownRequestOnly(t *testing.T) {
 	}
 	if strings.Contains(out, "### Response") {
 		t.Fatalf("requestOnly should omit the response section:\n%s", out)
+	}
+}
+
+func TestHighlightMarkdown(t *testing.T) {
+	md := "## [HIGH] Title\n\n**Module:** `mod-id`\n\n```http\nGET / HTTP/1.1\n**not-bold** `not-code`\n```\n"
+
+	// Not a terminal → untouched, so redirected/piped output stays plain Markdown.
+	defer terminal.SetIsTerminal(terminal.IsTerminal())
+	defer terminal.SetColorEnabled(terminal.IsColorEnabled())
+	terminal.SetIsTerminal(false)
+	terminal.SetColorEnabled(true)
+	if got := highlightMarkdown(md); got != md {
+		t.Fatalf("non-TTY highlight should be a no-op:\n%q", got)
+	}
+
+	// Interactive terminal → ANSI added for heading / bold / inline code, but the
+	// content inside the ```http fence is left verbatim (still greppable).
+	terminal.SetIsTerminal(true)
+	got := highlightMarkdown(md)
+	if !strings.Contains(got, "\x1b[") {
+		t.Fatalf("TTY highlight added no ANSI:\n%q", got)
+	}
+	if !strings.Contains(got, "GET / HTTP/1.1") {
+		t.Fatalf("fenced content mangled: %q", got)
+	}
+	// The bold/code markers inside the fence must survive verbatim — proof the
+	// fence body is skipped rather than reformatted.
+	if !strings.Contains(got, "**not-bold** `not-code`") {
+		t.Fatalf("fence body should not be reformatted:\n%q", got)
 	}
 }
 

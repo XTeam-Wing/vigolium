@@ -18,8 +18,8 @@ import (
 // registerInputSourceFlags registers the target/input/input-mode set used by
 // commands that ingest or scan from external sources.
 func registerInputSourceFlags(flags *pflag.FlagSet) {
-	flags.StringSliceVarP(&globalTargets, "target", "t", nil, "Target URL to scan (can be specified multiple times)")
-	flags.StringSliceVarP(&globalTargetFiles, "target-file", "T", nil, "File containing target URLs (one per line; repeatable for multiple files)")
+	flags.StringArrayVarP(&globalTargets, "target", "t", nil, "Target URL to scan (repeatable). Commas are literal so a URL query like ?ids=1,2,3 stays one target — repeat -t for multiple targets.")
+	flags.StringArrayVarP(&globalTargetFiles, "target-file", "T", nil, "File containing target URLs (one per line; repeatable for multiple files). Commas in the path are literal.")
 	flags.StringVarP(&globalInput, "input", "i", "-", "Input file path or spec (use - for stdin)")
 	flags.StringVarP(&globalInputMode, "input-mode", "I", "urls", "Input format: urls, openapi, swagger, burp, curl, nuclei, har (see --list-input-mode)")
 	flags.DurationVar(&globalInputReadTimeout, "input-read-timeout", 3*time.Minute, "Timeout for reading input from stdin or file")
@@ -30,8 +30,9 @@ func registerInputSourceFlags(flags *pflag.FlagSet) {
 func registerHTTPClientFlags(flags *pflag.FlagSet) {
 	flags.DurationVar(&globalTimeout, "timeout", 15*time.Second, "HTTP request timeout (e.g. 30s, 1m, 2h)")
 	flags.IntVarP(&globalConcurrency, "concurrency", "c", 50, "Number of concurrent scan workers")
-	flags.IntVarP(&globalRateLimit, "rate-limit", "r", 100, "Maximum HTTP requests per second")
+	flags.IntVarP(&globalRateLimit, "rate-limit", "r", 100, "Global requests/second cap, enforced across native scanning and known-issue-scan when set (unset = per-host concurrency only)")
 	flags.IntVar(&globalMaxPerHost, "max-per-host", 50, "Maximum concurrent requests allowed per host")
+	flags.BoolVar(&globalNoWafPacing, "no-waf-pacing", false, "Disable proactive CDN/WAF-edge pacing (don't pre-throttle per-host concurrency when a CloudFront/Cloudflare/etc. edge is detected); reactive back-off after a WAF block still applies")
 	flags.IntVar(&globalMaxHostError, "max-host-error", 30, "Skip host after reaching this many consecutive errors")
 	flags.IntVar(&globalMaxFindingsPerModule, "max-findings-per-module", 10, "Stop reporting after N findings per module (0 = unlimited)")
 	flags.BoolVar(&globalNoClustering, "no-clustering", false, "Disable deduplication of identical concurrent HTTP requests")
@@ -55,7 +56,7 @@ func registerScanPipelineFlags(flags *pflag.FlagSet) {
 // (when -i is an OpenAPI file) and ingest.
 func registerSpecFlags(flags *pflag.FlagSet) {
 	flags.BoolVar(&globalSpecURL, "spec-url", false, "Use base URLs from the OpenAPI spec's servers field")
-	flags.StringSliceVar(&globalSpecHeader, "spec-header", nil, "Add HTTP header to OpenAPI-generated requests (repeatable)")
+	flags.StringArrayVar(&globalSpecHeader, "spec-header", nil, "Add HTTP header to OpenAPI-generated requests (repeatable; commas are literal)")
 	flags.StringSliceVar(&globalSpecVar, "spec-var", nil, "Set OpenAPI parameter value as key=value (repeatable)")
 	flags.StringVar(&globalSpecDefault, "spec-default", "1", "Fallback value for required OpenAPI parameters that lack examples")
 }
@@ -81,14 +82,17 @@ func registerLightweightScanIOFlags(flags *pflag.FlagSet) {
 	flags.BoolVarP(&globalStateless, "stateless", "S", false, "Use a temporary database that is discarded after the scan (pass --output/--format to persist results)")
 	flags.StringSliceVar(&globalSkipPhases, "skip", nil, "Skip these phases (repeatable: discovery, external-harvest, spidering, known-issue-scan, dynamic-assessment)")
 	flags.StringVar(&scanFailOn, "fail-on", "", "Exit non-zero if a finding at or above this severity is present (info|low|medium|high|critical) — for CI/agent gating; --soft-fail overrides.")
+	flags.BoolVar(&scanPrintFinding, "print-finding", false, "After the scan, print each finding to stdout as Markdown (description + matched evidence + request/response), like 'vigolium finding --markdown'. Pairs well with -S and --silent for a quick single-target scan.")
+	flags.BoolVar(&scanPrintTrafficTree, "print-traffic-tree", false, "After the scan, print the run's HTTP traffic to stdout as a host/path hierarchy tree, like 'vigolium traffic --tree'. Pairs well with -S and --silent.")
+	flags.BoolVar(&scanPrintTraffic, "print-traffic", false, "After the scan, print the run's raw HTTP request/response pairs to stdout, like 'vigolium traffic --raw'. Pairs well with -S and --silent.")
 }
 
 // markFlagDeprecated hides oldName from --help and makes pflag emit a one-time
 // stderr warning ("Flag --<oldName> has been deprecated, use --<replacement>")
 // when it is set. Use after registering a hidden alias whose variable is shared
-// with the canonical flag.
+// with the canonical flag. pflag's MarkDeprecated sets both Deprecated and Hidden
+// (Deprecated alone still renders in usage, since FlagUsages only skips Hidden);
+// the error is ignored — it only fires for an unknown flag or an empty message.
 func markFlagDeprecated(flags *pflag.FlagSet, oldName, replacement string) {
-	if f := flags.Lookup(oldName); f != nil {
-		f.Deprecated = "use --" + replacement
-	}
+	_ = flags.MarkDeprecated(oldName, "use --"+replacement)
 }

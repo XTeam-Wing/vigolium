@@ -110,6 +110,55 @@ if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(baseVersion
 }
 const platformVersion = (tag) => `${baseVersion}-${tag}`;
 
+// --- built-version verification -------------------------------------------
+
+// goreleaser names each archive `vigolium_<version>_<os>_<arch>.tar.gz` from the
+// version it actually built (archives.name_template in .goreleaser.yaml), and
+// `--clean` wipes build/dist at the start of every run — so the archive version
+// is an authoritative, embed-string-proof record of what the binaries in
+// build/dist really are. This is the backstop for the v0.2.3 mis-publish: stale
+// v0.2.2 binaries were repackaged under the 0.2.3 npm version because the only
+// guard (a Makefile substring grep) false-matched a "v0.2.3" string the v0.2.2
+// binary carried in embedded content. Reading the version from the binary is
+// unreliable for the same reason, and executing it triggers first-run init, so
+// verify against the archive name instead. Refuse to pack when build/dist holds
+// binaries built for a different version than the one being published — this runs
+// no matter how build.mjs is invoked (make target or direct `node`).
+function verifyReleaseVersion(expected) {
+  if (!existsSync(DIST_DIR)) return; // findSourceBinary fails later with a clearer message
+  const archiveRe =
+    /^vigolium_(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)_(?:linux|darwin|windows)_(?:amd64|arm64)\.tar\.gz$/;
+  const built = new Set();
+  for (const f of readdirSync(DIST_DIR)) {
+    const m = f.match(archiveRe);
+    if (m) built.add(m[1]);
+  }
+  if (built.size === 0) {
+    // Fail closed: build/dist exists (checked above) but holds no goreleaser
+    // archives to verify against. Warning-and-continuing here is exactly the
+    // fail-open that lets stale unpacked binaries be repackaged under a new
+    // version — the v0.2.3 mis-publish this guard exists to stop. If archives
+    // are genuinely absent, `make snapshot` must be re-run before packing.
+    fail(
+      `cannot verify the built version against ${expected}: no goreleaser ` +
+        `archives (vigolium_<version>_<os>_<arch>.tar.gz) in ${DIST_DIR}. The ` +
+        `unpacked binaries there are unverifiable and may be STALE — packaging ` +
+        `them risks shipping a binary that reports the wrong version. Run ` +
+        `\`make snapshot\` to rebuild for ${expected} before packing.`,
+    );
+  }
+  if (built.size !== 1 || !built.has(expected)) {
+    fail(
+      `built-version mismatch: build/dist/ was built for [${[...built].sort().join(", ")}] ` +
+        `but this npm publish is version ${expected}. The binaries in build/dist/ are STALE — ` +
+        `packaging them would ship a binary whose \`vigolium version\` reports the wrong number ` +
+        `(the v0.2.3 mis-publish, where v0.2.2 binaries went out as 0.2.3). ` +
+        `Run \`make snapshot\` to rebuild for ${expected} before packing.`,
+    );
+  }
+  info(`verified build/dist/ binaries were built for ${expected}`);
+}
+
 // --- locate goreleaser binaries -------------------------------------------
 
 function findSourceBinary(goos, goarch) {
@@ -137,10 +186,10 @@ function findSourceBinary(goos, goarch) {
 // --- embedded audit blob verification -------------------------------------
 
 // Loader strings that uniquely fingerprint an embedded executable's OS. The
-// vigolium-audit blob and the jsscan blob are dynamically-linked native
-// binaries that carry their platform's loader path. jsscan is embedded with
-// per-platform go:build tags (internal/resources/deparos/embed_jsscan_*.go),
-// so for any cross-compile only the matching-OS jsscan is present — the audit
+// vigolium-audit blob and the jstangle blob are dynamically-linked native
+// binaries that carry their platform's loader path. jstangle is embedded with
+// per-platform go:build tags (internal/resources/deparos/embed_jstangle_*.go),
+// so for any cross-compile only the matching-OS jstangle is present — the audit
 // blob is the only other native binary. Verified empirically: a correct-OS
 // vigolium build carries ZERO foreign-OS loader markers, so a foreign marker
 // can only come from a mis-staged audit blob.
@@ -296,6 +345,7 @@ function npmPack(pkgDir) {
 // --- main -----------------------------------------------------------------
 
 info(`vigolium npm build — version ${baseVersion}`);
+verifyReleaseVersion(baseVersion);
 if (existsSync(OUT_DIR)) rmSync(OUT_DIR, { recursive: true, force: true });
 mkdirSync(OUT_DIR, { recursive: true });
 

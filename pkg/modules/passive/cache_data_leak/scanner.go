@@ -16,9 +16,21 @@ import (
 )
 
 var (
-	// Pattern 1: getStaticProps with auth-scoped data
-	getStaticPropsRe = regexp.MustCompile(`getStaticProps`)
-	staticAuthRe     = regexp.MustCompile(`session|cookies|getSession|auth\(\)|getToken|Authorization`)
+	// Pattern 1: getStaticProps with auth-scoped data.
+	//
+	// getStaticPropsDefRe requires an actual getStaticProps *definition*
+	// (`function getStaticProps`, `export … getStaticProps`, `getStaticProps =`),
+	// not a bare reference. The Next.js framework runtime bundle (main-*.js) ships
+	// the string "getStaticProps" as machinery on every Next.js site, so a bare
+	// match there is meaningless.
+	//
+	// staticAuthRe requires a call-shaped server auth/session accessor
+	// (getServerSession(...), cookies(), headers(), getToken(...)) rather than the
+	// loose tokens session/cookies/Authorization — those match sessionStorage,
+	// document.cookie and any fetch that sets an Authorization header, so pairing
+	// them with a framework "getStaticProps" string fired on every bundled site.
+	getStaticPropsDefRe = regexp.MustCompile(`(?:async\s+function|function|export|const|let|var)\s+getStaticProps\b|getStaticProps\s*[:=]`)
+	staticAuthRe        = regexp.MustCompile(`getServerSession\s*\(|getSession\s*\(|\bcookies\s*\(\s*\)|\bheaders\s*\(\s*\)|getToken\s*\(|req\.session`)
 
 	// Pattern 2: force-static with auth imports
 	forceStaticRe     = regexp.MustCompile(`dynamic\s*=\s*['"]force-static['"]`)
@@ -101,8 +113,24 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 		return nil, errors.Wrap(err, "failed to get URL")
 	}
 
+	// Skip compiled client build artifacts. getStaticProps / getServerSideProps /
+	// unstable_cache / server-side fetch are SERVER-only constructs; a bundler
+	// (Next.js `/_next/static/`, Nuxt `/_nuxt/`) strips them out of the client
+	// chunk it ships, so any match in one of these immutable build directories is
+	// a framework-string coincidence, not a real server caching bug. This is the
+	// systematic false positive where the Next.js runtime bundle
+	// (`_next/static/chunks/main-*.js`, identical hash across every Next.js site)
+	// was reported once per host. Genuine issues live in server source, which is
+	// never served from these paths.
+	if jsframework.IsClientBuildArtifact(urlx.Path) {
+		return nil, nil
+	}
+
 	// Dedup by host+path
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
+	var diskSet *dedup.DiskSet
+	if scanCtx != nil {
+		diskSet = m.ds.Get(scanCtx.DedupMgr())
+	}
 	dedupKey := utils.Sha1(fmt.Sprintf("%s%s", urlx.Host, urlx.Path))
 	if diskSet != nil && diskSet.IsSeen(dedupKey) {
 		return nil, nil
@@ -113,7 +141,7 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 	var issues []cacheIssue
 
 	// Pattern 1: getStaticProps combined with auth patterns
-	if getStaticPropsRe.MatchString(body) && staticAuthRe.MatchString(body) {
+	if getStaticPropsDefRe.MatchString(body) && staticAuthRe.MatchString(body) {
 		issues = append(issues, cacheIssue{
 			name:     "Static Generation with Auth Data",
 			desc:     "getStaticProps fetches authentication-scoped data; static pages are shared across all users",
@@ -170,25 +198,29 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 	var results []*output.ResultEvent
 	for _, issue := range issues {
 		results = append(results, &output.ResultEvent{
-			ModuleID: ModuleID,
-			Host:     urlx.Host,
-			URL:      urlx.String(),
-			Matched:  urlx.String(),
+			ModuleID:      ModuleID,
+			RecordKind:    output.RecordKindCandidate,
+			EvidenceGrade: output.EvidenceGradeCandidate,
+			Host:          urlx.Host,
+			URL:           urlx.String(),
+			Matched:       urlx.String(),
 			ExtractedResults: []string{
 				fmt.Sprintf("Issue: %s", issue.name),
 				issue.desc,
 			},
 			Info: output.Info{
-				Name:        fmt.Sprintf("Cache Data Leak: %s", issue.name),
-				Description: fmt.Sprintf("%s at %s", issue.desc, urlx.Path),
+				Name:        fmt.Sprintf("Cache Data-Flow Candidate: %s", issue.name),
+				Description: fmt.Sprintf("%s at %s. This file-level pattern does not prove that authenticated data reaches the shared cache or that another user receives it.", issue.desc, urlx.Path),
 				Severity:    issue.severity,
 				Confidence:  severity.Tentative,
 				Tags:        []string{"caching", "information-disclosure", "nextjs", "source-analysis"},
 				Reference:   []string{"https://cwe.mitre.org/data/definitions/524.html"},
 			},
 			Metadata: map[string]any{
-				"cwe":     "CWE-524",
-				"pattern": issue.name,
+				"cwe":                   "CWE-524",
+				"pattern":               issue.name,
+				"connected_flow_proven": false,
+				"cross_user_replay":     false,
 			},
 		})
 	}

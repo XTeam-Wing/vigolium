@@ -264,6 +264,41 @@ func (m *Module) ScanPerRequest(
 					continue
 				}
 
+				// Independent catch-all sample. The root/nonExistent references above
+				// are captured ONCE at the top of the scan and can be poisoned by a
+				// transient throttle at capture time (the WAF/CDN-flake false-positive
+				// class): on a host whose deep unknown paths render an app-shell that
+				// differs from "/", a poisoned nonExistent reference lets the shell
+				// through. RandomDirCatchAll adds a freshly-memoized
+				// random-web-root-directory shell sample a single poisoned capture
+				// cannot disable; it fails open (a non-2xx control is "not a
+				// catch-all"), so a genuine internal resource is never suppressed. It
+				// runs only after the local oracle admits the candidate, so the
+				// (memoized) probe never fires for a record that has no candidate worth
+				// reporting.
+				if modkit.RandomDirCatchAll(scanCtx, ctx, httpClient, func(b string) bool {
+					return modkit.BodiesSimilarSig(backedSig, b)
+				}) {
+					continue
+				}
+
+				// Traversal-shape catch-all guard: the clean-path references above
+				// (root/nonExistent, and the freshRoot guard below) miss a host that
+				// serves one generic body ONLY for the traversal SHAPE — the observed
+				// false positive where `/<anything>..%2f..%2f` returns a byte-identical
+				// "feature not available" page while clean `/` serves the real homepage.
+				// Re-issue the identical traversal from a same-depth random base (see
+				// collapseControlPath): a matching body proves the leading segments were
+				// irrelevant. Fails open — a non-2xx or dissimilar control never
+				// suppresses a genuine, base-specific resource.
+				if controlPath, okControl := collapseControlPath(basePathForPayload, payload, i-1); okControl {
+					control := m.probePath(rawRequest, controlPath, httpService, httpClient, true)
+					if control.ok && isResourceReached(control.status) &&
+						modkit.RatioSimilar(backedSig, modkit.NewResponseSignature(control.status, control.body, "")) {
+						continue
+					}
+				}
+
 				// Reproducibility: a genuine bypass is deterministic. Re-fetch the
 				// backed-off path with the cache bypassed and require the same 2xx
 				// resource with a stable body.
@@ -393,6 +428,20 @@ func (m *Module) buildFinding(
 // fetch is not recorded.
 func probeEvidence(label string, p pathProbe) string {
 	return output.BuildEvidence(label, p.requestRaw, truncateBody(p.body))
+}
+
+// collapseControlPath builds the traversal-shape catch-all control: the identical
+// payload (repeated `repeat` times) appended to a guaranteed-nonexistent base of the
+// SAME segment depth as basePath, constructed the same way the backed-off path is
+// (payload appended directly to the final segment). See modkit.RandomSameDepthPath
+// for why a same-depth random base collapses to the same ancestor/root. Returns
+// ("", false) when basePath has no segment to randomize (bare root), so the caller
+// skips the guard rather than probe a degenerate control.
+func collapseControlPath(basePath, payload string, repeat int) (string, bool) {
+	if strings.Trim(basePath, "/") == "" {
+		return "", false
+	}
+	return modkit.RandomSameDepthPath(basePath) + strings.Repeat(payload, repeat), true
 }
 
 // isResourceReached reports whether a response represents actually reaching a

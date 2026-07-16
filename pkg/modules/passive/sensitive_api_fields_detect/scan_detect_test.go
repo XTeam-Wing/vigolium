@@ -7,6 +7,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/output"
+	"github.com/vigolium/vigolium/pkg/types/severity"
 )
 
 // makeJSONCtx builds a JSON request/response pair with the given body.
@@ -39,6 +41,58 @@ func TestScanPerRequest_SensitiveFields(t *testing.T) {
 	require.NotEmpty(t, results)
 	assert.Equal(t, ModuleID, results[0].ModuleID)
 	assert.Equal(t, "Sensitive API Fields Detected", results[0].Info.Name)
+	assert.Equal(t, output.RecordKindFinding, results[0].EffectiveRecordKind())
+}
+
+// TestScanPerRequest_RedactedValuesAreFindings is the regression for the name-only
+// false positive: a redacted user object ({"password":null,"secret":""}) or a
+// feature flag ({"secret":false}) carries the sensitive KEY names but no value —
+// the parser retains that schema signal as a visible informational finding.
+func TestScanPerRequest_RedactedValuesAreFindings(t *testing.T) {
+	t.Parallel()
+	m := New()
+	for _, body := range []string{
+		`{"user":"bob","password":null,"secret":""}`,
+		`{"secret":false,"api_key":null}`,
+		`{"password":"","private_key":null}`,
+	} {
+		ctx := makeJSONCtx(body)
+		results, err := m.ScanPerRequest(ctx, &modkit.ScanContext{})
+		require.NoError(t, err)
+		require.Len(t, results, 1)
+		assert.Equal(t, output.RecordKindFinding, results[0].EffectiveRecordKind())
+	}
+}
+
+// TestScanPerRequest_SeverityIsLow verifies a genuine populated sensitive field
+// is reported at Low (a name-match review lead), not the old Medium.
+func TestScanPerRequest_SeverityIsLow(t *testing.T) {
+	t.Parallel()
+	m := New()
+	ctx := makeJSONCtx(`{"user":"bob","password":"hunter2"}`)
+	results, err := m.ScanPerRequest(ctx, &modkit.ScanContext{})
+	require.NoError(t, err)
+	require.NotEmpty(t, results)
+	assert.Equal(t, severity.Low, results[0].Info.Severity)
+}
+
+func TestScanPerRequest_PublicAPIIdentifierIsFinding(t *testing.T) {
+	t.Parallel()
+	m := New()
+	ctx := makeJSONCtx(`{"api_key":"AKIAIOSFODNN7EXAMPLE"}`)
+	results, err := m.ScanPerRequest(ctx, &modkit.ScanContext{})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, output.RecordKindFinding, results[0].EffectiveRecordKind())
+}
+
+func TestScanPerRequest_SensitiveKeyInsideStringIgnored(t *testing.T) {
+	t.Parallel()
+	m := New()
+	ctx := makeJSONCtx(`{"message":"Use the field \"password\" in this example"}`)
+	results, err := m.ScanPerRequest(ctx, &modkit.ScanContext{})
+	require.NoError(t, err)
+	assert.Empty(t, results)
 }
 
 // TestScanPerRequest_SchemaAntiPattern verifies a JSON schema/doc response

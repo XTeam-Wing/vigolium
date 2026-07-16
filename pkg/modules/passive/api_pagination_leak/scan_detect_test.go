@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/output"
 )
 
 func TestNew(t *testing.T) {
@@ -42,7 +43,9 @@ func TestScanPerRequest_PaginationLeak(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, results)
 	assert.Equal(t, ModuleID, results[0].ModuleID)
-	assert.Equal(t, "API Pagination Metadata Exposed", results[0].Info.Name)
+	assert.Equal(t, "Large API Pagination Count Observed", results[0].Info.Name)
+	assert.Equal(t, output.RecordKindObservation, results[0].RecordKind)
+	assert.False(t, results[0].IsFinding())
 }
 
 // TestScanPerRequest_NoContext verifies that a pagination count field without any
@@ -58,6 +61,22 @@ func TestScanPerRequest_NoContext(t *testing.T) {
 	assert.Empty(t, results)
 }
 
+// TestScanPerRequest_SmallCountSkipped is the regression for the public-content
+// false positive: a Zendesk-style help-center API returns a full pagination
+// envelope (count + page_count + per_page + page) but the collection is tiny
+// (5 categories). A count that small discloses nothing business-sensitive, so it
+// must be suppressed even though every pagination marker is present.
+func TestScanPerRequest_SmallCountSkipped(t *testing.T) {
+	t.Parallel()
+	m := New()
+	body := `{"categories": [], "count": 5, "page": 1, "per_page": 100, "page_count": 1}`
+	ctx := makeHTTPCtx("/api/v2/help_center/en-us/categories", "application/json", body)
+
+	results, err := m.ScanPerRequest(ctx, &modkit.ScanContext{})
+	require.NoError(t, err)
+	assert.Empty(t, results, "a tiny public collection count is not a sensitive disclosure")
+}
+
 // TestScanPerRequest_NonJSON verifies that HTML responses are skipped entirely.
 func TestScanPerRequest_NonJSON(t *testing.T) {
 	t.Parallel()
@@ -68,4 +87,13 @@ func TestScanPerRequest_NonJSON(t *testing.T) {
 	results, err := m.ScanPerRequest(ctx, &modkit.ScanContext{})
 	require.NoError(t, err)
 	assert.Empty(t, results)
+}
+
+func TestScanPerRequest_InvalidJSONMarkerTextSkipped(t *testing.T) {
+	t.Parallel()
+	body := `"total_count": 999999, "page": 1, "per_page": 25`
+	ctx := makeHTTPCtx("/api/users", "application/json", body)
+	results, err := New().ScanPerRequest(ctx, &modkit.ScanContext{})
+	require.NoError(t, err)
+	assert.Empty(t, results, "pagination-looking text must parse as JSON")
 }

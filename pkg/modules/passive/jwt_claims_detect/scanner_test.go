@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
 )
 
@@ -63,6 +64,11 @@ func TestAlgNone(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Contains(t, results[0].ExtractedResults[0], "alg=none")
+	assert.Equal(t, output.RecordKindCandidate, results[0].RecordKind)
+	assert.Equal(t, output.EvidenceGradeCandidate, results[0].EvidenceGrade)
+	for _, issue := range results[0].ExtractedResults {
+		assert.NotContains(t, issue, token)
+	}
 }
 
 func TestMissingExp(t *testing.T) {
@@ -115,6 +121,7 @@ func TestLongLivedToken(t *testing.T) {
 		}
 	}
 	assert.True(t, hasLongLived, "should detect long-lived token")
+	assert.Equal(t, output.RecordKindObservation, results[0].RecordKind)
 }
 
 func TestPrivilegedClaims(t *testing.T) {
@@ -139,6 +146,45 @@ func TestPrivilegedClaims(t *testing.T) {
 	}
 	assert.True(t, hasAdmin, "should detect admin=true")
 	assert.True(t, hasRole, "should detect role=superuser")
+	assert.Equal(t, output.RecordKindObservation, results[0].RecordKind)
+}
+
+// TestLongLivedTokenIsLow is the regression for the severity-inflation false
+// positive: a well-signed token whose only issue is a long expiry (or a missing
+// iss/aud) is a hygiene lead, not a Medium vulnerability. It must be reported at
+// Low/Tentative, not the flat module-default Medium.
+func TestLongLivedTokenIsLow(t *testing.T) {
+	m := New()
+	now := time.Now().Unix()
+	// exp 60 days out, missing iss/aud — the exact shape of the reported findings.
+	payload := fmt.Sprintf(`{"sub":"1","iat":%d,"exp":%d}`, now, now+60*86400)
+	token := buildJWT(`{"alg":"HS256"}`, payload)
+	ctx := makeHTTPCtxWithAuth(token)
+
+	results, err := m.ScanPerRequest(ctx, &modkit.ScanContext{})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, severity.Low, results[0].Info.Severity, "hygiene-only JWT issues must be Low, not Medium")
+	assert.Equal(t, severity.Tentative, results[0].Info.Confidence)
+	assert.Equal(t, output.RecordKindObservation, results[0].RecordKind)
+	assert.Equal(t, output.EvidenceGradeObservation, results[0].EvidenceGrade)
+}
+
+// TestAlgNoneIsHighCandidate verifies alg=none is prioritized above hygiene but
+// remains a candidate until a forged token is accepted by the server.
+func TestAlgNoneIsHigh(t *testing.T) {
+	m := New()
+	token := buildJWT(`{"alg":"none"}`, `{"sub":"1","iss":"test","aud":"app","exp":9999999999}`)
+	ctx := makeHTTPCtxWithAuth(token)
+
+	results, err := m.ScanPerRequest(ctx, &modkit.ScanContext{})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, severity.High, results[0].Info.Severity, "alg=none is a forgeable-token issue and must outrank hygiene leads")
+	assert.Equal(t, severity.Firm, results[0].Info.Confidence)
+	assert.Equal(t, output.RecordKindCandidate, results[0].RecordKind)
+	assert.Equal(t, output.EvidenceGradeCandidate, results[0].EvidenceGrade)
+	assert.Equal(t, false, results[0].Metadata["server_acceptance_tested"])
 }
 
 func TestHealthyJWT(t *testing.T) {
@@ -165,6 +211,20 @@ func TestJWTInResponseBody(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Contains(t, results[0].ExtractedResults[0], "alg=none")
+	assert.Equal(t, output.RecordKindCandidate, results[0].RecordKind)
+}
+
+func TestLowercaseBearerSchemeIsAccepted(t *testing.T) {
+	m := New()
+	token := buildJWT(`{"alg":"HS256"}`, `{"sub":"1"}`)
+	rawReq := fmt.Sprintf("GET /api HTTP/1.1\r\nHost: example.com\r\nAuthorization: bearer %s\r\n\r\n", token)
+	req := httpmsg.NewHttpRequestWithService(httpmsg.NewServiceSecure("example.com", 443, true), []byte(rawReq))
+	ctx := httpmsg.NewHttpRequestResponse(req, httpmsg.NewHttpResponse([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}")))
+
+	results, err := m.ScanPerRequest(ctx, &modkit.ScanContext{})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, output.RecordKindObservation, results[0].RecordKind)
 }
 
 func TestSkipsCloudflareAccessMetaToken_InBody(t *testing.T) {

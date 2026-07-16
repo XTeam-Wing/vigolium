@@ -12,6 +12,7 @@ import (
 	"github.com/sourcegraph/conc"
 	"github.com/vigolium/vigolium/pkg/deparos/discovery/queue"
 	pkghttp "github.com/vigolium/vigolium/pkg/deparos/http"
+	"github.com/vigolium/vigolium/pkg/deparos/jstangle"
 	"github.com/vigolium/vigolium/pkg/deparos/responsechain"
 	"github.com/vigolium/vigolium/pkg/deparos/spider"
 	"github.com/vigolium/vigolium/pkg/deparos/storage"
@@ -47,11 +48,17 @@ type PayloadCoordinator struct {
 
 // CoordinatorMetrics tracks execution statistics.
 type CoordinatorMetrics struct {
-	PayloadsProcessed atomic.Uint64
-	TasksCompleted    atomic.Uint64
-	RequestsSent      atomic.Uint64
-	ActiveWorkers     atomic.Int32
-	InFlightItems     atomic.Int32 // Tracks work items being processed
+	PayloadsProcessed    atomic.Uint64
+	TasksCompleted       atomic.Uint64
+	RequestsSent         atomic.Uint64
+	ActiveWorkers        atomic.Int32
+	InFlightItems        atomic.Int32 // Tracks work items being processed
+	InlineInFlight       atomic.Int32 // Tracks tasks executing inline in the expander (replay/form/case-sense/expand)
+	JSReplayExact        atomic.Uint64
+	JSReplayConservative atomic.Uint64
+	JSReplaySucceeded    atomic.Uint64
+	JSReplayFailed       atomic.Uint64
+	JSReplayDeduped      atomic.Uint64
 }
 
 // NewPayloadCoordinator creates a new coordinator with callbacks for execution.
@@ -114,46 +121,63 @@ func (c *PayloadCoordinator) runExpander(ctx context.Context) {
 			continue
 		}
 
-		logger.Info("Starting task expansion",
-			zap.String("description", task.Description()),
-			zap.String("baseURL", string(task.FullURL())),
-			zap.String("extension", task.Extension()),
-			zap.Uint8("priority", task.Priority()))
+		// Account for the entire per-task handling (inline execution OR expansion)
+		// as in-flight work. Inline task types send requests directly from this
+		// goroutine and never touch InFlightItems, and there is a gap between
+		// dequeue and the first workChan push during expansion — without this
+		// counter, quiescence detection (IsIdle) could observe a false "idle" mid
+		// task and stop the scan early. See IsIdle / WaitForQueues.
+		c.metrics.InlineInFlight.Add(1)
+		c.handleTask(ctx, task)
+		c.metrics.InlineInFlight.Add(-1)
 
-		// CaseSenseDetectionTask: execute inline, skip workChan
-		if csTask, ok := task.(*CaseSenseDetectionTask); ok {
-			c.executeCaseSenseDetectionTask(ctx, csTask)
-			c.metrics.TasksCompleted.Add(1)
-			continue
-		}
-
-		// JSExtractedRequestTask: execute inline with custom Method/Body handling
-		if jsExtTask, ok := task.(*JSExtractedRequestTask); ok {
-			c.executeJSExtractedRequestTask(ctx, jsExtTask)
-			c.metrics.TasksCompleted.Add(1)
-			continue
-		}
-
-		// FormSubmissionTask: execute inline with custom Method/Body handling
-		if formTask, ok := task.(*FormSubmissionTask); ok {
-			c.executeFormSubmissionTask(ctx, formTask)
-			c.metrics.TasksCompleted.Add(1)
-			continue
-		}
-
-		// Expand task into WorkItems
-		c.expandTask(ctx, task)
-		c.metrics.TasksCompleted.Add(1)
-
-		// Don't log completion if context was cancelled during expansion
 		if ctx.Err() != nil {
 			return
 		}
-
-		logger.Info("Task expansion completed",
-			zap.String("description", task.Description()),
-			zap.String("baseURL", string(task.FullURL())))
 	}
+}
+
+// handleTask expands or inline-executes a single dequeued task. Inline task
+// types (case-sensitivity detection, JS-extracted replay, form submission) run
+// entirely in the expander goroutine and send HTTP requests directly; all other
+// tasks are expanded into WorkItems dispatched to the worker pool.
+func (c *PayloadCoordinator) handleTask(ctx context.Context, task Task) {
+	logger.Info("Starting task expansion",
+		zap.String("description", task.Description()),
+		zap.String("baseURL", string(task.FullURL())),
+		zap.String("extension", task.Extension()),
+		zap.Uint8("priority", task.Priority()))
+
+	switch t := task.(type) {
+	case *CaseSenseDetectionTask:
+		// CaseSenseDetectionTask: execute inline, skip workChan
+		c.executeCaseSenseDetectionTask(ctx, t)
+		c.metrics.TasksCompleted.Add(1)
+		return
+	case *JSExtractedRequestTask:
+		// JSExtractedRequestTask: execute inline with custom Method/Body handling
+		c.executeJSExtractedRequestTask(ctx, t)
+		c.metrics.TasksCompleted.Add(1)
+		return
+	case *FormSubmissionTask:
+		// FormSubmissionTask: execute inline with custom Method/Body handling
+		c.executeFormSubmissionTask(ctx, t)
+		c.metrics.TasksCompleted.Add(1)
+		return
+	}
+
+	// Expand task into WorkItems
+	c.expandTask(ctx, task)
+	c.metrics.TasksCompleted.Add(1)
+
+	// Don't log completion if context was cancelled during expansion
+	if ctx.Err() != nil {
+		return
+	}
+
+	logger.Info("Task expansion completed",
+		zap.String("description", task.Description()),
+		zap.String("baseURL", string(task.FullURL())))
 }
 
 // expandTask delegates URL expansion to the task's own Expand method.
@@ -348,12 +372,13 @@ func (c *PayloadCoordinator) executeJSFetchItem(
 	// Validate: JavaScript or JSON content-type, with a .js/.json-extension
 	// fallback for assets served as text/plain or application/octet-stream. JSON
 	// is accepted because the JS-bundle sweep also harvests sibling config/data
-	// files (config.json, settings.json, …): jsscan no-ops on them, but
+	// files (config.json, settings.json, …): jstangle no-ops on them, but
 	// linkfinder still extracts embedded paths and the file is recorded as an
 	// http_record (so secret-scanning and later phases see its body).
 	ct := resp.Header.Get("Content-Type")
+	isSourceMap := strings.HasSuffix(strings.ToLower(jsURL.Path), ".map")
 	if !isJavaScriptContentType(ct) && !isJSONContentType(ct) &&
-		!hasJavaScriptExtension(jsURL) && !hasJSONExtension(jsURL) {
+		!hasJavaScriptExtension(jsURL) && !hasJSONExtension(jsURL) && !isSourceMap {
 		logger.Debug("JS-fetch target is neither JavaScript nor JSON",
 			zap.String("url", item.URL),
 			zap.String("content-type", ct))
@@ -362,7 +387,7 @@ func (c *PayloadCoordinator) executeJSFetchItem(
 
 	body := rc.BodyBytes()
 
-	// CDN/library bundles still get jsscan endpoint extraction (the API calls
+	// CDN/library bundles still get jstangle endpoint extraction (the API calls
 	// they make are real regardless of where the JS is hosted); only their
 	// path→wordlist extraction is suppressed to avoid flooding the bruteforcer.
 	skipPathExtraction := spider.ShouldSkipJSPathExtraction(jsURL)
@@ -375,31 +400,47 @@ func (c *PayloadCoordinator) executeJSFetchItem(
 		logger.Debug("JS too large, skipping parse",
 			zap.String("url", item.URL),
 			zap.Int("size", len(body)))
+	case isSourceMap:
+		if cb.ProcessSourceMap != nil && len(body) <= maxSourceMapBytes {
+			cb.ProcessSourceMap(ctx, jsURL, body)
+		}
 	default:
 		// Content to pass to linkfinder (default: raw body, may be replaced by CodeRecord)
 		contentForLinkfinder := body
 
-		// Run jsscan to extract HTTP requests and transformed code (always,
+		// Run jstangle to extract HTTP requests and transformed code (always,
 		// even for CDN-hosted bundles).
-		if cb.JSScanScanner != nil && cb.JSScanSem != nil {
-			// Acquire semaphore
-			select {
-			case cb.JSScanSem <- struct{}{}:
-				defer func() { <-cb.JSScanSem }()
-			case <-ctx.Done():
-				return
+		if cb.JSTangleService != nil {
+			// SourceMap/X-SourceMap headers have the same policy as comment facts.
+			for _, headerName := range []string{"SourceMap", "X-SourceMap"} {
+				if reference := strings.TrimSpace(resp.Header.Get(headerName)); reference != "" && cb.ProcessAssetFacts != nil {
+					cb.ProcessAssetFacts(ctx, item.URL, body, []jstangle.AssetReferenceFact{{
+						Kind: "assetReference", AssetType: string(AssetSourceMap),
+						URL:             jstangle.ValueTemplate{Rendered: reference, Static: true},
+						ParentSourceURL: item.URL, Provenance: jstangle.Provenance{Extractor: "source-map-header", Confidence: "high"},
+					}})
+				}
 			}
-
-			// Run jsscan
-			scanResult, err := cb.JSScanScanner.Scan(ctx, body)
+			// Run through the shared broker; it owns weighted admission and cache.
+			options := jstangle.ScanOptions{Profile: jstangle.ProfileDiscovery, SourceURL: item.URL}
+			if cb.JSTangleOptions != nil {
+				options = cb.JSTangleOptions(jstangle.ProfileDiscovery, item.URL)
+			}
+			scanResult, err := cb.JSTangleService.ScanWithOptions(ctx, body, options)
 			if err != nil {
-				logger.Debug("jsscan failed",
+				logger.Debug("jstangle failed",
 					zap.String("url", item.URL),
 					zap.Error(err))
 			} else {
-				// Store extracted requests with dedup
+				// Retain typed source/provenance when protocol v2 facts are present.
 				newRequests := 0
-				if cb.AddExtractedRequest != nil {
+				if len(scanResult.RequestFacts) > 0 && cb.AddRequestFact != nil {
+					for i := range scanResult.RequestFacts {
+						if cb.AddRequestFact(item.URL, scanResult.RequestFacts[i]) {
+							newRequests++
+						}
+					}
+				} else if cb.AddExtractedRequest != nil {
 					for i := range scanResult.Requests {
 						if cb.AddExtractedRequest(&scanResult.Requests[i]) {
 							newRequests++
@@ -408,11 +449,13 @@ func (c *PayloadCoordinator) executeJSFetchItem(
 				}
 
 				// Persist to database
-				if cb.StoreJSScanRequests != nil && len(scanResult.Requests) > 0 {
-					cb.StoreJSScanRequests(jsURL, scanResult.Requests)
+				if cb.StoreJSTangleFacts != nil && len(scanResult.RequestFacts) > 0 {
+					cb.StoreJSTangleFacts(jsURL, scanResult.RequestFacts)
+				} else if cb.StoreJSTangleRequests != nil && len(scanResult.Requests) > 0 {
+					cb.StoreJSTangleRequests(jsURL, scanResult.Requests)
 				}
 
-				logger.Debug("jsscan extracted requests",
+				logger.Debug("jstangle extracted requests",
 					zap.String("url", item.URL),
 					zap.Int("total", len(scanResult.Requests)),
 					zap.Int("new", newRequests))
@@ -420,10 +463,16 @@ func (c *PayloadCoordinator) executeJSFetchItem(
 				// Use CodeRecord.Content if available (transformed JS code)
 				if scanResult.HasCode() {
 					contentForLinkfinder = []byte(scanResult.Code.Content)
-					logger.Debug("Using jsscan transformed code for linkfinder",
+					logger.Debug("Using jstangle transformed code for linkfinder",
 						zap.String("url", item.URL),
 						zap.Int("original_size", len(body)),
 						zap.Int("transformed_size", len(contentForLinkfinder)))
+				}
+				if cb.ProcessAssetFacts != nil && len(scanResult.AssetFacts) > 0 {
+					cb.ProcessAssetFacts(ctx, item.URL, body, scanResult.AssetFacts)
+				}
+				if cb.ProcessJSTangleCapabilities != nil {
+					cb.ProcessJSTangleCapabilities(item.URL, scanResult)
 				}
 			}
 		}
@@ -460,7 +509,9 @@ func (c *PayloadCoordinator) executeJSFetchItem(
 	// pipeline so each is fetched and recorded. These chunk filenames are built
 	// at runtime and so are invisible to link extraction — the manifest is the
 	// only place they appear literally. Dispatches per framework by URL shape.
-	harvestSPAManifest(jsURL, body, cb)
+	if !isSourceMap {
+		harvestSPAManifest(jsURL, body, cb)
+	}
 
 	// Call OnResult to create finding (always, regardless of path extraction)
 	if cb.OnResult != nil {
@@ -569,6 +620,53 @@ func (c *PayloadCoordinator) executeJSExtractedRequestTask(ctx context.Context, 
 		zap.String("directory", task.DirURL().Path),
 		zap.Int("variant_count", len(variants)))
 
+	// GenerateAllVariants destructively claimed these templates from the pending
+	// set. Track each claimed template and requeue any that never reach a
+	// definitive outcome (a genuine send failure, or an early cancellation) so a
+	// later end-of-scan flush round retries it instead of losing the work. A
+	// template settles once any of its variants is handled definitively: a
+	// response, a scope skip, a cache-dedup hit, an empty URL, or a deterministic
+	// build failure — only transient send failures and cancellation leave it
+	// unsettled.
+	type replayRef struct{ sourceURL, templateID string }
+	claimed := make(map[string]replayRef, len(variants))
+	settled := make(map[string]struct{}, len(variants))
+	templateKey := func(v RequestVariant) (string, bool) {
+		if v.TemplateID == "" || v.SourceURL == "" {
+			return "", false
+		}
+		return v.SourceURL + "\x00" + v.TemplateID, true
+	}
+	markSettled := func(v RequestVariant) {
+		if k, ok := templateKey(v); ok {
+			settled[k] = struct{}{}
+		}
+	}
+	for _, variant := range variants {
+		if k, ok := templateKey(variant); ok {
+			claimed[k] = replayRef{variant.SourceURL, variant.TemplateID}
+		}
+	}
+	defer func() {
+		if cb.RequeueReplayTemplate == nil || len(settled) >= len(claimed) {
+			return
+		}
+		requeued := 0
+		for k, ref := range claimed {
+			if _, isSettled := settled[k]; isSettled {
+				continue
+			}
+			if cb.RequeueReplayTemplate(ref.sourceURL, ref.templateID) {
+				requeued++
+			}
+		}
+		if requeued > 0 {
+			logger.Debug("Requeued unsent JS replay templates for retry",
+				zap.Int("count", requeued),
+				zap.String("directory", task.DirURL().Path))
+		}
+	}()
+
 	for _, variant := range variants {
 		select {
 		case <-ctx.Done():
@@ -577,6 +675,7 @@ func (c *PayloadCoordinator) executeJSExtractedRequestTask(ctx context.Context, 
 		}
 
 		if variant.URL == "" {
+			markSettled(variant)
 			continue
 		}
 
@@ -586,13 +685,22 @@ func (c *PayloadCoordinator) executeJSExtractedRequestTask(ctx context.Context, 
 			if parseErr == nil && !cb.ScopeChecker.IsInScope(variantURL) {
 				logger.Debug("Skipping out-of-scope JS extracted request",
 					zap.String("url", variant.URL))
+				markSettled(variant) // out-of-scope is definitive; a retry won't help
 				continue
 			}
 		}
 
-		// Dedup check with method and body (for variants with same URL but different bodies)
-		if cb.RequestCache.IsSeen(variant.Method, variant.URL, variant.Body) {
+		// Replay identity includes safe semantic headers as well as method/URL/body.
+		dedupBody := variant.Body + "\x00" + strings.Join(variant.Headers, "\x00")
+		if cb.RequestCache.IsSeen(variant.Method, variant.URL, dedupBody) {
+			c.metrics.JSReplayDeduped.Add(1)
+			markSettled(variant) // already sent elsewhere; definitive
 			continue
+		}
+		if variant.ReplayTier == "exact" {
+			c.metrics.JSReplayExact.Add(1)
+		} else {
+			c.metrics.JSReplayConservative.Add(1)
 		}
 
 		// Build HTTP request with method, body, and content-type
@@ -607,21 +715,36 @@ func (c *PayloadCoordinator) executeJSExtractedRequestTask(ctx context.Context, 
 
 		req, err := reqBuilder.Build()
 		if err != nil {
+			c.metrics.JSReplayFailed.Add(1)
 			logger.Debug("Failed to build JS extracted request",
 				zap.String("url", variant.URL),
 				zap.String("method", variant.Method),
 				zap.Error(err))
+			markSettled(variant) // build failure is deterministic; a retry won't help
 			continue
 		}
 
 		// Set Content-Type header if specified
 		if variant.ContentType != "" && variant.Body != "" {
-			req.Header.Set("Content-Type", variant.ContentType)
+			if req.Header.Get("Content-Type") == "" {
+				req.Header.Set("Content-Type", variant.ContentType)
+			}
+		}
+		for _, header := range variant.Headers {
+			name, value := splitHeader(header)
+			// Explicit scan/auth configuration always wins over literals recovered
+			// from a public bundle.
+			if name != "" && req.Header.Get(name) == "" {
+				req.Header.Set(name, value)
+			}
 		}
 
-		// Send request with tracking
+		// Send request with tracking. A send failure (network/WAF/timeout) is left
+		// unsettled so the template is requeued for a retry round; every other
+		// outcome below is definitive.
 		rc, err := c.sendTrackedRequest(ctx, req, variant.URL, cb)
 		if err != nil {
+			c.metrics.JSReplayFailed.Add(1)
 			logger.Debug("JS extracted request failed",
 				zap.String("url", variant.URL),
 				zap.String("method", variant.Method),
@@ -629,7 +752,9 @@ func (c *PayloadCoordinator) executeJSExtractedRequestTask(ctx context.Context, 
 			continue
 		}
 
+		markSettled(variant) // got a response; definitive regardless of analysis outcome
 		c.metrics.RequestsSent.Add(1)
+		c.metrics.JSReplaySucceeded.Add(1)
 
 		// Analyze response
 		found, err := cb.Analyzer.Analyze(ctx, req, rc)
@@ -657,8 +782,9 @@ func (c *PayloadCoordinator) executeJSExtractedRequestTask(ctx context.Context, 
 			cb.OnResult(&Result{
 				URL: parseURL(variant.URL),
 				Request: &storage.RequestData{
-					Method: variant.Method,
-					Body:   []byte(variant.Body),
+					Method:  variant.Method,
+					Headers: headerSliceToMap(variant.Headers),
+					Body:    []byte(variant.Body),
 				},
 				Metadata: &storage.DiscoveryMetadata{
 					FoundBy:   foundBy,
@@ -1053,8 +1179,13 @@ func redirectPreservesPath(originalURL, redirectTargetURL string) bool {
 }
 
 // IsIdle returns true if no work is pending and no items are being processed.
+// This accounts for both worker-pool items (InFlightItems) and the expander's
+// own inline task execution (InlineInFlight) so quiescence isn't declared while
+// a JS replay / form / case-sense task is mid-flight in the expander goroutine.
 func (c *PayloadCoordinator) IsIdle() bool {
-	return len(c.workChan) == 0 && c.metrics.InFlightItems.Load() == 0
+	return len(c.workChan) == 0 &&
+		c.metrics.InFlightItems.Load() == 0 &&
+		c.metrics.InlineInFlight.Load() == 0
 }
 
 // Metrics returns coordinator metrics.

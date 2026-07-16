@@ -51,6 +51,7 @@ Stdin and -i auto-detect the content shape: a URL list, a raw HTTP request,
 a Burp request/response pair (split by '***'), or a curl command. Inputs that
 already carry a response (Burp pair, HAR, …) are stored as-is — no live
 refetch — so the response you pasted is what lands in the database.`,
+	Args: cobra.NoArgs,
 	RunE: runIngestCmd,
 }
 
@@ -312,6 +313,7 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 	opts.Debug = globalDebug
 	opts.DumpTraffic = globalDumpTraffic
 	opts.MaxPerHost = globalMaxPerHost
+	opts.NoWafPacing = globalNoWafPacing
 
 	if err := network.Init(opts); err != nil {
 		return fmt.Errorf("failed to initialize network: %w", err)
@@ -735,6 +737,7 @@ func runLocalIngestScan(settings *config.Settings, db *database.DB, repo *databa
 	opts.DumpTraffic = globalDumpTraffic
 	opts.JSONOutput = globalJSON
 	opts.MaxPerHost = globalMaxPerHost
+	opts.NoWafPacing = globalNoWafPacing
 	opts.MaxHostError = globalMaxHostError
 	opts.MaxFindingsPerModule = globalMaxFindingsPerModule
 	opts.ConfigPath = globalConfig

@@ -11,8 +11,8 @@ type Options struct {
 
 	TargetsFilePaths []string // target-list files (-T/--target-file, repeatable); lines from all are merged
 	InputFileMode    string   // json, jsonb, list
-	Stream          bool
-	Stdin           bool
+	Stream           bool
+	Stdin            bool
 	// Time to wait between each input read operation before closing the stream
 
 	InputReadTimeout time.Duration
@@ -46,6 +46,10 @@ type Options struct {
 
 	// MaxPerHost is the maximum concurrent requests per host
 	MaxPerHost int
+	// NoWafPacing disables the proactive CDN/WAF-edge pacing (pre-arming the
+	// per-host limiter when an edge is fingerprinted). The reactive WAF-block back-off
+	// still applies. Wired from the --no-waf-pacing CLI flag.
+	NoWafPacing bool
 	// MaxHostError is the maximum number of errors allowed for a host
 	MaxHostError int
 	// MaxFindingsPerModule caps findings emitted per module (0 = unlimited)
@@ -125,6 +129,13 @@ type Options struct {
 	// force a scan-on-receive run to terminate on its own.
 	ScanOnReceiveIdleTimeout time.Duration
 
+	// ManagedScanRecord signals that an external orchestrator (the API server)
+	// already created the scan record and owns its pending/queued/running
+	// transitions. The runner then skips its own CreateScan so the two do not
+	// compete over the same row; the runner still owns the single terminal
+	// CompleteScan (recorded on a detached context so cancellation can't fail it).
+	ManagedScanRecord bool
+
 	// DisableFetchResponse skips fetching HTTP responses during ingestion
 	DisableFetchResponse bool
 
@@ -164,6 +175,13 @@ type Options struct {
 	SpideringNoCDP         bool
 	SpideringNoForms       bool
 
+	// CarryBrowserSession carries the spidering browser's WAF/bot-cleared session
+	// (cookies, and — only when a non-default User-Agent is configured — the
+	// browser UA) forward into content discovery and dynamic assessment, scoped
+	// to the same host. On by default whenever spidering runs; the
+	// --no-carry-browser-session flag sets it false.
+	CarryBrowserSession bool
+
 	// Known Issue Scan options
 	KnownIssueScanEnabled      bool
 	KnownIssueScanTags         []string
@@ -201,6 +219,12 @@ type Options struct {
 	ConcurrencyExplicitlySet bool
 	// MaxPerHostExplicitlySet tracks whether the CLI --max-per-host flag was explicitly provided
 	MaxPerHostExplicitlySet bool
+
+	// RateLimit is the global outbound requests-per-second cap for native scanning,
+	// set only when the operator explicitly passes --rate-limit (0 = unlimited, the
+	// default, preserves current throughput). When > 0 the scan's Services get a
+	// shared token-bucket rate limiter enforced at the request boundary.
+	RateLimit int
 
 	// ExtensionsOnly skips all built-in Go modules; runs only JS/YAML extension modules.
 	ExtensionsOnly bool
@@ -279,6 +303,7 @@ func DefaultOptions() *Options {
 		ClusterRequests:      true,
 		ShutdownTimeout:      30 * time.Second,
 		Parallel:             1,
+		CarryBrowserSession:  true,
 	}
 }
 func (options *Options) ShouldUseHostError() bool {

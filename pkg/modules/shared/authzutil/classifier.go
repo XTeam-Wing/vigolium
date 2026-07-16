@@ -129,8 +129,20 @@ func ClassifyPathContext(pathSegments []string, segmentValue string) (string, in
 	for i, seg := range pathSegments {
 		if seg == segmentValue && i > 0 {
 			prev := strings.ToLower(pathSegments[i-1])
-			if _, ok := ResourceNouns[prev]; ok {
-				return prev, 2
+			// Match the preceding segment as a resource noun, tolerating the common
+			// case where the path uses the SINGULAR form (/basket/6, /user/1,
+			// /order/5) while ResourceNouns lists the plural — so singular-style IDOR
+			// endpoints aren't dropped by the "bare integer" guard in ClassifyParam.
+			// The downstream probe/compare/determinism gates still guard FPs.
+			// Motivating miss: Juice Shop GET /rest/basket/6.
+			candidates := []string{prev, prev + "s"} // exact, or simple "+s" plural
+			if strings.HasSuffix(prev, "y") {
+				candidates = append(candidates, prev[:len(prev)-1]+"ies") // category → categories
+			}
+			for _, c := range candidates {
+				if _, ok := ResourceNouns[c]; ok {
+					return prev, 2
+				}
 			}
 		}
 	}
@@ -161,6 +173,20 @@ func ClassifyParam(name, value string, isPathParam bool, pathSegments []string) 
 	var pathScore int
 	if isPathParam && len(pathSegments) > 0 {
 		resourceNoun, pathScore = ClassifyPathContext(pathSegments, value)
+	}
+
+	// A bare sequential integer is the single most ambiguous "value" signal: a
+	// download-bandwidth reading, a metric, an HTTP status code, a page number,
+	// a Unix timestamp and a positional path segment are all just digits, and
+	// only a tiny fraction are enumerable object references. On its own it is not
+	// enough to call a parameter an object ID — that inference needs corroboration
+	// from either a recognizable identifier name (id, user_id, *_id, …) or a
+	// resource-noun path context (/users/123). Without either, drop the value
+	// signal so telemetry/pagination parameters like
+	// connection_download_bandwidth_bps=1520435, page_number=5, value=48741 or
+	// responseStatus=200 are no longer misreported as IDOR candidates.
+	if idType == SequentialInt && nameSignal == NoSignal && resourceNoun == "" {
+		valueScore = 0
 	}
 
 	totalScore := nameScore + valueScore + pathScore

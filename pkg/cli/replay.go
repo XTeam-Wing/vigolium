@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/pkg/agent/input"
+	"github.com/vigolium/vigolium/pkg/burpbridge"
 	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
@@ -42,6 +44,22 @@ var (
 	replayInReplaceTop   bool
 	replayOutputPath     string
 	replayPretty         bool
+	replayBurpBridgeURL  string
+	replaySaveToBurp     bool
+
+	// Bulk-selection flags — when any is set, replay iterates the matching
+	// stored records instead of a single source (mirrors `traffic --replay`,
+	// but each record runs through the mutation/diff engine).
+	replayAll         bool
+	replayBulkHost    string
+	replayBulkMethods []string
+	replayBulkStatus  []int
+	replayBulkPath    string
+	replayBulkSource  string
+	replayBulkSearch  string
+	replayBulkBody    string
+	replayBulkLimit   int
+	replayConcurrency int
 )
 
 var replayCmd = &cobra.Command{
@@ -56,23 +74,18 @@ to drive vigolium externally (Claude Code, Cursor, Pi, CI scripts) — the JSON 
 shape is stable so an agent can confirm a finding without parsing terminal output.
 
 Cookies set by one replay persist to the next when --session-id is provided. Routes
-through HTTP_PROXY / HTTPS_PROXY (or --proxy) for Burp-style inspection.`,
-	Example: `  # Confirm a stored record with a SQLi payload
-  vigolium replay --record-uuid abc12345 -m 'name=id,payload=1 OR 1=1'
+through HTTP_PROXY / HTTPS_PROXY (or --proxy) for Burp-style inspection.
+Use --save-to-burp with --burp-bridge-url to add the actual mutated request and
+fresh replay response directly to Burp's Target Site map without proxying it twice.
 
-  # Replay a curl command verbatim (auto-baseline by re-sending)
-  vigolium replay -i "curl -X POST https://example.com/api/login -d 'u=admin'"
-
-  # Replay a finding's stored evidence with an XSS payload
-  vigolium replay --finding-id 42 -m 'name=q,payload=<svg/onload=alert(1)>'
-
-  # Multi-step auth via persistent cookie jar
-  vigolium replay --session-id login -i curl-login.sh
-  vigolium replay --session-id login --record-uuid <action-uuid>
-
-  # Confirm against a different environment than the baseline
-  vigolium replay --record-uuid abc12345 --target https://staging.example.com \
-                   -m 'name=user,payload=admin' -H 'X-Forwarded-For: 127.0.0.1'`,
+Bulk mode: pass --all (or any of --host/--method/--status/--path/--source/--search/
+--body) to replay every matching stored record instead of a single source — like
+'vigolium traffic --replay', but each record runs through the mutation/diff engine
+and results stream as JSONL (one object per record). Any --mutate is applied to
+every record that has that insertion point; without --mutate each record is re-sent
+verbatim. Throttle with -c/--concurrency and read a standalone export with -S --db.`,
+	// Example is set in usage.go (replayExamples) so it renders colored like the
+	// other commands via FormatExamples.
 	RunE: runReplay,
 }
 
@@ -94,7 +107,7 @@ func init() {
 
 	// Header / auth merges.
 	f.StringArrayVarP(&replayHeaders, "header", "H", nil, "Extra request header 'Name: value' (repeatable, overrides baseline)")
-	f.StringVar(&replayAuthSession, "auth-session", "", "Auth session name to merge headers from (from `vigolium auth list`)")
+	f.StringVar(&replayAuthSession, "auth-session", "", "Auth session name to merge headers from (from 'vigolium auth list')")
 
 	// Session / cookies.
 	f.StringVar(&replaySessionID, "session-id", "",
@@ -111,6 +124,30 @@ func init() {
 		"When the source is a stored record, update its stored response with the replay")
 	f.StringVarP(&replayOutputPath, "output", "o", "", "Write JSON result to this file (default: stdout)")
 	f.BoolVar(&replayPretty, "pretty", false, "Human-readable summary instead of JSON")
+	f.StringVar(
+		&replayBurpBridgeURL,
+		"burp-bridge-url",
+		burpbridge.URLFromEnvironment(),
+		"Loopback Burp bridge URL used by --save-to-burp")
+	f.BoolVar(
+		&replaySaveToBurp,
+		"save-to-burp",
+		false,
+		"Add each replayed request and its fresh response to Burp's Target Site map")
+
+	// Bulk selection — mirror the traffic filters. Setting any of these (or
+	// --all) switches replay into bulk mode over the matching stored records.
+	f.BoolVarP(&replayAll, "all", "a", false, "Bulk: replay every matched stored record (lifts the -n/--limit cap); re-send all stored traffic")
+	f.StringVar(&replayBulkHost, "host", "", "Bulk: filter records by hostname pattern (wildcard supported)")
+	f.StringSliceVar(&replayBulkMethods, "method", nil, "Bulk: filter records by HTTP method (repeatable)")
+	f.IntSliceVar(&replayBulkStatus, "status", nil, "Bulk: filter records by stored status code (repeatable)")
+	f.StringVar(&replayBulkPath, "path", "", "Bulk: filter records by URL path pattern")
+	f.StringVar(&replayBulkSource, "source", "", "Bulk: filter records by source (scanner, ingest-cli, ingest-proxy, seed, ...)")
+	f.StringVar(&replayBulkSearch, "search", "", "Bulk: fuzzy-search records across URLs, paths, and hostnames")
+	f.StringVar(&replayBulkBody, "body", "", "Bulk: filter records whose request/response body contains this text")
+	f.IntVarP(&replayBulkLimit, "limit", "n", 100, "Bulk: max records to replay (use --all to lift the cap)")
+	f.IntVarP(&replayConcurrency, "concurrency", "c", 10, "Bulk: concurrent replays; keep low to avoid overwhelming an intercepting proxy like Burp")
+	f.BoolVarP(&globalStateless, "stateless", "S", false, "Read records from --db (a .jsonl export or standalone .sqlite) with project scoping off; never writes to your project DB")
 }
 
 func runReplay(cmd *cobra.Command, args []string) error {
@@ -118,10 +155,20 @@ func runReplay(cmd *cobra.Command, args []string) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	src, err := resolveReplaySource(ctx)
-	if err != nil {
-		return err
+	if replaySaveToBurp && strings.TrimSpace(replayBurpBridgeURL) == "" {
+		return fmt.Errorf("--save-to-burp requires --burp-bridge-url")
+	}
+	var bridgeClient *burpbridge.Client
+	if replayBurpBridgeURL != "" {
+		validated, err := burpbridge.ValidateURL(replayBurpBridgeURL)
+		if err != nil {
+			return fmt.Errorf("--burp-bridge-url: %w", err)
+		}
+		replayBurpBridgeURL = validated
+		bridgeClient, err = burpbridge.New(validated)
+		if err != nil {
+			return err
+		}
 	}
 
 	mutations, err := parseReplayMutations()
@@ -137,6 +184,30 @@ func runReplay(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--mutate and --raw-request / --raw-request-file are mutually exclusive")
 	}
 
+	pj, jarLoaded, jarErr := openReplayJar()
+	if jarErr != nil {
+		fmt.Fprintf(os.Stderr, "%s replay: cookie jar disabled (%v)\n", terminal.WarningSymbol(), jarErr)
+	}
+	rr := &replayRun{
+		mutations:   mutations,
+		rawOverride: rawOverride,
+		client:      newReplayClient(pj, replayTimeout),
+		pj:          pj,
+		jarLoaded:   jarLoaded,
+		burpClient:  bridgeClient,
+		saveToBurp:  replaySaveToBurp,
+	}
+
+	// Bulk mode: iterate every matching stored record through the same engine.
+	if replayBulkRequested() {
+		return runReplayBulk(ctx, rr)
+	}
+
+	src, err := resolveReplaySource(ctx)
+	if err != nil {
+		return err
+	}
+
 	overlay, err := buildReplayOverlay(ctx, src)
 	if err != nil {
 		return err
@@ -148,46 +219,84 @@ func runReplay(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	pj, jarLoaded, jarErr := openReplayJar()
-	if jarErr != nil {
-		fmt.Fprintf(os.Stderr, "%s replay: cookie jar disabled (%v)\n", terminal.WarningSymbol(), jarErr)
+	out, err := rr.one(ctx, src, overlay)
+	if err != nil {
+		return fmt.Errorf("replay: %w", err)
 	}
 
+	saveReplayJar(pj)
+
+	if replayPretty {
+		return emitReplayPretty(out)
+	}
+	return emitReplayJSON(out)
+}
+
+// replayRun bundles the per-invocation replay settings that don't vary across
+// records, so the single-source and bulk paths share one call shape instead of
+// threading the same five values through every signature.
+type replayRun struct {
+	mutations   []replay.Mutation
+	rawOverride []byte
+	client      *http.Client
+	pj          *jar.PersistentJar
+	jarLoaded   int
+	burpClient  *burpbridge.Client
+	saveToBurp  bool
+}
+
+// newReplayClient builds the shared HTTP client for replay: the persistent
+// cookie jar (when --session-id is set) plus --proxy routing, preserving the
+// InsecureSkipVerify TLS config NewDefaultClient installs.
+func newReplayClient(pj *jar.PersistentJar, timeout time.Duration) *http.Client {
 	var jarForClient http.CookieJar
 	if pj != nil {
 		jarForClient = pj
 	}
-	client := replay.NewDefaultClient(jarForClient, replayTimeout)
-
+	client := replay.NewDefaultClient(jarForClient, timeout)
 	if globalProxy != "" {
 		if px, perr := url.Parse(globalProxy); perr == nil {
-			// Mutate the existing transport so the InsecureSkipVerify
-			// TLS config NewDefaultClient set isn't dropped when an
-			// operator pipes replays through Burp.
 			if t, ok := client.Transport.(*http.Transport); ok {
 				t.Proxy = http.ProxyURL(px)
 			}
 		}
 	}
+	return client
+}
 
+// saveReplayJar persists the cookie jar (no-op when --session-id is unset),
+// warning to stderr on failure. Shared by the single-source and bulk paths.
+func saveReplayJar(pj *jar.PersistentJar) {
+	if pj == nil {
+		return
+	}
+	if err := pj.Save(); err != nil {
+		fmt.Fprintf(os.Stderr, "%s replay: could not save cookie jar: %v\n", terminal.WarningSymbol(), err)
+	}
+}
+
+// one runs a single source through the engine and returns the assembled
+// output. Shared by single-source and bulk (per-record) replay. It honors
+// --in-replace for stored records; the caller owns the cookie jar's lifecycle.
+func (rr *replayRun) one(ctx context.Context, src *replaySource, overlay map[string]string) (*replayOutput, error) {
 	opts := replay.Options{
 		BaselineRequest:      src.BaselineRequest,
 		BaselineResponse:     src.BaselineResponse,
 		BaselineStatus:       src.BaselineStatus,
 		BaselineResponseTime: src.BaselineResponseTime,
-		Mutations:            mutations,
-		RawRequest:           rawOverride,
+		Mutations:            rr.mutations,
+		RawRequest:           rr.rawOverride,
 		Scheme:               src.Scheme,
 		Hostname:             src.Hostname,
 		Port:                 src.Port,
 		HeaderOverlay:        overlay,
 		NoRedirects:          replayNoRedirects,
-		Client:               client,
+		Client:               rr.client,
 	}
 
 	result, err := replay.Do(ctx, opts)
 	if err != nil {
-		return fmt.Errorf("replay: %w", err)
+		return nil, err
 	}
 
 	if replayInReplaceTop {
@@ -195,19 +304,15 @@ func runReplay(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "%s replay: --in-replace failed: %v\n", terminal.WarningSymbol(), err)
 		}
 	}
-
-	if pj != nil {
-		if err := pj.Save(); err != nil {
-			fmt.Fprintf(os.Stderr, "%s replay: could not save cookie jar: %v\n", terminal.WarningSymbol(), err)
+	if rr.saveToBurp {
+		if err := saveReplayResultToBurp(ctx, rr.burpClient, src, result); err != nil {
+			return nil, fmt.Errorf("save replay to Burp: %w", err)
 		}
 	}
 
-	out := buildReplayOutput(src, result, jarLoaded, pj)
-
-	if replayPretty {
-		return emitReplayPretty(out)
-	}
-	return emitReplayJSON(out)
+	out := buildReplayOutput(src, result, rr.jarLoaded, rr.pj)
+	out.SavedToBurp = rr.saveToBurp
+	return out, nil
 }
 
 // replaySource is the resolved baseline a replay diffs against. It can
@@ -245,7 +350,9 @@ func resolveReplaySource(ctx context.Context) (*replaySource, error) {
 		return nil, fmt.Errorf("--record-uuid, --finding-id and --input/--input-file are mutually exclusive")
 	}
 
-	db, dbErr := getDB()
+	// openReadDB honors -S/--stateless: a standalone .sqlite/.jsonl export via
+	// --db, project scoping off. Falls back to the project DB otherwise.
+	db, dbErr := openReadDB()
 	var repo *database.Repository
 	if dbErr == nil {
 		repo = database.NewRepository(db)
@@ -283,20 +390,10 @@ func sourceFromRecord(ctx context.Context, repo *database.Repository, uuid strin
 	if err != nil {
 		return nil, fmt.Errorf("load record %q: %w", uuid, err)
 	}
-	if pid, _ := resolveProjectUUID(); pid != "" && rec.ProjectUUID != pid {
+	if pid, _ := effectiveProjectUUID(); pid != "" && rec.ProjectUUID != pid {
 		return nil, fmt.Errorf("record %q does not belong to the current project", uuid)
 	}
-	return &replaySource{
-		BaselineRequest:      rec.RawRequest,
-		BaselineResponse:     rec.RawResponse,
-		BaselineStatus:       rec.StatusCode,
-		BaselineResponseTime: rec.ResponseTimeMs,
-		Scheme:               rec.Scheme,
-		Hostname:             rec.Hostname,
-		Port:                 rec.Port,
-		RecordUUID:           rec.UUID,
-		OriginLabel:          fmt.Sprintf("record %s", rec.UUID),
-	}, nil
+	return sourceFromDBRecord(rec), nil
 }
 
 // sourceFromFinding resolves a finding to a baseline. Preference order:
@@ -312,25 +409,16 @@ func sourceFromFinding(ctx context.Context, repo *database.Repository, id int64)
 	if err != nil || finding == nil {
 		return nil, fmt.Errorf("load finding #%d: %w", id, err)
 	}
-	if pid, _ := resolveProjectUUID(); pid != "" && finding.ProjectUUID != pid {
+	if pid, _ := effectiveProjectUUID(); pid != "" && finding.ProjectUUID != pid {
 		return nil, fmt.Errorf("finding #%d does not belong to the current project", id)
 	}
 
 	for _, uuid := range finding.HTTPRecordUUIDs {
 		rec, err := repo.GetRecordByUUID(ctx, uuid)
 		if err == nil && rec != nil {
-			src := &replaySource{
-				BaselineRequest:      rec.RawRequest,
-				BaselineResponse:     rec.RawResponse,
-				BaselineStatus:       rec.StatusCode,
-				BaselineResponseTime: rec.ResponseTimeMs,
-				Scheme:               rec.Scheme,
-				Hostname:             rec.Hostname,
-				Port:                 rec.Port,
-				RecordUUID:           rec.UUID,
-				FindingID:            finding.ID,
-				OriginLabel:          fmt.Sprintf("finding #%d via record %s", finding.ID, rec.UUID),
-			}
+			src := sourceFromDBRecord(rec)
+			src.FindingID = finding.ID
+			src.OriginLabel = fmt.Sprintf("finding #%d via record %s", finding.ID, rec.UUID)
 			return src, nil
 		}
 	}
@@ -494,16 +582,18 @@ func loadReplayRawOverride() ([]byte, error) {
 
 // buildReplayOverlay: --auth-session headers are merged first, then
 // --header K:V flags win last so an operator can override stored auth.
+// Honors -S/--stateless (openReadDB/effectiveProjectUUID) so every DB touchpoint
+// in the command reads from the same source.
 func buildReplayOverlay(ctx context.Context, src *replaySource) (map[string]string, error) {
 	overlay := map[string]string{}
 
 	if replayAuthSession != "" {
-		db, err := getDB()
+		db, err := openReadDB()
 		if err != nil {
 			return nil, fmt.Errorf("--auth-session requires database access: %w", err)
 		}
 		repo := database.NewRepository(db)
-		pid, _ := resolveProjectUUID()
+		pid, _ := effectiveProjectUUID()
 		rows, err := repo.GetAuthenticationHostnamesByHostname(ctx, pid, src.Hostname)
 		if err != nil {
 			return nil, fmt.Errorf("lookup auth sessions: %w", err)
@@ -523,6 +613,21 @@ func buildReplayOverlay(ctx context.Context, src *replaySource) (map[string]stri
 		}
 	}
 
+	headers, err := parseReplayHeaderFlags()
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range headers {
+		overlay[k] = v
+	}
+	return overlay, nil
+}
+
+// parseReplayHeaderFlags parses the repeatable --header flags into an overlay
+// map, erroring on the first malformed entry. Host-independent, so the bulk
+// path parses it once and reuses it across records.
+func parseReplayHeaderFlags() (map[string]string, error) {
+	overlay := map[string]string{}
 	for i, h := range replayHeaders {
 		name, value, err := replay.ParseHeaderFlag(h)
 		if err != nil {
@@ -564,15 +669,7 @@ func persistReplayResponse(ctx context.Context, src *replaySource, result *repla
 	}
 	repo := database.NewRepository(db)
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "HTTP/1.1 %d %s\r\n", result.Replay.Status, http.StatusText(result.Replay.Status))
-	for k, vs := range result.Replay.Headers {
-		for _, v := range vs {
-			fmt.Fprintf(&b, "%s: %s\r\n", k, v)
-		}
-	}
-	b.WriteString("\r\n")
-	raw := append([]byte(b.String()), body...)
+	raw := rawReplayResponse(result.Replay)
 
 	update := &database.RecordResponseUpdate{
 		StatusCode:            result.Replay.Status,
@@ -585,6 +682,58 @@ func persistReplayResponse(ctx context.Context, src *replaySource, result *repla
 		ResponseTimeMs:        result.Replay.ResponseTimeMs,
 	}
 	return repo.UpdateRecordResponse(ctx, src.RecordUUID, update)
+}
+
+func saveReplayResultToBurp(
+	ctx context.Context,
+	client *burpbridge.Client,
+	src *replaySource,
+	result *replay.Result,
+) error {
+	if client == nil {
+		return fmt.Errorf("burp bridge client is not configured")
+	}
+	if result == nil || len(result.RawMutatedRequest) == 0 {
+		return fmt.Errorf("replay did not return the complete sent request")
+	}
+	var rawResponse []byte
+	if result.Replay != nil && result.Replay.Status > 0 && result.Replay.Error == "" {
+		rawResponse = rawReplayResponse(result.Replay)
+	}
+	return client.AddToSiteMap(
+		ctx,
+		replaySourceURL(src),
+		result.RawMutatedRequest,
+		rawResponse,
+		"vigolium-replay",
+	)
+}
+
+func replaySourceURL(src *replaySource) string {
+	scheme := src.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+	host := src.Hostname
+	if src.Port > 0 {
+		host = net.JoinHostPort(src.Hostname, strconv.Itoa(src.Port))
+	}
+	return (&url.URL{Scheme: scheme, Host: host}).String()
+}
+
+func rawReplayResponse(summary *replay.Summary) []byte {
+	if summary == nil || summary.Status <= 0 {
+		return nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "HTTP/1.1 %d %s\r\n", summary.Status, http.StatusText(summary.Status))
+	for k, values := range summary.Headers {
+		for _, value := range values {
+			fmt.Fprintf(&b, "%s: %s\r\n", k, value)
+		}
+	}
+	b.WriteString("\r\n")
+	return append([]byte(b.String()), summary.RawBody...)
 }
 
 // replayOutput is the JSON shape emitted to stdout / --output. It wraps
@@ -600,6 +749,10 @@ type replayOutput struct {
 	CookiesPreloaded int            `json:"cookies_preloaded,omitempty"`
 	JarPath          string         `json:"jar_path,omitempty"`
 	Result           *replay.Result `json:"result"`
+	SavedToBurp      bool           `json:"saved_to_burp,omitempty"`
+	// Error is set (with Result nil) only in bulk mode when a single record
+	// fails to replay, so one bad record doesn't abort the JSONL stream.
+	Error string `json:"error,omitempty"`
 }
 
 func buildReplayOutput(src *replaySource, result *replay.Result, jarLoaded int, pj *jar.PersistentJar) *replayOutput {
@@ -625,18 +778,28 @@ func buildReplayOutput(src *replaySource, result *replay.Result, jarLoaded int, 
 	return out
 }
 
+// openReplayOutputWriter returns the JSON sink for replay output: stdout, or
+// --output if set. The returned close func is a no-op for stdout. Shared by the
+// single-source (indented object) and bulk (JSONL stream) paths.
+func openReplayOutputWriter() (io.Writer, func(), error) {
+	if replayOutputPath == "" {
+		return os.Stdout, func() {}, nil
+	}
+	f, err := os.Create(replayOutputPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create --output %q: %w", replayOutputPath, err)
+	}
+	return f, func() { _ = f.Close() }, nil
+}
+
 // emitReplayJSON pretty-prints the result. Agents that want compact
 // JSON should pipe through `jq -c .`.
 func emitReplayJSON(out *replayOutput) error {
-	w := io.Writer(os.Stdout)
-	if replayOutputPath != "" {
-		f, err := os.Create(replayOutputPath)
-		if err != nil {
-			return fmt.Errorf("create --output %q: %w", replayOutputPath, err)
-		}
-		defer func() { _ = f.Close() }()
-		w = f
+	w, closeOut, err := openReplayOutputWriter()
+	if err != nil {
+		return err
 	}
+	defer closeOut()
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(out)
@@ -648,6 +811,9 @@ func emitReplayPretty(out *replayOutput) error {
 	if out.SessionID != "" {
 		fmt.Printf("  session: %s (preloaded %d cookies, jar: %s)\n",
 			out.SessionID, out.CookiesPreloaded, out.JarPath)
+	}
+	if out.SavedToBurp {
+		fmt.Printf("  saved to Burp Target Site map\n")
 	}
 	if out.Result == nil || out.Result.Replay == nil || out.Result.Baseline == nil {
 		return fmt.Errorf("no result")

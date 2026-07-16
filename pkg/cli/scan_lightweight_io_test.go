@@ -17,6 +17,9 @@ func resetLightweightIOGlobals() {
 	globalStateless = false
 	globalSkipPhases = nil
 	globalFormat = "console"
+	scanPrintFinding = false
+	scanPrintTraffic = false
+	scanPrintTrafficTree = false
 	scanPhaseDiscover = false
 	scanPhaseSpider = false
 	scanPhaseExternalHarvest = false
@@ -37,6 +40,9 @@ func TestRegisterLightweightScanIOFlags(t *testing.T) {
 	require.NotNil(t, fs.Lookup("output"), "-o/--output must be registered")
 	require.NotNil(t, fs.Lookup("stateless"), "-S/--stateless must be registered")
 	require.NotNil(t, fs.Lookup("skip"), "--skip must be registered")
+	require.NotNil(t, fs.Lookup("print-finding"), "--print-finding must be registered")
+	require.NotNil(t, fs.Lookup("print-traffic"), "--print-traffic must be registered")
+	require.NotNil(t, fs.Lookup("print-traffic-tree"), "--print-traffic-tree must be registered")
 	assert.Equal(t, "o", fs.Lookup("output").Shorthand)
 	assert.Equal(t, "S", fs.Lookup("stateless").Shorthand)
 
@@ -80,12 +86,15 @@ func TestNeedsRunnerScan(t *testing.T) {
 	})
 
 	triggers := map[string]func(){
-		"--output":           func() { scanOpts.Output = "out.jsonl" },
-		"--stateless":        func() { globalStateless = true },
-		"--skip":             func() { globalSkipPhases = []string{"known-issue-scan"} },
-		"--format jsonl":     func() { globalFormat = "jsonl" },
-		"--discover (phase)": func() { scanPhaseDiscover = true },
-		"--spider (phase)":   func() { scanPhaseSpider = true },
+		"--output":             func() { scanOpts.Output = "out.jsonl" },
+		"--stateless":          func() { globalStateless = true },
+		"--skip":               func() { globalSkipPhases = []string{"known-issue-scan"} },
+		"--print-finding":      func() { scanPrintFinding = true },
+		"--print-traffic":      func() { scanPrintTraffic = true },
+		"--print-traffic-tree": func() { scanPrintTrafficTree = true },
+		"--format jsonl":       func() { globalFormat = "jsonl" },
+		"--discover (phase)":   func() { scanPhaseDiscover = true },
+		"--spider (phase)":     func() { scanPhaseSpider = true },
 	}
 	for name, set := range triggers {
 		t.Run(name+" routes to the Runner", func(t *testing.T) {
@@ -137,9 +146,10 @@ func TestScanURLTargetFlag(t *testing.T) {
 
 	fs := pflag.NewFlagSet("scan-url", pflag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	fs.StringSliceVarP(&globalTargets, "target", "t", nil, "")
+	fs.StringArrayVarP(&globalTargets, "target", "t", nil, "")
 
 	globalTargets = nil
-	require.NoError(t, fs.Parse([]string{"-t", "https://a.example", "-t", "https://b.example"}))
-	assert.Equal(t, []string{"https://a.example", "https://b.example"}, globalTargets)
+	// Commas are literal (StringArray): a query string with commas stays one target.
+	require.NoError(t, fs.Parse([]string{"-t", "https://a.example/api?ids=1,2,3", "-t", "https://b.example"}))
+	assert.Equal(t, []string{"https://a.example/api?ids=1,2,3", "https://b.example"}, globalTargets)
 }

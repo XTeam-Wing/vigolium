@@ -42,7 +42,7 @@ func ProjectUUIDMiddleware(repo *database.Repository) fiber.Handler {
 // isPublicProjectPath returns true for endpoints that should never trigger
 // project auto-creation (health checks, swagger, static UI, etc.).
 func isPublicProjectPath(path string) bool {
-	if path == "/" || path == "/health" || path == "/server-info" || path == "/metrics" {
+	if path == "/" || path == "/health" || path == "/ready" || path == "/server-info" || path == "/metrics" {
 		return true
 	}
 	return strings.HasPrefix(path, "/swagger")
@@ -99,16 +99,27 @@ func getProjectUUID(c fiber.Ctx) string {
 	return database.DefaultProjectUUID
 }
 
+// inRequestProject reports whether a loaded row (records, findings, OAST
+// interactions, scans) belongs to the request's active project (X-Project-UUID,
+// or the default project when the header is absent). Point endpoints that fetch
+// by a global id/uuid use this to enforce project-selection semantics — the
+// docs promise the header scopes all operations — so an operator scoped to one
+// engagement can't read, mutate, or delete another's data via a raw id. Callers
+// surface a mismatch as 404 (not 403) so cross-project existence isn't leaked.
+func inRequestProject(c fiber.Ctx, rowProjectUUID string) bool {
+	return rowProjectUUID == getProjectUUID(c)
+}
+
 const authUserLocalsKey = "auth_user"
 
 // BearerAuth returns fiber middleware that validates Bearer tokens and resolves user identity.
 // Checks the UserStore first (file-based users), then falls back to legacy API keys (admin role).
-// Skips authentication for public endpoints: /, /health, /swagger/*, /metrics.
+// Skips authentication for public endpoints: /, /health, /ready, /swagger/*, /metrics.
 func BearerAuth(validKeys []string, store *UserStore) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		path := c.Path()
 		// Skip auth for public endpoints
-		if path == "/" || path == "/health" || path == "/metrics" || strings.HasPrefix(path, "/swagger") {
+		if path == "/" || path == "/health" || path == "/ready" || path == "/metrics" || strings.HasPrefix(path, "/swagger") {
 			return c.Next()
 		}
 
@@ -232,16 +243,27 @@ var bodyLimitExemptPaths = map[string]bool{
 }
 
 // DefaultBodyLimitMiddleware rejects request bodies larger than defaultBodyLimit
-// for routes that aren't in bodyLimitExemptPaths.
+// for routes that aren't in bodyLimitExemptPaths. With StreamRequestBody enabled
+// (see fiber.Config), the declared-Content-Length check rejects an oversized body
+// before it is read into memory — so a normal JSON route no longer buffers up to
+// the framework's 512 MB ceiling just to bounce it. Chunked/undeclared bodies
+// (ContentLength() < 0) fall through to the read-based check, which fasthttp still
+// bounds at the framework BodyLimit.
 func DefaultBodyLimitMiddleware() fiber.Handler {
+	tooLarge := func(c fiber.Ctx) error {
+		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(ErrorResponse{
+			Error: "request body exceeds 4 MB limit",
+		})
+	}
 	return func(c fiber.Ctx) error {
 		if bodyLimitExemptPaths[c.Path()] {
 			return c.Next()
 		}
+		if cl := c.Request().Header.ContentLength(); cl > defaultBodyLimit {
+			return tooLarge(c)
+		}
 		if len(c.Body()) > defaultBodyLimit {
-			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(ErrorResponse{
-				Error: "request body exceeds 4 MB limit",
-			})
+			return tooLarge(c)
 		}
 		return c.Next()
 	}

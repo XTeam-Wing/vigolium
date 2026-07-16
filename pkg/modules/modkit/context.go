@@ -80,9 +80,48 @@ type RemarksAnnotator interface {
 	AppendRemarks(ctx context.Context, annotations map[string][]string) error
 }
 
+// DerivedArtifact is immutable analysis output associated with a stored HTTP
+// record. The original request/response remains the source of truth; consumers
+// can inspect this companion artifact without changing captured traffic.
+type DerivedArtifact struct {
+	RecordUUID string
+	Kind       string
+	Filename   string
+	MediaType  string
+	SHA256     string
+	Content    []byte
+	Metadata   map[string]any
+}
+
+// DerivedArtifactWriter persists immutable companion artifacts produced by
+// passive analysis (for example, a beautified JavaScript bundle).
+type DerivedArtifactWriter interface {
+	StoreDerivedArtifact(ctx context.Context, artifact *DerivedArtifact) error
+}
+
 // RequestUUIDResolver resolves a request hash to a database record UUID.
 type RequestUUIDResolver interface {
 	ResolveRequestUUID(requestHash string) string
+}
+
+// ScopeChecker answers whether a host is within the scan's configured scope,
+// i.e. whether it is (part of) the scan target rather than a third-party
+// resource. Used by the js-beautify module to only treat a known-vendor host as
+// third-party when the scan is not actually targeting that vendor.
+type ScopeChecker interface {
+	IsHostInScope(host string) bool
+}
+
+// RecordResponseRewriter overwrites a stored HTTP record's raw response in place
+// and recomputes its derived hash/length/word fields. Used by the passive
+// js-beautify module to replace a minified JS body with its beautified,
+// bundle-unpacked form so downstream traffic/finding/fs views and manual review
+// see readable source. No-op when the record can't be resolved (e.g. stateless).
+type RecordResponseRewriter interface {
+	// RewriteRecordResponse replaces the raw response bytes of the record with
+	// the given UUID. rawResponse must be a complete HTTP response (status line
+	// + headers + body).
+	RewriteRecordResponse(ctx context.Context, uuid string, rawResponse []byte) error
 }
 
 // OASTProvider generates out-of-band callback URLs for blind vulnerability detection.
@@ -126,7 +165,10 @@ type ScanContext struct {
 	DedupManager        *dedup.Manager
 	RiskScoreUpdater    RiskScoreUpdater
 	RemarksAnnotator    RemarksAnnotator
+	RecordRewriter      RecordResponseRewriter
+	ArtifactWriter      DerivedArtifactWriter
 	RequestUUIDResolver RequestUUIDResolver
+	Scope               ScopeChecker
 	OASTProvider        OASTProvider
 	MutationGen         MutationGenerator
 	RequestFeeder       RequestFeeder
@@ -136,6 +178,9 @@ type ScanContext struct {
 	TechStack           *TechRegistry             // Per-host tech-stack detections (populated by *_fingerprint passive modules)
 	WAFStack            *WAFRegistry              // Per-host WAF/CDN detections (populated by XSS modules on block responses)
 	ContentClass        *ContentClassRegistry     // Per-host content-class hint (seeded from the heuristics root probe; fallback for content-class module gating)
+
+	cookiePolicyOnce sync.Once
+	cookiePolicy     *CookiePolicyRegistry
 
 	// FollowSubdomains gates the subdomain_harvest feed-back behavior: when true
 	// the module adds discovered in-scope subdomains to scope (via ScopeExpander)
@@ -162,6 +207,22 @@ type ScanContext struct {
 	decoyOnce   sync.Once
 	decoyCache  *lru.Cache[string, *decoyResult]
 	decoyFlight singleflight.Group
+}
+
+func (sc *ScanContext) cookiePolicies() *CookiePolicyRegistry {
+	if sc == nil {
+		return nil
+	}
+	sc.cookiePolicyOnce.Do(func() { sc.cookiePolicy = &CookiePolicyRegistry{} })
+	return sc.cookiePolicy
+}
+
+// DerivedArtifactWriterOrNil returns the configured immutable artifact writer.
+func (sc *ScanContext) DerivedArtifactWriterOrNil() DerivedArtifactWriter {
+	if sc == nil {
+		return nil
+	}
+	return sc.ArtifactWriter
 }
 
 // getBaselineCache returns the LRU baseline cache, lazily initializing on first use.
@@ -195,6 +256,23 @@ func (sc *ScanContext) Feeder() RequestFeeder {
 		return nil
 	}
 	return sc.RequestFeeder
+}
+
+// RecordResponseRewriterOrNil returns the RecordResponseRewriter or nil safely
+// (unset in stateless scans and bare-ScanContext tests).
+func (sc *ScanContext) RecordResponseRewriterOrNil() RecordResponseRewriter {
+	if sc == nil {
+		return nil
+	}
+	return sc.RecordRewriter
+}
+
+// IsScanTarget reports whether host is within the scan's configured scope (i.e.
+// the scan is targeting that host). Returns false when no scope checker is wired
+// (ingested traffic / no-scope scans / tests) — so a known-vendor host is then
+// treated as third-party by default, which is the safe choice for beautification.
+func (sc *ScanContext) IsScanTarget(host string) bool {
+	return sc != nil && sc.Scope != nil && sc.Scope.IsHostInScope(host)
 }
 
 // ShouldFollowSubdomains reports whether the subdomain_harvest module should
@@ -245,6 +323,17 @@ func (sc *ScanContext) MarkTech(host, tag string) {
 		return
 	}
 	sc.TechStack.Mark(host, tag)
+}
+
+// HasTech reports whether tag was detected for host during the scan. It is the
+// read-side mirror of MarkTech and is fail-closed: a nil ScanContext or unset
+// registry returns false, so a tech-gated active module never probes a host
+// whose stack was not fingerprinted (or in tests with a bare ScanContext).
+func (sc *ScanContext) HasTech(host, tag string) bool {
+	if sc == nil || sc.TechStack == nil {
+		return false
+	}
+	return sc.TechStack.Has(host, tag)
 }
 
 // MarkWAF records the WAF/CDN type observed fronting host. No-op when the

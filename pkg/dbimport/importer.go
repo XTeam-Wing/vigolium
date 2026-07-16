@@ -41,6 +41,11 @@ type Result struct {
 
 	SessionDir string
 	StorageURL string
+
+	// MergeStats is populated only for SQLite-database imports (ImportSQLite):
+	// a lossless SQLite→SQLite merge of another vigolium result database into
+	// the destination. Nil for audit and JSONL imports.
+	MergeStats *database.MergeStats
 }
 
 // AgenticScanUUID returns the UUID of the result's agentic scan, or "" if no
@@ -77,7 +82,8 @@ type Options struct {
 }
 
 // ImportPath dispatches based on filesystem inspection of path: directory →
-// audit folder, .tar.gz/.tgz/.zip → archive, anything else → JSONL.
+// audit folder, .tar.gz/.tgz/.zip → archive, a vigolium SQLite result database
+// → SQLite merge, anything else → JSONL.
 func ImportPath(ctx context.Context, repo *database.Repository, path, projectUUID string, opts Options) (*Result, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -89,14 +95,56 @@ func ImportPath(ctx context.Context, repo *database.Repository, path, projectUUI
 	switch ArchiveExt(path) {
 	case ".tar.gz", ".tgz", ".zip":
 		return ImportArchive(ctx, repo, path, projectUUID, opts)
-	default:
-		f, err := os.Open(path)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open file: %w", err)
-		}
-		defer func() { _ = f.Close() }()
-		return ImportJSONL(ctx, repo, f, projectUUID, opts)
 	}
+	// A vigolium SQLite result database (any extension — .sqlite/.sqlite3/.db or
+	// none — detected by its magic header) is merged into the destination DB
+	// rather than parsed as JSONL text.
+	isSQLite, err := database.IsSQLiteFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if isSQLite {
+		return ImportSQLite(ctx, repo, path, projectUUID, opts)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	return ImportJSONL(ctx, repo, f, projectUUID, opts)
+}
+
+// ImportSQLite merges another vigolium SQLite result database at srcPath into
+// the database behind repo. It is a lossless, idempotent SQLite→SQLite merge of
+// the scan-result tables (http_records, findings, finding_records, scans,
+// agentic_scans, oast_interactions, projects), deduping rows on their natural
+// keys — so importing the same database twice adds nothing the second time.
+//
+// Each row keeps its original project_uuid, so imported data stays scoped to
+// whatever project it was scanned under; the projectUUID argument (the caller's
+// active project) is intentionally not applied here. opts is likewise not
+// applied: AgenticScanUUID (attach) and OriginalSource (storage-URL recording)
+// are single-scan/audit concepts that don't map onto a bulk merge of a whole
+// database of scans — findings keep their own agentic_scan_uuid from the source.
+// Requires a SQLite destination — a Postgres destination returns a clear error
+// from database.MergeSQLiteFile. The destination schema must already exist
+// (callers run CreateSchema before ImportPath).
+func ImportSQLite(ctx context.Context, repo *database.Repository, srcPath, projectUUID string, opts Options) (*Result, error) {
+	stats, err := database.MergeSQLiteFile(ctx, repo.DB(), srcPath)
+	if err != nil {
+		return nil, fmt.Errorf("merge SQLite database %s: %w", srcPath, err)
+	}
+
+	res := newResult()
+	res.MergeStats = stats
+	// Map the merge counters onto the shared Result shape so the common import
+	// summary still shows record/finding totals. Deduped findings (already
+	// present in the destination) are reported as "skipped".
+	res.RecordsImported = stats.RecordsMerged
+	res.FindingsSaved = stats.FindingsMerged
+	res.FindingsSkipped = stats.FindingsDeduped
+	res.FindingsTotal = stats.FindingsMerged + stats.FindingsDeduped
+	return res, nil
 }
 
 // ImportArchive extracts a .tar.gz / .tgz / .zip and dispatches its contents
@@ -167,6 +215,26 @@ func ImportArchive(ctx context.Context, repo *database.Repository, archivePath, 
 	return merged, nil
 }
 
+// tallyFindingSaves counts saved (newly-inserted) vs skipped (dedup-append or
+// errored) findings from an aligned SaveFindingsDirectBatch result, tallying the
+// severity of each non-errored finding into sev. Shared by the audit and JSONL
+// import paths.
+func tallyFindingSaves(findings []*database.Finding, results []database.FindingSaveResult, sev map[string]int) (saved, skipped int) {
+	for i, f := range findings {
+		if results[i].Err != nil {
+			skipped++
+			continue
+		}
+		if results[i].Inserted {
+			saved++
+		} else {
+			skipped++
+		}
+		sev[f.Severity]++
+	}
+	return saved, skipped
+}
+
 // ImportAudit imports an audit output folder. When opts.AgenticScanUUID is
 // set, the existing scan row is loaded (and project-validated by the caller)
 // and findings are attached to it instead of a new row being created.
@@ -208,20 +276,9 @@ func ImportAudit(ctx context.Context, repo *database.Repository, folderPath, pro
 	}
 	findings := audit.BuildFindingsWithSource(parsed.RawFindings, auditID, agenticScan.UUID, projectUUID, parsed.RepoName, src)
 
-	saved, skipped := 0, 0
 	sevCounts := map[string]int{}
-	for _, f := range findings {
-		if err := repo.SaveFindingDirect(ctx, f); err != nil {
-			skipped++
-			continue
-		}
-		if f.ID == 0 {
-			skipped++
-		} else {
-			saved++
-		}
-		sevCounts[f.Severity]++
-	}
+	results, _ := repo.SaveFindingsDirectBatch(ctx, findings)
+	saved, skipped := tallyFindingSaves(findings, results, sevCounts)
 
 	// For new scans we set the full finding count; for attached scans we
 	// increment so prior findings on that row aren't clobbered.
@@ -383,19 +440,8 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 		res.RecordsImported += len(uuids)
 	}
 
-	saved, skipped := 0, 0
-	for _, f := range findings {
-		if err := repo.SaveFindingDirect(ctx, f); err != nil {
-			skipped++
-			continue
-		}
-		if f.ID == 0 {
-			skipped++
-		} else {
-			saved++
-		}
-		res.SeverityCounts[f.Severity]++
-	}
+	results, _ := repo.SaveFindingsDirectBatch(ctx, findings)
+	saved, skipped := tallyFindingSaves(findings, results, res.SeverityCounts)
 	res.FindingsTotal = len(findings)
 	res.FindingsSaved = saved
 	res.FindingsSkipped = skipped
@@ -443,10 +489,28 @@ func mergeResult(dst, src *Result) {
 	for k, v := range src.SkippedTypes {
 		dst.SkippedTypes[k] += v
 	}
+	if src.MergeStats != nil {
+		if dst.MergeStats == nil {
+			dst.MergeStats = &database.MergeStats{}
+		}
+		dst.MergeStats.Add(src.MergeStats)
+	}
 	if src.SessionDir != "" {
 		dst.SessionDir = src.SessionDir
 	}
 	if src.StorageURL != "" {
 		dst.StorageURL = src.StorageURL
 	}
+}
+
+// MergeResults folds several import Results into one aggregate: counts, the
+// severity/skipped maps and MergeStats are summed, while the last non-nil
+// AgenticScan and session/storage references win (see mergeResult). nil entries
+// are ignored. Used to summarize a multi-source import as a single Result.
+func MergeResults(results []*Result) *Result {
+	agg := newResult()
+	for _, r := range results {
+		mergeResult(agg, r)
+	}
+	return agg
 }

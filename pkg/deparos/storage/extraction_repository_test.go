@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"net/url"
 	"testing"
 
@@ -11,9 +12,112 @@ import (
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/sqlitedialect"
 
-	"github.com/vigolium/vigolium/pkg/deparos/jsscan"
+	"github.com/vigolium/vigolium/pkg/deparos/jstangle"
 	"github.com/vigolium/vigolium/pkg/deparos/spider"
 )
+
+func TestExtractionRepositoryStoresTypedJSTangleFacts(t *testing.T) {
+	db := setupTestDB(t)
+	defer func() { _ = db.Close() }()
+	repo := NewExtractionRepository(db)
+	fact := jstangle.HTTPRequestFact{
+		Kind: "httpRequest", ID: "http-test", Client: "fetch",
+		URL:    jstangle.ValueTemplate{Rendered: "/api/users", Static: true},
+		Method: jstangle.ValueTemplate{Rendered: "POST", Static: true},
+		Query: []jstangle.FieldTemplate{{
+			Name:  jstangle.ValueTemplate{Rendered: "page", Static: true},
+			Value: jstangle.ValueTemplate{Rendered: "${page}", Static: false},
+		}},
+		Headers: []jstangle.HeaderTemplate{{
+			Name:  jstangle.ValueTemplate{Rendered: "Content-Type", Static: true},
+			Value: jstangle.ValueTemplate{Rendered: "application/json", Static: true},
+		}},
+		Body:       &jstangle.BodyTemplate{Kind: "json", ContentType: "application/json", Value: jstangle.ValueTemplate{Rendered: `{"id":"${id}"}`, Static: false}},
+		Provenance: jstangle.Provenance{Extractor: "fetch", Confidence: "high", ModulePath: "src/api.ts", Start: &jstangle.SourceLocation{Line: 42}},
+	}
+
+	require.NoError(t, repo.BatchStoreJSTangleFacts(10, 20, "https://example.com/assets/app.js", []jstangle.HTTPRequestFact{fact, fact}))
+	require.NoError(t, repo.StoreJSTangleFact(10, 20, "https://cdn.example.net/chunk.js", &fact))
+	models, err := repo.GetJSTangleRequests(20)
+	require.NoError(t, err)
+	require.Len(t, models, 2, "same source/fact should deduplicate while distinct sources survive")
+
+	for _, model := range models {
+		require.Equal(t, 2, model.SchemaVersion)
+		require.Equal(t, "httpRequest", model.RecordKind.String)
+		require.Equal(t, "high", model.Confidence.String)
+		require.Equal(t, "fetch", model.Extractor.String)
+		require.Equal(t, "src/api.ts", model.ModulePath.String)
+		require.Equal(t, int64(42), model.SourceLine.Int64)
+		require.Contains(t, model.URL, "/api/users?page=%24%7Bpage%7D")
+		var stored jstangle.HTTPRequestFact
+		require.NoError(t, json.Unmarshal([]byte(model.TemplateJSON.String), &stored))
+		require.Equal(t, fact.ID, stored.ID)
+	}
+}
+
+func TestExtractionRepositorySeparatesCapabilityFactsFromHTTPReplay(t *testing.T) {
+	db := setupTestDB(t)
+	defer func() { _ = db.Close() }()
+	repo := NewExtractionRepository(db)
+	provenance := jstangle.Provenance{Extractor: "capability-test", Confidence: "high", Start: &jstangle.SourceLocation{Line: 7}}
+	result := &jstangle.ScanResult{
+		GraphQLOperations: []jstangle.GraphQLOperationFact{{Kind: "graphqlOperation", ID: "g1", Endpoint: &jstangle.ValueTemplate{Rendered: "/graphql"}, OperationType: "query", Transport: "http", Provenance: provenance}},
+		WebSockets:        []jstangle.WebSocketFact{{Kind: "websocket", ID: "w1", URL: jstangle.ValueTemplate{Rendered: "wss://example.test/ws"}, Provenance: provenance}},
+		EventSources:      []jstangle.EventSourceFact{{Kind: "eventSource", ID: "e1", URL: jstangle.ValueTemplate{Rendered: "/events"}, Provenance: provenance}},
+		ClientRoutes:      []jstangle.ClientRouteFact{{Kind: "clientRoute", ID: "r1", Path: jstangle.ValueTemplate{Rendered: "/users/:id"}, RouteType: "page", Provenance: provenance}},
+		BrowserFlows:      []jstangle.BrowserSecurityFlowFact{{Kind: "browserSecurityFlow", ID: "b1", FlowType: "unsafePostMessage", Provenance: provenance}},
+	}
+	require.NoError(t, repo.BatchStoreJSTangleCapabilityFacts(10, 30, "https://example.test/assets/app.js", result))
+	replayRows, err := repo.GetJSTangleRequests(30)
+	require.NoError(t, err)
+	require.Empty(t, replayRows, "metadata must never enter the HTTP replay query")
+	metadataRows, err := repo.GetJSTangleCapabilityFacts(30)
+	require.NoError(t, err)
+	require.Len(t, metadataRows, 5)
+	kinds := make(map[string]bool)
+	for _, row := range metadataRows {
+		kinds[row.RecordKind.String] = true
+		require.Equal(t, 2, row.SchemaVersion)
+		require.Equal(t, int64(7), row.SourceLine.Int64)
+		require.NotEmpty(t, row.TemplateJSON.String)
+	}
+	for _, kind := range []string{"graphqlOperation", "websocket", "eventSource", "clientRoute", "browserSecurityFlow"} {
+		require.True(t, kinds[kind], "missing %s", kind)
+	}
+}
+
+func TestExtractionRepositoryStoresSourceMapArtifactsImmutably(t *testing.T) {
+	db := setupTestDB(t)
+	defer func() { _ = db.Close() }()
+	repo := NewExtractionRepository(db)
+	artifact := &JSTangleSourceArtifactModel{
+		SourceNodeID: 11, SessionID: 22,
+		GeneratedURL: "https://example.test/assets/app.js",
+		VirtualURL:   "https://example.test/assets/app.js#source=src%2Fapi.ts",
+		SourcePath:   "src/api.ts", Language: "ts", ContentSHA256: "sha-1",
+		Content: `fetch('/api/from-map')`,
+	}
+	require.NoError(t, repo.StoreJSTangleSourceArtifact(artifact))
+	require.NoError(t, repo.StoreJSTangleSourceArtifact(artifact), "same immutable artifact must deduplicate")
+
+	otherSession := *artifact
+	otherSession.ID = 0
+	otherSession.Hash = ""
+	otherSession.SessionID = 23
+	require.NoError(t, repo.StoreJSTangleSourceArtifact(&otherSession))
+
+	rows, err := repo.GetJSTangleSourceArtifacts(22)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, "src/api.ts", rows[0].SourcePath)
+	require.Equal(t, `fetch('/api/from-map')`, rows[0].Content)
+	require.NotEmpty(t, rows[0].Hash)
+
+	all, err := repo.GetJSTangleSourceArtifacts(0)
+	require.NoError(t, err)
+	require.Len(t, all, 2, "content dedup must remain session-aware")
+}
 
 // setupTestDB creates an in-memory SQLite database for testing.
 func setupTestDB(t *testing.T) *bun.DB {
@@ -42,6 +146,14 @@ func setupTestDB(t *testing.T) *bun.DB {
 		content_type TEXT,
 		headers TEXT,
 		cookies TEXT,
+		source_url TEXT,
+		record_kind TEXT,
+		confidence TEXT,
+		extractor TEXT,
+		module_path TEXT,
+		source_line INTEGER,
+		template_json TEXT,
+		schema_version INTEGER NOT NULL DEFAULT 1,
 		created_at INTEGER NOT NULL
 	)`)
 	if err != nil {
@@ -51,6 +163,26 @@ func setupTestDB(t *testing.T) *bun.DB {
 	_, err = db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_hash ON extractions(hash)`)
 	if err != nil {
 		t.Fatalf("failed to create index: %v", err)
+	}
+	_, err = db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS jstangle_source_artifacts (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		source_node_id INTEGER NOT NULL,
+		session_id INTEGER NOT NULL,
+		hash TEXT NOT NULL,
+		generated_url TEXT NOT NULL,
+		virtual_url TEXT NOT NULL,
+		source_path TEXT NOT NULL,
+		language TEXT NOT NULL,
+		content_sha256 TEXT NOT NULL,
+		content TEXT NOT NULL,
+		created_at INTEGER NOT NULL
+	)`)
+	if err != nil {
+		t.Fatalf("failed to create source artifact table: %v", err)
+	}
+	_, err = db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_jstangle_source_artifact_hash ON jstangle_source_artifacts(hash)`)
+	if err != nil {
+		t.Fatalf("failed to create source artifact index: %v", err)
 	}
 
 	return db
@@ -292,9 +424,9 @@ func TestBatchStoreSpiderLinks_EmptySlice(t *testing.T) {
 	}
 }
 
-// ============ JSScan Tests ============
+// ============ JSTangle Tests ============
 
-func TestStoreJSScanRequest(t *testing.T) {
+func TestStoreJSTangleRequest(t *testing.T) {
 	db := setupTestDB(t)
 	repo := NewExtractionRepository(db)
 
@@ -302,7 +434,7 @@ func TestStoreJSScanRequest(t *testing.T) {
 		name         string
 		sourceNodeID int64
 		sessionID    int64
-		req          *jsscan.ExtractedRequest
+		req          *jstangle.ExtractedRequest
 		wantURL      string
 		wantMethod   string
 		wantBody     string
@@ -313,7 +445,7 @@ func TestStoreJSScanRequest(t *testing.T) {
 			name:         "Simple GET request",
 			sourceNodeID: 1,
 			sessionID:    100,
-			req: &jsscan.ExtractedRequest{
+			req: &jstangle.ExtractedRequest{
 				URL:    "https://api.example.com/users",
 				Method: "GET",
 			},
@@ -325,7 +457,7 @@ func TestStoreJSScanRequest(t *testing.T) {
 			name:         "GET with params merged into URL",
 			sourceNodeID: 2,
 			sessionID:    100,
-			req: &jsscan.ExtractedRequest{
+			req: &jstangle.ExtractedRequest{
 				URL:    "https://api.example.com/search",
 				Method: "GET",
 				Params: "q=test&page=1",
@@ -338,7 +470,7 @@ func TestStoreJSScanRequest(t *testing.T) {
 			name:         "GET with existing query + params",
 			sourceNodeID: 3,
 			sessionID:    100,
-			req: &jsscan.ExtractedRequest{
+			req: &jstangle.ExtractedRequest{
 				URL:    "https://api.example.com/search?sort=asc",
 				Method: "GET",
 				Params: "q=test",
@@ -351,7 +483,7 @@ func TestStoreJSScanRequest(t *testing.T) {
 			name:         "POST with body",
 			sourceNodeID: 4,
 			sessionID:    101,
-			req: &jsscan.ExtractedRequest{
+			req: &jstangle.ExtractedRequest{
 				URL:    "https://api.example.com/login",
 				Method: "POST",
 				Body:   `{"username":"admin","password":"secret"}`,
@@ -364,7 +496,7 @@ func TestStoreJSScanRequest(t *testing.T) {
 			name:         "Request with headers",
 			sourceNodeID: 5,
 			sessionID:    101,
-			req: &jsscan.ExtractedRequest{
+			req: &jstangle.ExtractedRequest{
 				URL:     "https://api.example.com/data",
 				Method:  "GET",
 				Headers: []string{"Authorization: Bearer token123", "X-Custom: value"},
@@ -377,7 +509,7 @@ func TestStoreJSScanRequest(t *testing.T) {
 			name:         "Request with cookies",
 			sourceNodeID: 6,
 			sessionID:    101,
-			req: &jsscan.ExtractedRequest{
+			req: &jstangle.ExtractedRequest{
 				URL:     "https://api.example.com/profile",
 				Method:  "GET",
 				Cookies: []string{"session=abc123", "user=john"},
@@ -390,7 +522,7 @@ func TestStoreJSScanRequest(t *testing.T) {
 			name:         "Full request with all fields",
 			sourceNodeID: 7,
 			sessionID:    102,
-			req: &jsscan.ExtractedRequest{
+			req: &jstangle.ExtractedRequest{
 				URL:     "https://api.example.com/api/v2/create",
 				Method:  "POST",
 				Params:  "version=2",
@@ -408,9 +540,9 @@ func TestStoreJSScanRequest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := repo.StoreJSScanRequest(tt.sourceNodeID, tt.sessionID, tt.req)
+			err := repo.StoreJSTangleRequest(tt.sourceNodeID, tt.sessionID, tt.req)
 			if err != nil {
-				t.Fatalf("StoreJSScanRequest() error = %v", err)
+				t.Fatalf("StoreJSTangleRequest() error = %v", err)
 			}
 
 			result := queryLastExtraction(t, db)
@@ -424,8 +556,8 @@ func TestStoreJSScanRequest(t *testing.T) {
 			if result.Body.String != tt.wantBody {
 				t.Errorf("Body = %q, want %q", result.Body.String, tt.wantBody)
 			}
-			if result.Source != uint8(SourceJSScan) {
-				t.Errorf("Source = %d, want %d", result.Source, uint8(SourceJSScan))
+			if result.Source != uint8(SourceJSTangle) {
+				t.Errorf("Source = %d, want %d", result.Source, uint8(SourceJSTangle))
 			}
 			if tt.wantHeaders != "" && result.Headers.String != tt.wantHeaders {
 				t.Errorf("Headers = %q, want %q", result.Headers.String, tt.wantHeaders)
@@ -437,13 +569,13 @@ func TestStoreJSScanRequest(t *testing.T) {
 	}
 }
 
-func TestStoreJSScanRequest_NilInput(t *testing.T) {
+func TestStoreJSTangleRequest_NilInput(t *testing.T) {
 	db := setupTestDB(t)
 	repo := NewExtractionRepository(db)
 
-	err := repo.StoreJSScanRequest(1, 1, nil)
+	err := repo.StoreJSTangleRequest(1, 1, nil)
 	if err != nil {
-		t.Errorf("StoreJSScanRequest(nil) should not return error, got %v", err)
+		t.Errorf("StoreJSTangleRequest(nil) should not return error, got %v", err)
 	}
 
 	count := countExtractions(t, db)
@@ -452,19 +584,19 @@ func TestStoreJSScanRequest_NilInput(t *testing.T) {
 	}
 }
 
-func TestBatchStoreJSScanRequests(t *testing.T) {
+func TestBatchStoreJSTangleRequests(t *testing.T) {
 	db := setupTestDB(t)
 	repo := NewExtractionRepository(db)
 
-	reqs := []jsscan.ExtractedRequest{
+	reqs := []jstangle.ExtractedRequest{
 		{URL: "https://api.example.com/a", Method: "GET"},
 		{URL: "https://api.example.com/b", Method: "POST", Body: "data=test"},
 		{URL: "https://api.example.com/c", Method: "PUT", Params: "id=1"},
 	}
 
-	err := repo.BatchStoreJSScanRequests(20, 300, reqs)
+	err := repo.BatchStoreJSTangleRequests(20, 300, reqs)
 	if err != nil {
-		t.Fatalf("BatchStoreJSScanRequests() error = %v", err)
+		t.Fatalf("BatchStoreJSTangleRequests() error = %v", err)
 	}
 
 	results := queryAllExtractions(t, db)
@@ -493,8 +625,8 @@ func TestBatchStoreJSScanRequests(t *testing.T) {
 		if result.Body.String != expected[i].body {
 			t.Errorf("results[%d].Body = %q, want %q", i, result.Body.String, expected[i].body)
 		}
-		if result.Source != uint8(SourceJSScan) {
-			t.Errorf("results[%d].Source = %d, want %d", i, result.Source, uint8(SourceJSScan))
+		if result.Source != uint8(SourceJSTangle) {
+			t.Errorf("results[%d].Source = %d, want %d", i, result.Source, uint8(SourceJSTangle))
 		}
 	}
 }
@@ -667,7 +799,7 @@ func TestGetBySession(t *testing.T) {
 
 	// Insert test data for session 100
 	require.NoError(t, repo.StoreSpiderLink(1, 100, &spider.DiscoveredLink{URL: mustParseURL(t, "https://example.com/a"), SourceType: spider.SourceHTMLAttribute}))
-	require.NoError(t, repo.StoreJSScanRequest(1, 100, &jsscan.ExtractedRequest{URL: "https://example.com/b", Method: "GET"}))
+	require.NoError(t, repo.StoreJSTangleRequest(1, 100, &jstangle.ExtractedRequest{URL: "https://example.com/b", Method: "GET"}))
 	require.NoError(t, repo.StoreFormRequest(1, 100, &spider.FormRequest{URL: mustParseURL(t, "https://example.com/c"), Method: "POST"}))
 
 	// Insert test data for session 200
@@ -713,7 +845,7 @@ func TestGetBySource(t *testing.T) {
 	// Insert mixed data
 	require.NoError(t, repo.StoreSpiderLink(1, 100, &spider.DiscoveredLink{URL: mustParseURL(t, "https://example.com/spider1"), SourceType: spider.SourceHTMLAttribute}))
 	require.NoError(t, repo.StoreSpiderLink(1, 100, &spider.DiscoveredLink{URL: mustParseURL(t, "https://example.com/spider2"), SourceType: spider.SourceJavaScript}))
-	require.NoError(t, repo.StoreJSScanRequest(1, 100, &jsscan.ExtractedRequest{URL: "https://example.com/jsscan1", Method: "GET"}))
+	require.NoError(t, repo.StoreJSTangleRequest(1, 100, &jstangle.ExtractedRequest{URL: "https://example.com/jstangle1", Method: "GET"}))
 	require.NoError(t, repo.StoreFormRequest(1, 100, &spider.FormRequest{URL: mustParseURL(t, "https://example.com/form1"), Method: "POST"}))
 
 	// Get spider links
@@ -725,16 +857,16 @@ func TestGetBySource(t *testing.T) {
 		t.Errorf("expected 2 spider links, got %d", len(spiderLinks))
 	}
 
-	// Get jsscan requests
-	jsscanReqs, err := repo.GetBySource(100, SourceJSScan)
+	// Get jstangle requests
+	jstangleReqs, err := repo.GetBySource(100, SourceJSTangle)
 	if err != nil {
-		t.Fatalf("GetBySource(SourceJSScan) error = %v", err)
+		t.Fatalf("GetBySource(SourceJSTangle) error = %v", err)
 	}
-	if len(jsscanReqs) != 1 {
-		t.Errorf("expected 1 jsscan request, got %d", len(jsscanReqs))
+	if len(jstangleReqs) != 1 {
+		t.Errorf("expected 1 jstangle request, got %d", len(jstangleReqs))
 	}
-	if jsscanReqs[0].URL != "https://example.com/jsscan1" {
-		t.Errorf("URL = %q, want %q", jsscanReqs[0].URL, "https://example.com/jsscan1")
+	if jstangleReqs[0].URL != "https://example.com/jstangle1" {
+		t.Errorf("URL = %q, want %q", jstangleReqs[0].URL, "https://example.com/jstangle1")
 	}
 
 	// Get forms
@@ -786,8 +918,8 @@ func TestCountBySource(t *testing.T) {
 	require.NoError(t, repo.StoreSpiderLink(1, 100, &spider.DiscoveredLink{URL: mustParseURL(t, "https://example.com/s1"), SourceType: spider.SourceHTMLAttribute}))
 	require.NoError(t, repo.StoreSpiderLink(1, 100, &spider.DiscoveredLink{URL: mustParseURL(t, "https://example.com/s2"), SourceType: spider.SourceJavaScript}))
 	require.NoError(t, repo.StoreSpiderLink(1, 100, &spider.DiscoveredLink{URL: mustParseURL(t, "https://example.com/s3"), SourceType: spider.SourceComment}))
-	require.NoError(t, repo.StoreJSScanRequest(1, 100, &jsscan.ExtractedRequest{URL: "https://example.com/j1", Method: "GET"}))
-	require.NoError(t, repo.StoreJSScanRequest(1, 100, &jsscan.ExtractedRequest{URL: "https://example.com/j2", Method: "POST"}))
+	require.NoError(t, repo.StoreJSTangleRequest(1, 100, &jstangle.ExtractedRequest{URL: "https://example.com/j1", Method: "GET"}))
+	require.NoError(t, repo.StoreJSTangleRequest(1, 100, &jstangle.ExtractedRequest{URL: "https://example.com/j2", Method: "POST"}))
 	require.NoError(t, repo.StoreFormRequest(1, 100, &spider.FormRequest{URL: mustParseURL(t, "https://example.com/f1"), Method: "POST"}))
 
 	counts, err := repo.CountBySource(100)
@@ -798,8 +930,8 @@ func TestCountBySource(t *testing.T) {
 	if counts[SourceSpider] != 3 {
 		t.Errorf("SourceSpider count = %d, want 3", counts[SourceSpider])
 	}
-	if counts[SourceJSScan] != 2 {
-		t.Errorf("SourceJSScan count = %d, want 2", counts[SourceJSScan])
+	if counts[SourceJSTangle] != 2 {
+		t.Errorf("SourceJSTangle count = %d, want 2", counts[SourceJSTangle])
 	}
 	if counts[SourceForm] != 1 {
 		t.Errorf("SourceForm count = %d, want 1", counts[SourceForm])
@@ -852,8 +984,8 @@ func TestGetByMethod(t *testing.T) {
 
 	// Insert mixed methods
 	require.NoError(t, repo.StoreSpiderLink(1, 100, &spider.DiscoveredLink{URL: mustParseURL(t, "https://example.com/get1"), SourceType: spider.SourceHTMLAttribute}))
-	require.NoError(t, repo.StoreJSScanRequest(1, 100, &jsscan.ExtractedRequest{URL: "https://example.com/post1", Method: "POST"}))
-	require.NoError(t, repo.StoreJSScanRequest(1, 100, &jsscan.ExtractedRequest{URL: "https://example.com/put1", Method: "PUT"}))
+	require.NoError(t, repo.StoreJSTangleRequest(1, 100, &jstangle.ExtractedRequest{URL: "https://example.com/post1", Method: "POST"}))
+	require.NoError(t, repo.StoreJSTangleRequest(1, 100, &jstangle.ExtractedRequest{URL: "https://example.com/put1", Method: "PUT"}))
 	require.NoError(t, repo.StoreFormRequest(1, 100, &spider.FormRequest{URL: mustParseURL(t, "https://example.com/post2"), Method: "POST"}))
 
 	// Get GET requests
@@ -890,7 +1022,7 @@ func TestGetSpiderLinks(t *testing.T) {
 
 	require.NoError(t, repo.StoreSpiderLink(1, 100, &spider.DiscoveredLink{URL: mustParseURL(t, "https://example.com/link1"), SourceType: spider.SourceHTMLAttribute}))
 	require.NoError(t, repo.StoreSpiderLink(1, 100, &spider.DiscoveredLink{URL: mustParseURL(t, "https://example.com/link2"), SourceType: spider.SourceJavaScript}))
-	require.NoError(t, repo.StoreJSScanRequest(1, 100, &jsscan.ExtractedRequest{URL: "https://example.com/jsscan", Method: "GET"}))
+	require.NoError(t, repo.StoreJSTangleRequest(1, 100, &jstangle.ExtractedRequest{URL: "https://example.com/jstangle", Method: "GET"}))
 
 	links, err := repo.GetSpiderLinks(100)
 	if err != nil {
@@ -901,20 +1033,20 @@ func TestGetSpiderLinks(t *testing.T) {
 	}
 }
 
-func TestGetJSScanRequests(t *testing.T) {
+func TestGetJSTangleRequests(t *testing.T) {
 	db := setupTestDB(t)
 	repo := NewExtractionRepository(db)
 
 	require.NoError(t, repo.StoreSpiderLink(1, 100, &spider.DiscoveredLink{URL: mustParseURL(t, "https://example.com/spider"), SourceType: spider.SourceHTMLAttribute}))
-	require.NoError(t, repo.StoreJSScanRequest(1, 100, &jsscan.ExtractedRequest{URL: "https://example.com/js1", Method: "GET"}))
-	require.NoError(t, repo.StoreJSScanRequest(1, 100, &jsscan.ExtractedRequest{URL: "https://example.com/js2", Method: "POST"}))
+	require.NoError(t, repo.StoreJSTangleRequest(1, 100, &jstangle.ExtractedRequest{URL: "https://example.com/js1", Method: "GET"}))
+	require.NoError(t, repo.StoreJSTangleRequest(1, 100, &jstangle.ExtractedRequest{URL: "https://example.com/js2", Method: "POST"}))
 
-	reqs, err := repo.GetJSScanRequests(100)
+	reqs, err := repo.GetJSTangleRequests(100)
 	if err != nil {
-		t.Fatalf("GetJSScanRequests() error = %v", err)
+		t.Fatalf("GetJSTangleRequests() error = %v", err)
 	}
 	if len(reqs) != 2 {
-		t.Errorf("expected 2 jsscan requests, got %d", len(reqs))
+		t.Errorf("expected 2 jstangle requests, got %d", len(reqs))
 	}
 }
 
@@ -1001,7 +1133,7 @@ func TestExtractionSource_String(t *testing.T) {
 		want   string
 	}{
 		{SourceSpider, "spider"},
-		{SourceJSScan, "jsscan"},
+		{SourceJSTangle, "jstangle"},
 		{SourceForm, "form"},
 		{ExtractionSource(99), "unknown"},
 	}

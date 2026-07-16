@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vigolium/vigolium/internal/config"
@@ -18,6 +19,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/dedup"
 	"github.com/vigolium/vigolium/pkg/http"
+	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/input/formats/openapi"
 	"github.com/vigolium/vigolium/pkg/input/source"
 	"github.com/vigolium/vigolium/pkg/jsext"
@@ -29,13 +31,14 @@ import (
 	"github.com/projectdiscovery/useragent"
 	"github.com/vigolium/vigolium/pkg/types"
 	"go.uber.org/zap"
+	"golang.org/x/time/rate"
 )
 
 // maxFeedbackRounds limits re-scanning of newly discovered URLs in the dynamic-assessment phase.
 const maxFeedbackRounds = 1
 
-// kingfisherBatchSize is the number of records per batch when scanning response bodies for secrets.
-const kingfisherBatchSize = 500
+// secretScanBatchSize is the number of records per batch when scanning response bodies for secrets.
+const secretScanBatchSize = 500
 
 // Runner is a client for running the enumeration process.
 type Runner struct {
@@ -46,7 +49,13 @@ type Runner struct {
 	dedupManager      *dedup.Manager
 	repository        *database.Repository // Optional: database storage
 	heuristicsResults map[string]*HeuristicsResult
-	spidering         spideringOutcome     // cross-phase signals captured after Spidering (drives Discovery auto-fuzz)
+	spidering         spideringOutcome // cross-phase signals captured after Spidering (drives Discovery auto-fuzz)
+	// browserSessions holds WAF/bot-cleared sessions harvested by the spidering
+	// browser, keyed by lowercased hostname. Populated after Spidering (when
+	// Options.CarryBrowserSession is on) and consumed by Discovery
+	// (buildDeparosConfig) and the shared scan requester so later phases inherit
+	// the cleared session. Nil when spidering did not run or carrying is disabled.
+	browserSessions   map[string]httpmsg.CarriedSession
 	autoFuzzDiscovery bool                 // set by runDiscoveryPhase when low-yield/SSO auto-enables FUZZ fuzzing
 	scanLogger        *database.ScanLogger // Optional: structured scan logging
 	teeWriter         *teeWriter           // Optional: captures stderr for trace logging
@@ -58,6 +67,17 @@ type Runner struct {
 	cancel    context.CancelFunc    // cancels ctx to signal workers to stop
 	done      chan struct{}         // closed when RunNativeScan finishes
 	pauseCtrl *core.PauseController // cooperative pause/resume for workers
+
+	closeOnce sync.Once   // guards one-time resource release (Close/Discard may race)
+	finalized atomic.Bool // set once RunNativeScan has written the terminal scan status
+}
+
+// Finalized reports whether RunNativeScan already wrote the scan's terminal
+// status. The API server uses this so its safety-net CompleteScan only runs when
+// the runner never reached its finalizer (e.g. infrastructure setup failed),
+// avoiding a second write that would clobber the runner's truthful outcome.
+func (r *Runner) Finalized() bool {
+	return r.finalized.Load()
 }
 
 // spideringOutcome captures cross-phase signals from the Spidering phase that
@@ -122,13 +142,25 @@ func (s *SharedInfra) Close() {
 	}
 }
 
+// buildScanRateLimiter returns a global requests-per-second token bucket for the
+// scan, or nil when no explicit --rate-limit was set (perSec <= 0) so default
+// scans keep their current throughput. Burst equals the rate so a fresh scan can
+// send up to one second's worth immediately, then settles to the steady cap.
+func buildScanRateLimiter(perSec int) *rate.Limiter {
+	if perSec <= 0 {
+		return nil
+	}
+	return rate.NewLimiter(rate.Limit(perSec), perSec)
+}
+
 // BuildSharedInfra creates a SharedInfra from the given options and settings.
 // It extracts the reusable portions of buildInfrastructure.
 func BuildSharedInfra(opts *types.Options, settings *config.Settings, repo *database.Repository) (*SharedInfra, error) {
 	infra := &SharedInfra{}
 
 	svc := &services.Services{
-		Options: opts,
+		Options:     opts,
+		RateLimiter: buildScanRateLimiter(opts.RateLimit),
 	}
 
 	if opts.ShouldUseHostError() {
@@ -157,6 +189,12 @@ func BuildSharedInfra(opts *types.Options, settings *config.Settings, repo *data
 		Adaptive:       adaptive,
 		MinPerHost:     minPerHost,
 		CeilingPerHost: ceilingPerHost,
+		// Throttle a host only once it starts returning WAF/CDN blocks; a non-WAF
+		// scan is unaffected. The constructor drops this when Adaptive is on.
+		WafAutoArm: true,
+		// --no-waf-pacing turns off only the proactive edge pre-arm; reactive
+		// WAF-block back-off stays on.
+		DisablePreArm: opts.NoWafPacing,
 	})
 	svc.HostLimiter = hostLimiter
 	infra.HostLimiter = hostLimiter
@@ -304,23 +342,35 @@ func NewWithInputSource(options *types.Options, inputSource source.InputSource) 
 	}, nil
 }
 
-// setupUserAgents initializes global user agents for HTTP requests.
+// setupUserAgentsOnce guards the one-time write to the package-global
+// useragent.UserAgents slice. Every runner construction called it, racing the
+// shared global against concurrent request setup; the picked set is effectively
+// constant, so initialize it exactly once.
+var setupUserAgentsOnce sync.Once
+
+// setupUserAgents initializes global user agents for HTTP requests (once).
 func setupUserAgents() {
-	filters := []useragent.Filter{useragent.Windows}
-	userAgents, err := useragent.PickWithFilters(30, filters...)
-	if err != nil {
-		zap.L().Error("Error picking user agent", zap.Error(err))
-		userAgents = []*useragent.UserAgent{
-			{
-				Raw:  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
-				Tags: []string{"Chrome"},
-			},
+	setupUserAgentsOnce.Do(func() {
+		filters := []useragent.Filter{useragent.Windows}
+		userAgents, err := useragent.PickWithFilters(30, filters...)
+		if err != nil {
+			zap.L().Error("Error picking user agent", zap.Error(err))
+			userAgents = []*useragent.UserAgent{
+				{
+					Raw:  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
+					Tags: []string{"Chrome"},
+				},
+			}
 		}
-	}
-	useragent.UserAgents = userAgents
+		useragent.UserAgents = userAgents
+	})
 }
 
-// Close releases all the resources and cleans up
+// Close cancels the run, waits (bounded) for RunNativeScan to finish, then
+// releases resources. Safe to call concurrently and repeatedly — a stop handler
+// and the background-completion path can both call it, so the resource release
+// (which decrements the process-global network dialer refcount) is guarded by
+// sync.Once to avoid a double teardown of the shared dialer.
 func (r *Runner) Close() {
 	// Resume if paused — workers must unblock before they can see context cancellation
 	if r.pauseCtrl != nil && r.pauseCtrl.IsPaused() {
@@ -346,6 +396,23 @@ func (r *Runner) Close() {
 		}
 	}
 
+	r.closeOnce.Do(r.releaseResources)
+}
+
+// Discard releases a runner's resources without waiting for RunNativeScan.
+// Used when a scan is rejected (queue full / project busy) before it ever
+// starts: r.done is never closed in that case, so a normal Close would block for
+// the full shutdown timeout. Shares closeOnce with Close so the network refcount
+// is released exactly once.
+func (r *Runner) Discard() {
+	if r.cancel != nil {
+		r.cancel()
+	}
+	r.closeOnce.Do(r.releaseResources)
+}
+
+// releaseResources frees the runner's owned resources. Runs at most once.
+func (r *Runner) releaseResources() {
 	if r.output != nil {
 		r.output.Close()
 	}

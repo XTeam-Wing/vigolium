@@ -2,14 +2,21 @@ package database
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	neturl "net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/uptrace/bun"
 
+	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"go.uber.org/zap"
 )
 
@@ -41,6 +48,66 @@ func (r *Repository) SaveRecord(ctx context.Context, httpRR *httpmsg.HttpRequest
 	return record.UUID, nil
 }
 
+// UpsertSnapshotRecord stores a Burp snapshot record idempotently. When an
+// existing request later gains a response, or its response changes, the
+// response-derived columns are refreshed in place while the stable UUID and
+// finding links are preserved. outcome is inserted, updated, or unchanged.
+func (r *Repository) UpsertSnapshotRecord(ctx context.Context, httpRR *httpmsg.HttpRequestResponse, source string, projectUUID string) (uuid, outcome string, err error) {
+	if httpRR == nil || httpRR.Request() == nil {
+		return "", "", fmt.Errorf("invalid HttpRequestResponse")
+	}
+	record := &HTTPRecord{}
+	if err := record.FromHttpRequestResponse(httpRR); err != nil {
+		return "", "", fmt.Errorf("failed to convert request: %w", err)
+	}
+	record.Source = source
+	record.ProjectUUID = defaultProjectUUID(projectUUID)
+
+	existingUUID, lookupErr := r.findDuplicateRecord(ctx, record)
+	if lookupErr != nil {
+		return "", "", lookupErr
+	}
+	if existingUUID == "" {
+		if _, err := r.db.NewInsert().Model(record).Exec(ctx); err != nil {
+			return "", "", fmt.Errorf("failed to insert snapshot record: %w", err)
+		}
+		r.emitRecordSaved(record)
+		return record.UUID, "inserted", nil
+	}
+	if !record.HasResponse {
+		return existingUUID, "unchanged", nil
+	}
+
+	existing, err := r.GetRecordByUUID(ctx, existingUUID)
+	if err != nil {
+		return "", "", err
+	}
+	if existing.HasResponse && existing.ResponseHash == record.ResponseHash {
+		return existingUUID, "unchanged", nil
+	}
+	_, err = r.db.NewUpdate().
+		Model((*HTTPRecord)(nil)).
+		Set("status_code = ?", record.StatusCode).
+		Set("status_phrase = ?", record.StatusPhrase).
+		Set("response_http_version = ?", record.ResponseHTTPVersion).
+		Set("response_content_type = ?", record.ResponseContentType).
+		Set("response_content_length = ?", record.ResponseContentLength).
+		Set("raw_response = ?", record.RawResponse).
+		Set("response_hash = ?", record.ResponseHash).
+		Set("response_norm_hash = ?", record.ResponseNormHash).
+		Set("response_words = ?", record.ResponseWords).
+		Set("response_title = ?", record.ResponseTitle).
+		Set("content_hash = ?", record.ContentHash).
+		Set("has_response = ?", true).
+		Set("received_at = ?", time.Now()).
+		Where("uuid = ?", existingUUID).
+		Exec(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to refresh snapshot response: %w", err)
+	}
+	return existingUUID, "updated", nil
+}
+
 // findDuplicateRecord checks whether a record with the same method, hostname,
 // path, and URL already exists. For requests with a body, the request_hash is
 // also compared to distinguish different payloads to the same endpoint. It is a
@@ -59,6 +126,29 @@ func (r *Repository) findDuplicateRecord(ctx context.Context, record *HTTPRecord
 // separately because it only narrows records that carry a body.
 func recordDedupTuple(method, host, path, url string) string {
 	return method + "\x00" + host + "\x00" + path + "\x00" + url
+}
+
+// recordSourceRequiresExactIdentity reports whether records saved under this
+// source must dedup on the EXACT raw request (its request_hash) even when the
+// request carries no body. Finding-evidence records — saved with the record kind
+// as their source (finding / candidate / observation) — carry the precise
+// exchange a module used to prove a vulnerability. A header-only probe (Origin,
+// Authorization, Cookie, X-Forwarded-*, a method-override or cache/conditional
+// header) leaves method/host/path/url unchanged and carries no body, so the coarse
+// no-body dedup would collapse it onto an unrelated baseline record and mislink the
+// finding to traffic that never carried the attacker header (and to the baseline
+// response). Requiring the request_hash keeps each proving exchange distinct.
+//
+// Crawler/ingest sources (scanner, spidering, discovery, ingest-*) intentionally
+// keep the coarse no-body key so repeated identical fetches still collapse and the
+// record store isn't inflated by every header-varied crawl request.
+func recordSourceRequiresExactIdentity(source string) bool {
+	switch source {
+	case RecordKindFinding, RecordKindCandidate, RecordKindObservation:
+		return true
+	default:
+		return false
+	}
 }
 
 // dedupCandidate is the narrow projection findDuplicateRecordUUIDs scans — only
@@ -135,7 +225,10 @@ func (r *Repository) findDuplicateRecordUUIDs(ctx context.Context, records []*HT
 
 		// A body record matches the candidate with the same request_hash; a
 		// no-body record matches any candidate (mirroring findDuplicateRecord,
-		// which omits the request_hash filter when there is no body).
+		// which omits the request_hash filter when there is no body) — UNLESS its
+		// source requires exact identity (finding-evidence records), in which case
+		// it too must match on request_hash so a header-only probe never collapses
+		// onto an unrelated baseline record.
 		byTuple := make(map[string][]dedupCandidate, len(rows))
 		for _, row := range rows {
 			k := recordDedupTuple(row.Method, row.Hostname, row.Path, row.URL)
@@ -148,7 +241,7 @@ func (r *Repository) findDuplicateRecordUUIDs(ctx context.Context, records []*HT
 				continue
 			}
 			rec := records[i]
-			if rec.RequestContentLength == 0 {
+			if rec.RequestContentLength == 0 && !recordSourceRequiresExactIdentity(rec.Source) {
 				out[i] = cands[0].UUID
 				continue
 			}
@@ -441,9 +534,60 @@ func (r *Repository) UpdateRecordAnnotations(ctx context.Context, uuid string, r
 	return nil
 }
 
+// OverwriteRecordResponseBody replaces the stored raw response of the record
+// with the given UUID and recomputes its derived fields (response_hash,
+// response_norm_hash, response_words, response_content_length), keeping them
+// consistent with dedup/resume/fingerprinting that key off those columns.
+//
+// rawResponse must be a complete HTTP response (status line + headers + body).
+// Used by the passive js-beautify module to overwrite a minified JS body with
+// its beautified form in place. The derivation mirrors Record.FromRequestResponse
+// so a rewritten record hashes identically to one ingested with the new body.
+// (Distinct from UpdateRecordResponse, which is the replay feature's full
+// response-field swap.)
+func (r *Repository) OverwriteRecordResponseBody(ctx context.Context, uuid string, rawResponse []byte) error {
+	if uuid == "" || len(rawResponse) == 0 {
+		return fmt.Errorf("OverwriteRecordResponseBody: empty uuid or response")
+	}
+
+	// Path + URL are needed for the reflected-URL-robust normalized body hash.
+	recs, err := r.getRecordsByUUIDs(ctx, []string{uuid}, "uuid", "path", "url")
+	if err != nil {
+		return fmt.Errorf("OverwriteRecordResponseBody: load record: %w", err)
+	}
+	if len(recs) == 0 {
+		return fmt.Errorf("OverwriteRecordResponseBody: no record found with uuid %s", uuid)
+	}
+	rec := recs[0]
+
+	resp := httpmsg.NewHttpResponse(rawResponse)
+	body := resp.Body()
+
+	respHash := sha256.Sum256(rawResponse)
+	normHash := modkit.NormalizedBodyHash(string(body), rec.Path, rec.URL)
+	words := countResponseWords(body, resp.Headers())
+
+	result, err := r.db.NewUpdate().
+		Model((*HTTPRecord)(nil)).
+		Where("uuid = ?", uuid).
+		Set("raw_response = ?", rawResponse).
+		Set("response_hash = ?", hex.EncodeToString(respHash[:])).
+		Set("response_norm_hash = ?", normHash).
+		Set("response_words = ?", words).
+		Set("response_content_length = ?", int64(len(body))).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("OverwriteRecordResponseBody: update failed: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return fmt.Errorf("OverwriteRecordResponseBody: no record found with uuid %s", uuid)
+	}
+	return nil
+}
+
 // GetRecordsWithResponseBody returns HTTP records that have a non-empty response body,
 // using UUID-based cursor pagination. Only columns needed for batch secret scanning are selected.
-func (r *Repository) GetRecordsWithResponseBody(ctx context.Context, projectUUID, afterUUID string, limit int) ([]*HTTPRecord, error) {
+func (r *Repository) GetRecordsWithResponseBody(ctx context.Context, projectUUID, afterUUID string, limit int, hosts ...HostTarget) ([]*HTTPRecord, error) {
 	var records []*HTTPRecord
 	q := r.db.NewSelect().
 		Model(&records).
@@ -454,6 +598,8 @@ func (r *Repository) GetRecordsWithResponseBody(ctx context.Context, projectUUID
 	if projectUUID != "" {
 		q = q.Where("project_uuid = ?", projectUUID)
 	}
+	// Optional in-scope origin filter — empty means all project records.
+	q = applyHostScopeFilter(q, hosts)
 	if afterUUID != "" {
 		q = q.Where("uuid > ?", afterUUID)
 	}
@@ -462,6 +608,60 @@ func (r *Repository) GetRecordsWithResponseBody(ctx context.Context, projectUUID
 		return nil, fmt.Errorf("failed to query records with response body: %w", err)
 	}
 	return records, nil
+}
+
+// WalkJavaScriptRecords streams JavaScript responses already stored for a host by
+// earlier phases (spidering, proxy/Burp ingestion) so the discovery engine can
+// feed browser-collected bundles through JSTangle even though they live in the
+// main DB rather than the ephemeral discovery sitemap. Each callback receives the
+// record URL, its response content-type, and the decoded (gzip-inflated) response
+// body. JavaScript is matched by content-type or a .js/.mjs URL suffix; the walk
+// is bounded by limit and ordered by uuid for determinism. A callback error stops
+// the walk and is returned. This satisfies the source.spideredJSProvider optional
+// interface structurally (primitive-typed) so neither package imports the other.
+func (r *Repository) WalkJavaScriptRecords(ctx context.Context, projectUUID, hostname string, limit int, fn func(recordURL, contentType string, body []byte) error) error {
+	if hostname == "" || fn == nil {
+		return nil
+	}
+	var rows []struct {
+		URL                 string `bun:"url"`
+		ResponseContentType string `bun:"response_content_type"`
+		RawResponse         []byte `bun:"raw_response"`
+	}
+	q := r.db.NewSelect().
+		TableExpr("http_records").
+		ColumnExpr("url, response_content_type, raw_response").
+		Where("has_response = ?", true).
+		Where("raw_response IS NOT NULL").
+		Where("length(raw_response) > 0").
+		Where("hostname = ?", hostname).
+		Where("(response_content_type LIKE '%javascript%' OR response_content_type LIKE '%ecmascript%' OR url LIKE '%.js' OR url LIKE '%.mjs')")
+	if projectUUID != "" {
+		q = q.Where("project_uuid = ?", projectUUID)
+	}
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	if err := q.OrderExpr("uuid ASC").Scan(ctx, &rows); err != nil {
+		return fmt.Errorf("failed to query stored JavaScript records: %w", err)
+	}
+	for i := range rows {
+		body := httpmsg.NewHttpResponse(rows[i].RawResponse).Body()
+		// Stored bodies may still carry their on-wire gzip encoding; inflate when
+		// the gzip magic is present so JSTangle/linkfinder see readable source.
+		if len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
+			if dec := httpmsg.DecompressBytes(body); len(dec) > 0 {
+				body = dec
+			}
+		}
+		if len(body) == 0 {
+			continue
+		}
+		if err := fn(rows[i].URL, rows[i].ResponseContentType, body); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ReSpiderCandidate is a lightweight projection of an HTTP record used by the
@@ -486,7 +686,7 @@ type ReSpiderCandidate struct {
 // deterministic. Each returned row carries a full raw_response body, so the
 // caller pages with a modest limit and reduces each page before reading the
 // next rather than materializing every body at once.
-func (r *Repository) GetReSpiderCandidates(ctx context.Context, projectUUID, afterUUID string, limit int) ([]ReSpiderCandidate, error) {
+func (r *Repository) GetReSpiderCandidates(ctx context.Context, projectUUID, afterUUID string, limit int, hosts ...HostTarget) ([]ReSpiderCandidate, error) {
 	var rows []ReSpiderCandidate
 	q := r.db.NewSelect().
 		TableExpr("http_records").
@@ -497,6 +697,7 @@ func (r *Repository) GetReSpiderCandidates(ctx context.Context, projectUUID, aft
 	if projectUUID != "" {
 		q = q.Where("project_uuid = ?", projectUUID)
 	}
+	q = applyHostScopeFilter(q, hosts)
 	if afterUUID != "" {
 		q = q.Where("uuid > ?", afterUUID)
 	}
@@ -529,8 +730,17 @@ type HostTarget struct {
 	Port     int    `bun:"port"`
 }
 
-// GetDistinctHosts returns distinct scheme+hostname+port combinations from HTTP records, filtered by project.
-func (r *Repository) GetDistinctHosts(ctx context.Context, projectUUID string) ([]HostTarget, error) {
+// dbTimestampString formats t to the DB's second-precision UTC timestamp string, matching
+// how created_at/cursor timestamps are stored and compared (so the comparison works on
+// SQLite text columns as well as Postgres).
+func dbTimestampString(t time.Time) string {
+	return t.UTC().Format("2006-01-02 15:04:05")
+}
+
+// GetDistinctHosts returns distinct scheme+hostname+port combinations from HTTP records,
+// filtered by project. When a non-zero `since` is supplied, only records created at/after
+// that time are considered (used to find origins discovered during a specific scan).
+func (r *Repository) GetDistinctHosts(ctx context.Context, projectUUID string, since ...time.Time) ([]HostTarget, error) {
 	var hosts []HostTarget
 	q := r.db.NewSelect().
 		TableExpr("http_records").
@@ -538,11 +748,162 @@ func (r *Repository) GetDistinctHosts(ctx context.Context, projectUUID string) (
 	if projectUUID != "" {
 		q = q.Where("project_uuid = ?", projectUUID)
 	}
+	if len(since) > 0 && !since[0].IsZero() {
+		q = q.Where("created_at >= ?", dbTimestampString(since[0]))
+	}
 	err := q.Scan(ctx, &hosts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get distinct hosts: %w", err)
 	}
 	return hosts, nil
+}
+
+// InScopeHosts returns the distinct (scheme, hostname, port) origins in the project that
+// are in scope for the supplied CLI targets. An origin is in scope when its hostname passes
+// the scope matcher AND EITHER its (scheme, port) matches one of the targets' origins
+// (default ports normalized like stored records: https→443, http→80) OR it was discovered
+// during the current scan (records created at/after the scan's start). Returns nil when
+// there are no targets (no filter — a project-wide pass). This is the single source of
+// truth for the origin scoping the executor applies via WithHostScopes, so
+// DynamicAssessment, KnownIssueScan, spidering/discovery seeds, and the scan-completion
+// record count all derive the same set.
+//
+// The full-origin match keeps e.g. localhost:3000 separate from localhost:8080 left in the
+// project by a prior scan, while the current-scan provenance carve-out still lets THIS
+// scan's own discoveries on a different port (e.g. the --intensity deep port sweep, or a
+// followed cross-port link) be scanned. Records carry no scan_uuid, so provenance is keyed
+// on the scan's start time. If no target yields a determinable scheme/port (e.g. all bare
+// hosts), the scheme/port constraint is dropped — a safe fallback that never over-excludes.
+func (r *Repository) InScopeHosts(ctx context.Context, scopeCfg config.ScopeConfig, targets []string, projectUUID, scanUUID string) []HostTarget {
+	if len(targets) == 0 {
+		return nil
+	}
+	matcher := config.NewScopeMatcher(scopeCfg, targets...)
+	allowedOrigins := parseTargetOrigins(targets)
+	hosts, err := r.GetDistinctHosts(ctx, projectUUID)
+	if err != nil {
+		return nil
+	}
+	currentScanOrigins := r.originsDiscoveredByScan(ctx, projectUUID, scanUUID)
+	var out []HostTarget
+	for _, h := range hosts {
+		if !matcher.InScopeRequest(h.Hostname, "/", "", "") {
+			continue
+		}
+		if len(allowedOrigins) > 0 {
+			_, originMatch := allowedOrigins[originKey(h.Scheme, h.Port)]
+			_, fromScan := currentScanOrigins[fullOriginKey(h)]
+			if !originMatch && !fromScan {
+				continue
+			}
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
+// HostnamesOf returns the distinct hostnames of the given origins, order-preserving.
+// Used to derive a hostname-only filter (e.g. for findings, which carry no port column)
+// from a set of in-scope origins.
+func HostnamesOf(hosts []HostTarget) []string {
+	if len(hosts) == 0 {
+		return nil
+	}
+	var hostnames []string
+	seen := make(map[string]struct{}, len(hosts))
+	for _, h := range hosts {
+		if _, ok := seen[h.Hostname]; ok {
+			continue
+		}
+		seen[h.Hostname] = struct{}{}
+		hostnames = append(hostnames, h.Hostname)
+	}
+	return hostnames
+}
+
+// originKey is the map key for a (scheme, port) origin pair.
+func originKey(scheme string, port int) string {
+	return strings.ToLower(scheme) + ":" + strconv.Itoa(port)
+}
+
+// fullOriginKey is the map key for a complete (scheme, hostname, port) origin.
+func fullOriginKey(h HostTarget) string {
+	return strings.ToLower(h.Scheme) + "://" + strings.ToLower(h.Hostname) + ":" + strconv.Itoa(h.Port)
+}
+
+// originsDiscoveredByScan returns the full origin keys (scheme://host:port) of hosts with
+// records created during the given scan. http_records carry no scan_uuid, so the scan's
+// start time is used as the provenance boundary: records created at/after it belong to this
+// scan. (A precise alternative would populate http_records.scan_uuid at save time; the
+// time boundary avoids that wider change at the cost of fragility under concurrent
+// same-project scans.) Empty scanUUID (or an unknown scan) yields nil, so callers fall
+// back to pure origin matching.
+func (r *Repository) originsDiscoveredByScan(ctx context.Context, projectUUID, scanUUID string) map[string]struct{} {
+	if scanUUID == "" {
+		return nil
+	}
+	scan, err := r.GetScanByUUID(ctx, scanUUID)
+	if err != nil || scan == nil || scan.StartedAt.IsZero() {
+		return nil
+	}
+	hosts, err := r.GetDistinctHosts(ctx, projectUUID, scan.StartedAt)
+	if err != nil {
+		return nil
+	}
+	keys := make(map[string]struct{}, len(hosts))
+	for _, h := range hosts {
+		keys[fullOriginKey(h)] = struct{}{}
+	}
+	return keys
+}
+
+// parseTargetOrigins extracts the set of (scheme, port) origins from CLI target URLs,
+// normalizing default ports the same way stored records do (via httpmsg.GetDefaultPort).
+// Targets without a determinable scheme are skipped; an empty result means "no scheme/port
+// constraint" to the caller. The set is across all targets, not per-target: in the rare
+// multi-target scan with the same host on different ports, a record may match a sibling
+// target's port — an accepted trade-off vs per-target matching complexity.
+func parseTargetOrigins(targets []string) map[string]struct{} {
+	origins := make(map[string]struct{}, len(targets))
+	for _, t := range targets {
+		u, err := neturl.Parse(strings.TrimSpace(t))
+		if err != nil || u.Hostname() == "" || u.Scheme == "" {
+			continue
+		}
+		scheme := strings.ToLower(u.Scheme)
+		port := httpmsg.GetDefaultPort(scheme)
+		if p := u.Port(); p != "" {
+			port, _ = strconv.Atoi(p)
+		}
+		origins[originKey(scheme, port)] = struct{}{}
+	}
+	return origins
+}
+
+// applyHostScopeFilter restricts q to the given in-scope origins when the list is
+// non-empty; an empty list is a no-op. Each HostTarget is a flexible predicate: an empty
+// Scheme or zero Port is left unconstrained, so {Hostname} matches any origin on that host
+// while {Scheme,Hostname,Port} matches the exact origin. Origins are OR-ed together.
+func applyHostScopeFilter(q *bun.SelectQuery, hosts []HostTarget) *bun.SelectQuery {
+	if len(hosts) == 0 {
+		return q
+	}
+	var conds []string
+	var args []interface{}
+	for _, h := range hosts {
+		parts := []string{"hostname = ?"}
+		args = append(args, h.Hostname)
+		if h.Scheme != "" {
+			parts = append(parts, "scheme = ?")
+			args = append(args, h.Scheme)
+		}
+		if h.Port != 0 {
+			parts = append(parts, "port = ?")
+			args = append(args, h.Port)
+		}
+		conds = append(conds, "("+strings.Join(parts, " AND ")+")")
+	}
+	return q.Where("("+strings.Join(conds, " OR ")+")", args...)
 }
 
 // PathTarget represents a distinct scheme+hostname+port+path combination from HTTP records.
@@ -553,8 +914,10 @@ type PathTarget struct {
 	Path     string `bun:"path"`
 }
 
-// GetDistinctPaths returns distinct scheme+hostname+port+path combinations from HTTP records, filtered by project.
-func (r *Repository) GetDistinctPaths(ctx context.Context, projectUUID string) ([]PathTarget, error) {
+// GetDistinctPaths returns distinct scheme+hostname+port+path combinations from HTTP records,
+// filtered by project and, when hosts is non-empty, restricted to those in-scope origins
+// (matching the executor's WithHostScopes convention). Empty hosts means no origin filter.
+func (r *Repository) GetDistinctPaths(ctx context.Context, projectUUID string, hosts ...HostTarget) ([]PathTarget, error) {
 	var paths []PathTarget
 	q := r.db.NewSelect().
 		TableExpr("http_records").
@@ -562,6 +925,7 @@ func (r *Repository) GetDistinctPaths(ctx context.Context, projectUUID string) (
 	if projectUUID != "" {
 		q = q.Where("project_uuid = ?", projectUUID)
 	}
+	q = applyHostScopeFilter(q, hosts)
 	err := q.Scan(ctx, &paths)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get distinct paths: %w", err)

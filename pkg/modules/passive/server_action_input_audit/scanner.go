@@ -9,6 +9,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/dedup"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/modules/shared/jsframework"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
 	"github.com/vigolium/vigolium/pkg/utils"
@@ -94,8 +95,19 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 		return nil, errors.Wrap(err, "failed to get URL")
 	}
 
+	// Skip compiled client build artifacts (/_next/static/, /_nuxt/): server-side
+	// data-fetching / server-action / auth code is stripped from client bundles, so a
+	// match there is a framework-machinery false positive (same bundle hash across
+	// every site using the framework). Real issues live in server source.
+	if jsframework.IsClientBuildArtifact(urlx.Path) {
+		return nil, nil
+	}
+
 	// Dedup by host+path
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
+	var diskSet *dedup.DiskSet
+	if scanCtx != nil {
+		diskSet = m.ds.Get(scanCtx.DedupMgr())
+	}
 	dedupKey := utils.Sha1(fmt.Sprintf("%s%s", urlx.Host, urlx.Path))
 	if diskSet != nil && diskSet.IsSeen(dedupKey) {
 		return nil, nil
@@ -151,22 +163,26 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 	return []*output.ResultEvent{
 		{
 			ModuleID:         ModuleID,
+			RecordKind:       output.RecordKindCandidate,
+			EvidenceGrade:    output.EvidenceGradeCandidate,
 			Host:             urlx.Host,
 			URL:              urlx.String(),
 			Matched:          urlx.String(),
 			ExtractedResults: extracted,
 			Info: output.Info{
-				Name:        "Server Action Missing Input Validation",
-				Description: fmt.Sprintf("Next.js Server Action at %s processes user input without runtime schema validation (zod/yup/joi/valibot)", urlx.Path),
+				Name:        "Server Action Input-Validation Candidate",
+				Description: fmt.Sprintf("Source-like code at %s contains server-action, input-access, and database-operation patterns without a recognized schema library. Regex proximity does not prove that the input reaches the operation or that imported/manual validation is absent.", urlx.Path),
 				Severity:    severity.Medium,
 				Confidence:  severity.Tentative,
 				Tags:        []string{"input-validation", "server-action", "nextjs", "source-analysis"},
 				Reference:   []string{"https://cwe.mitre.org/data/definitions/20.html"},
 			},
 			Metadata: map[string]any{
-				"cwe":         "CWE-20",
-				"hasFormData": hasFormData,
-				"hasDBWrite":  hasDBWrite,
+				"cwe":                       "CWE-20",
+				"hasFormData":               hasFormData,
+				"hasDBWrite":                hasDBWrite,
+				"connected_flow_proven":     false,
+				"manual_validation_checked": false,
 			},
 		},
 	}, nil

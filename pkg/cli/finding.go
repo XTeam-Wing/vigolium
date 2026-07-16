@@ -3,10 +3,13 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/cli/tui"
 	"github.com/vigolium/vigolium/pkg/database"
@@ -21,9 +24,12 @@ var (
 	findingPath          string
 	findingFrom          string
 	findingTo            string
-	findingSearch        string
+	findingSearch        []string
 	findingHeader        string
 	findingBody          string
+	findingExcludeSearch []string
+	findingExcludeHeader string
+	findingExcludeBody   string
 	findingSource        string
 	findingSort          string
 	findingAsc           bool
@@ -36,15 +42,18 @@ var (
 	findingAgenticScan   string
 	findingModuleType    string
 	findingFindingSource string
+	findingRecordKind    string
 	findingID            int
 
 	// Display-only flags
 	findingRaw         bool
 	findingBurp        bool
+	findingTree        bool
 	findingMarkdown    bool
 	findingWithRecords bool
 	findingColumns     []string
 	findingExclude     []string
+	findingPick        string
 )
 
 // findingColumnDef defines a displayable column for the findings table.
@@ -65,6 +74,8 @@ var allFindingColumns = []findingColumnDef{
 	{"DESCRIPTION", "", func(f *database.Finding) string { return clicommon.Truncate(f.Description, 50) }, 50},
 	{"TYPE", "", func(f *database.Finding) string { return colorModuleType(f.ModuleType) }, 12},
 	{"SOURCE", "", func(f *database.Finding) string { return f.FindingSource }, 20},
+	{"KIND", "", func(f *database.Finding) string { return f.RecordKind }, 12},
+	{"EVIDENCE", "", func(f *database.Finding) string { return f.EvidenceGrade }, 8},
 	{"HOST_REPO", "URL / REPO NAME", func(f *database.Finding) string {
 		if f.RepoName != "" {
 			return clicommon.Truncate(f.RepoName, 60)
@@ -94,7 +105,7 @@ var findingCmd = &cobra.Command{
 	Use:     "finding [search-term]",
 	Aliases: []string{"findings"},
 	Short:   "Browse vulnerability findings with fuzzy search and filtering",
-	Long:    "Browse stored vulnerability findings with fuzzy search, raw display, and column selection.",
+	Long:    "Browse stored vulnerability findings with fuzzy search, raw display, tree view, and column selection.",
 	Args:    cobra.MaximumNArgs(1),
 	RunE:    runFinding,
 }
@@ -111,9 +122,12 @@ func init() {
 	pf.StringVar(&findingPath, "path", "", "Filter by URL path pattern")
 	pf.StringVar(&findingFrom, "from", "", "Show findings after this date (YYYY-MM-DD or RFC3339)")
 	pf.StringVar(&findingTo, "to", "", "Show findings before this date (YYYY-MM-DD or RFC3339)")
-	pf.StringVar(&findingSearch, "search", "", "Search across descriptions, module IDs, and matched_at")
+	pf.StringArrayVar(&findingSearch, "search", nil, "Search across the finding's module metadata, matched location, and the linked request/response (headers + body); repeatable, AND-combined (each term further narrows)")
 	pf.StringVar(&findingHeader, "header", "", "Search within HTTP header names and values")
 	pf.StringVar(&findingBody, "body", "", "Search within HTTP request/response body content")
+	pf.StringArrayVar(&findingExcludeSearch, "exclude-search", nil, "Exclude findings where the term appears in the module metadata, matched location, or linked request/response (repeatable; dropped if ANY term matches — the inverse of --search)")
+	pf.StringVar(&findingExcludeHeader, "exclude-header", "", "Exclude findings whose linked request/response headers contain the term (inverse of --header)")
+	pf.StringVar(&findingExcludeBody, "exclude-body", "", "Exclude findings whose linked request/response body contains the term (inverse of --body)")
 	pf.StringVar(&findingSource, "source", "", "Filter by record source (e.g. scanner, ingest-cli)")
 	pf.StringVar(&findingSort, "sort", "found_at", "Sort by: found_at, created_at, severity, module, confidence")
 	pf.BoolVar(&findingAsc, "asc", false, "Sort in ascending order (default: descending)")
@@ -121,26 +135,42 @@ func init() {
 	pf.IntVar(&findingOffset, "offset", 0, "Number of findings to skip (for pagination)")
 
 	// Finding-specific filter flags
-	pf.StringVar(&findingSeverity, "severity", "", "Filter by severity: critical,high,medium,low,info (comma-separated)")
+	pf.StringVar(&findingSeverity, "severity", "", "Filter by severity: critical,high,medium,low,suspect,info (comma-separated; single-letter shorthands or any unambiguous prefix ok, e.g. 'h,c' or 'me,info'). Alias: --sev")
 	pf.StringVar(&findingMinSeverity, "min-severity", "", "Filter by minimum severity (e.g. high → high+critical); ignored when --severity is set")
 	pf.StringVar(&findingConfidence, "confidence", "", "Filter by confidence: certain,firm,tentative (comma-separated)")
 	pf.StringVar(&findingScanUUID, "scan-uuid", "", "Filter by scan UUID")
 	pf.StringVar(&findingAgenticScan, "agentic-scan", "", "Filter by agentic-scan UUID (findings produced by an agent autopilot/swarm/audit run)")
-	pf.StringVar(&findingModuleType, "module-type", "", "Filter by module type (active, passive, nuclei, secret-scan, agent, source-tools, oast, extension)")
+	pf.StringVar(&findingModuleType, "module-type", "", "Filter by module type (active, passive, nuclei, agent, source-tools, oast, extension)")
 	pf.StringVar(&findingFindingSource, "finding-source", "", "Filter by finding source (dynamic-assessment, spa, agent, oast, source-tools, extension)")
+	pf.StringVar(&findingRecordKind, "record-kind", "", "Filter by record kind (finding, candidate, observation; comma-separated). Default: finding")
 	pf.IntVar(&findingID, "id", 0, "Filter by finding ID")
 
 	// Display-only flags
 	f := findingCmd.Flags()
 	f.BoolVar(&findingRaw, "raw", false, "Show full raw HTTP request and response for each finding")
 	f.BoolVar(&findingBurp, "burp", false, "Display in Burp Suite-style format (colored request/response)")
-	f.BoolVar(&findingMarkdown, "markdown", false, "Render the matched findings as Markdown (evidence + request/response in fenced http blocks) to stdout")
+	f.BoolVar(&findingTree, "tree", false, "Display as a host/path hierarchy tree; repeated titles collapse into one node with each affected URL listed below")
+	f.BoolVar(&findingMarkdown, "markdown", false, "Render the matched findings as Markdown (evidence + request/response in fenced http blocks) to stdout; response bodies are compacted to a preview by default (use --full-body for whole bodies)")
 	f.BoolVarP(&globalStateless, "stateless", "S", false, "Read from --db (a .jsonl export or standalone .sqlite) with project scoping off; never writes to your project DB")
+	f.StringVar(&globalGlobDB, "glob-db", "", "Read across a glob of result files merged into one temporary DB (e.g. --glob-db 'scans/*.sqlite'); implies -S")
 	f.BoolVar(&findingWithRecords, "with-records", false, "With --json: resolve and embed the linked HTTP records (self-contained triage bundle)")
 	f.StringSliceVar(&findingColumns, "columns", nil, "Columns to show (comma-separated, e.g. ID,SEVERITY,MODULE)")
 	f.StringSliceVar(&findingExclude, "exclude-columns", nil, "Columns to hide (comma-separated)")
+	f.StringVar(&findingPick, "pick", "", "Select finding(s) by 1-based position in the result list (e.g. 2, 1,3, 2-4); applied after --search/filters and sort")
 	registerAgentJSONFlags(f)
 	tui.AddFlags(findingCmd, &findingTUIFlag, &findingNoTUIFlag)
+
+	// Accept --sev as an alias for --severity. A normalize func routes the name
+	// to the same flag so both spellings share one value (registering a second
+	// flag bound to the same var would let one silently overwrite the other).
+	// Set globally so it reaches the merged parse-time set — --severity is a
+	// persistent flag, so a func on PersistentFlags() alone would not apply.
+	findingCmd.SetGlobalNormalizationFunc(func(_ *pflag.FlagSet, name string) pflag.NormalizedName {
+		if name == "sev" {
+			name = "severity"
+		}
+		return pflag.NormalizedName(name)
+	})
 }
 
 func runFinding(cmd *cobra.Command, args []string) error {
@@ -152,8 +182,17 @@ func runFinding(cmd *cobra.Command, args []string) error {
 	}
 
 	var fuzzyTerm string
+	// Argument routing mirrors traffic: "tree" activates tree mode, "ls"/"list"
+	// are no-ops (default table view), anything else is a fuzzy search term.
 	if len(args) == 1 {
-		fuzzyTerm = args[0]
+		switch strings.ToLower(args[0]) {
+		case "tree":
+			findingTree = true
+		case "ls", "list":
+			// no-op — default table view
+		default:
+			fuzzyTerm = args[0]
+		}
 	}
 
 	return runWithWatch(func() error {
@@ -175,6 +214,22 @@ func runFinding(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to query findings: %w", err)
 		}
 
+		// --pick narrows the fetched page to specific 1-based positions (after
+		// filters + sort). Applied here — before any display path — so it composes
+		// with --raw/--burp/--markdown/--json/--tui alike. The picked findings
+		// become the result set: total and offset are normalized together so the
+		// "Showing X of Y" summary and JSON stay internally consistent (otherwise
+		// a leftover non-zero --offset would desync into e.g. "Showing 11-1 of 1").
+		if findingPick != "" {
+			picked, perr := selectFindingsByPosition(findings, findingPick)
+			if perr != nil {
+				return perr
+			}
+			findings = picked
+			total = int64(len(findings))
+			findingOffset = 0
+		}
+
 		if active, tuiErr := tui.Active(findingTUIFlag, findingNoTUIFlag, globalJSON); tuiErr != nil {
 			return tuiErr
 		} else if active {
@@ -187,15 +242,164 @@ func runFinding(cmd *cobra.Command, args []string) error {
 
 		if globalJSON {
 			return displayFindingsJSON(ctx, db, findings, total, filters.ProjectUUID)
-		} else if findingMarkdown {
-			return displayFindingsMarkdown(ctx, db, findings)
-		} else if findingBurp {
-			return displayFindingsBurp(db, ctx, findings)
-		} else if findingRaw {
-			return displayFindingsRaw(db, ctx, findings)
 		}
-		return findingDisplayTable(db, ctx, findings, total)
+
+		// Echo the active filter conditions (severity, search, host, …) so it's
+		// clear the result set was narrowed and by what — and, for --severity,
+		// that a fuzzy token like 'me' resolved to 'medium'. Text modes only; JSON
+		// already carries the filters implicitly and must stay clean on stdout.
+		printActiveFindingFilters(filters, fuzzyTerm)
+
+		var renderErr error
+		switch {
+		case findingMarkdown:
+			renderErr = displayFindingsMarkdown(ctx, db, findings)
+		case findingBurp:
+			renderErr = displayFindingsBurp(db, ctx, findings)
+		case findingRaw:
+			renderErr = displayFindingsRaw(db, ctx, findings)
+		case findingTree:
+			warnIfCapped(len(findings), total) // top, so it's seen before a long tree
+			renderErr = displayFindingTree(db, ctx, findings, total)
+		default:
+			warnIfCapped(len(findings), total)
+			renderErr = findingDisplayTable(db, ctx, findings, total)
+		}
+		if renderErr != nil {
+			return renderErr
+		}
+		// Repeat at the bottom so it's also visible after scrolling a long list.
+		warnIfCapped(len(findings), total)
+		return nil
 	})
+}
+
+// selectFindingsByPosition narrows findings to the 1-based positions named by
+// spec — a comma list of single indices and A-B ranges (e.g. "2", "1,3",
+// "2-4"). Positions index into the already-filtered, already-sorted result
+// list; input order is preserved as written and duplicates are collapsed.
+// Out-of-range positions are warned about on stderr and skipped; a spec that
+// selects nothing from a non-empty list is an error naming the valid range.
+func selectFindingsByPosition(findings []*database.Finding, spec string) ([]*database.Finding, error) {
+	n := len(findings)
+	if n == 0 {
+		return findings, nil
+	}
+
+	positions, err := parsePositionSpec(spec)
+	if err != nil {
+		return nil, err
+	}
+
+	// Both collections hold at most one entry per distinct in-range position, so
+	// they can never exceed n — size to that, not to len(positions), which the
+	// spec can inflate well past the page size.
+	sizeHint := min(len(positions), n)
+	seen := make(map[int]bool, sizeHint)
+	picked := make([]*database.Finding, 0, sizeHint)
+	var outOfRange []int
+	for _, p := range positions {
+		if p < 1 || p > n {
+			outOfRange = append(outOfRange, p)
+			continue
+		}
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		picked = append(picked, findings[p-1])
+	}
+
+	if len(outOfRange) > 0 {
+		fmt.Fprintf(os.Stderr, "%s --pick: position(s) %s out of range (valid: 1-%d)\n",
+			terminal.WarningSymbol(), summarizeInts(outOfRange, 10), n)
+	}
+	if len(picked) == 0 {
+		return nil, fmt.Errorf("--pick %q selected no findings (valid range: 1-%d)", spec, n)
+	}
+	return picked, nil
+}
+
+// maxPickPositions caps how many positions a --pick spec may expand to. A
+// selection can never usefully exceed the result page (bounded by --limit), so
+// this rejects a fat-fingered range like "1-1000000" up front instead of
+// eagerly allocating millions of throwaway ints.
+const maxPickPositions = 10000
+
+// parsePositionSpec parses a comma list of 1-based positions and A-B ranges
+// (e.g. "2", "1,3", "2-4") into a flat, ordered slice. It validates syntax and
+// 1-based positivity but not against any result-set length, and bounds the
+// total expansion at maxPickPositions.
+func parsePositionSpec(spec string) ([]int, error) {
+	// parsePos parses one 1-based index; the caller wraps the error with the
+	// offending token so the single-index and range paths share one validation.
+	parsePos := func(s string) (int, error) {
+		v, err := strconv.Atoi(strings.TrimSpace(s))
+		if err != nil {
+			return 0, err
+		}
+		if v < 1 {
+			return 0, fmt.Errorf("positions are 1-based")
+		}
+		return v, nil
+	}
+
+	var positions []int
+	for _, tok := range strings.Split(spec, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		if lo, hi, isRange := strings.Cut(tok, "-"); isRange {
+			a, err := parsePos(lo)
+			if err != nil {
+				return nil, fmt.Errorf("invalid --pick range %q: %w", tok, err)
+			}
+			b, err := parsePos(hi)
+			if err != nil {
+				return nil, fmt.Errorf("invalid --pick range %q: %w", tok, err)
+			}
+			if a > b {
+				return nil, fmt.Errorf("invalid --pick range %q: start must be <= end", tok)
+			}
+			if b-a+1 > maxPickPositions {
+				return nil, fmt.Errorf("invalid --pick range %q: spans more than %d positions", tok, maxPickPositions)
+			}
+			for i := a; i <= b; i++ {
+				positions = append(positions, i)
+			}
+		} else {
+			v, err := parsePos(tok)
+			if err != nil {
+				return nil, fmt.Errorf("invalid --pick position %q: %w", tok, err)
+			}
+			positions = append(positions, v)
+		}
+		if len(positions) > maxPickPositions {
+			return nil, fmt.Errorf("--pick: too many positions (max %d)", maxPickPositions)
+		}
+	}
+	if len(positions) == 0 {
+		return nil, fmt.Errorf("--pick: no positions given")
+	}
+	return positions, nil
+}
+
+// summarizeInts renders nums as a comma-separated string, truncating to the
+// first max entries with a "(+N more)" suffix so an oversized spec can't dump a
+// huge warning line.
+func summarizeInts(nums []int, max int) string {
+	shown := nums
+	suffix := ""
+	if len(nums) > max {
+		shown = nums[:max]
+		suffix = fmt.Sprintf(" (+%d more)", len(nums)-max)
+	}
+	parts := make([]string, len(shown))
+	for i, v := range shown {
+		parts[i] = strconv.Itoa(v)
+	}
+	return strings.Join(parts, ", ") + suffix
 }
 
 func buildFindingFilters(fuzzyTerm string) (database.QueryFilters, error) {
@@ -217,9 +421,9 @@ func buildFindingFilters(fuzzyTerm string) (database.QueryFilters, error) {
 
 	var severities []string
 	if findingSeverity != "" {
-		severities = strings.Split(findingSeverity, ",")
+		severities = parseSeverityList(findingSeverity)
 	} else if findingMinSeverity != "" {
-		severities = severitiesAtOrAbove(findingMinSeverity)
+		severities = severitiesAtOrAbove(normalizeSeverity(findingMinSeverity))
 		if severities == nil {
 			return database.QueryFilters{}, fmt.Errorf("invalid --min-severity %q (want one of: %s)", findingMinSeverity, strings.Join(severityOrder, ", "))
 		}
@@ -239,30 +443,104 @@ func buildFindingFilters(fuzzyTerm string) (database.QueryFilters, error) {
 		return database.QueryFilters{}, err
 	}
 
+	recordKinds, err := parseRecordKinds(findingRecordKind)
+	if err != nil {
+		return database.QueryFilters{}, err
+	}
+
 	return database.QueryFilters{
-		ProjectUUID:   projectUUID,
-		FindingID:     findingID,
-		HostPattern:   findingHost,
-		Methods:       findingMethods,
-		StatusCodes:   findingStatus,
-		PathPattern:   findingPath,
-		Source:        findingSource,
-		ScanUUID:      findingScanUUID,
-		Severity:      severities,
-		Confidence:    confidences,
-		ModuleType:    findingModuleType,
-		FindingSource: findingFindingSource,
-		DateFrom:      dateFrom,
-		DateTo:        dateTo,
-		FuzzyTerm:     fuzzyTerm,
-		SearchTerm:    findingSearch,
-		HeaderSearch:  findingHeader,
-		BodySearch:    findingBody,
-		Limit:         findingLimit,
-		Offset:        findingOffset,
-		SortBy:        findingSort,
-		SortAsc:       findingAsc,
+		ProjectUUID:         projectUUID,
+		FindingID:           findingID,
+		HostPattern:         findingHost,
+		Methods:             findingMethods,
+		StatusCodes:         findingStatus,
+		PathPattern:         findingPath,
+		Source:              findingSource,
+		ScanUUID:            findingScanUUID,
+		Severity:            severities,
+		Confidence:          confidences,
+		ModuleType:          findingModuleType,
+		FindingSource:       findingFindingSource,
+		RecordKinds:         recordKinds,
+		DateFrom:            dateFrom,
+		DateTo:              dateTo,
+		FuzzyTerm:           fuzzyTerm,
+		SearchTerms:         findingSearch,
+		HeaderSearch:        findingHeader,
+		BodySearch:          findingBody,
+		ExcludeTerms:        findingExcludeSearch,
+		ExcludeHeaderSearch: findingExcludeHeader,
+		ExcludeBodySearch:   findingExcludeBody,
+		Limit:               findingLimit,
+		Offset:              findingOffset,
+		SortBy:              findingSort,
+		SortAsc:             findingAsc,
 	}, nil
+}
+
+func parseRecordKinds(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	allowed := map[string]bool{
+		database.RecordKindFinding: true, database.RecordKindCandidate: true, database.RecordKindObservation: true,
+	}
+	var kinds []string
+	for _, part := range strings.Split(raw, ",") {
+		kind := strings.ToLower(strings.TrimSpace(part))
+		if !allowed[kind] {
+			return nil, fmt.Errorf("invalid record kind %q (want finding, candidate, or observation)", part)
+		}
+		kinds = append(kinds, kind)
+	}
+	return kinds, nil
+}
+
+// printActiveFindingFilters prints a one-line summary of the filter conditions
+// actually in effect (e.g. "severity=medium,info · search=\"foo\""), or nothing
+// when no narrowing filter is set. It reads the built filters so the severity it
+// shows is the normalized/fuzzy-expanded value that was applied, giving the user
+// confirmation that a shorthand like 'me' resolved to 'medium'.
+func printActiveFindingFilters(filters database.QueryFilters, fuzzyTerm string) {
+	var s filterSummary
+	s.addQuoted("search", fuzzyTerm)
+	if len(filters.SearchTerms) > 0 {
+		s.addQuoted("search", strings.Join(filters.SearchTerms, " "))
+	}
+	// Severity: show the normalized list when --severity is set, or the expanded
+	// threshold set when --min-severity is used, so the fuzzy expansion is visible.
+	if findingSeverity != "" {
+		s.addSeverities("severity", filters.Severity)
+	} else if findingMinSeverity != "" {
+		s.addMinSeverity("min-severity", normalizeSeverity(findingMinSeverity), filters.Severity)
+	}
+	s.addConfidences("confidence", filters.Confidence)
+	s.add("host", filters.HostPattern)
+	s.add("path", filters.PathPattern)
+	s.add("method", strings.Join(filters.Methods, ","))
+	s.addInts("status", filters.StatusCodes)
+	s.add("header", filters.HeaderSearch)
+	s.add("body", filters.BodySearch)
+	if len(filters.ExcludeTerms) > 0 {
+		s.addQuoted("exclude-search", strings.Join(filters.ExcludeTerms, " "))
+	}
+	s.add("exclude-header", filters.ExcludeHeaderSearch)
+	s.add("exclude-body", filters.ExcludeBodySearch)
+	s.add("source", filters.Source)
+	s.add("scan-uuid", filters.ScanUUID)
+	s.add("agentic-scan", findingAgenticScan)
+	s.add("module-type", filters.ModuleType)
+	s.add("finding-source", filters.FindingSource)
+	if filters.FindingID != 0 {
+		s.add("id", strconv.Itoa(filters.FindingID))
+	}
+	if filters.DateFrom != nil {
+		s.add("from", filters.DateFrom.Format("2006-01-02"))
+	}
+	if filters.DateTo != nil {
+		s.add("to", filters.DateTo.Format("2006-01-02"))
+	}
+	s.print()
 }
 
 func displayFindingsJSON(ctx context.Context, db *database.DB, findings []*database.Finding, total int64, projectUUID string) error {
@@ -397,7 +675,10 @@ func recordsForFinding(byUUID map[string]*database.HTTPRecord, f *database.Findi
 	return records
 }
 
-func findingDisplayTable(db *database.DB, ctx context.Context, findings []*database.Finding, total int64) error {
+// printFindingsSummary prints the "Showing X-Y of Z findings" line plus the
+// project-wide severity and confidence breakdown. Shared by the default table
+// view and the tree view so both surface the same totals.
+func printFindingsSummary(db *database.DB, ctx context.Context, shown int, total int64) {
 	// Stateless counts across the whole file (effectiveProjectUUID returns "").
 	projectUUID, _ := effectiveProjectUUID()
 
@@ -428,7 +709,7 @@ func findingDisplayTable(db *database.DB, ctx context.Context, findings []*datab
 	fmt.Printf("%s Showing %d-%d of %d findings\n",
 		terminal.InfoSymbol(),
 		findingOffset+1,
-		min(findingOffset+len(findings), int(total)),
+		min(findingOffset+shown, int(total)),
 		total)
 	if sevLine != "" {
 		fmt.Printf("  %s Severity:  %s\n", terminal.Cyan(terminal.SymbolSparkle), sevLine)
@@ -437,6 +718,10 @@ func findingDisplayTable(db *database.DB, ctx context.Context, findings []*datab
 		fmt.Printf("  %s Confidence:%s\n", terminal.Cyan(terminal.SymbolSparkle2), confLine)
 	}
 	fmt.Println()
+}
+
+func findingDisplayTable(db *database.DB, ctx context.Context, findings []*database.Finding, total int64) error {
+	printFindingsSummary(db, ctx, len(findings), total)
 
 	cols := resolveFindingColumns(findingColumns, findingExclude)
 	if len(cols) == 0 {

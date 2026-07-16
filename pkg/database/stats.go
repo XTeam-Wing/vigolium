@@ -270,16 +270,19 @@ func (db *DB) getPerformanceStats(ctx context.Context, stats *DatabaseStats, fil
 	stats.Performance.MinResponseTime = result.Min
 	stats.Performance.MaxResponseTime = result.Max
 
-	// Single-pass percentile calculation using ROW_NUMBER window function
+	// Single-pass percentile calculation: rank the with-response set once with a
+	// ROW_NUMBER window and pluck all three percentile rows in one query, instead
+	// of three separate `ORDER BY ... LIMIT 1 OFFSET n` full sorts of the same
+	// (unindexed) column.
 	withResp := stats.Records.WithResponse
 	if withResp > 0 {
-		p50Idx := withResp / 2
-		p95Idx := withResp * 95 / 100
-		p99Idx := withResp * 99 / 100
-
-		stats.Performance.P50ResponseTime = db.responseTimeAt(ctx, filters, int(p50Idx))
-		stats.Performance.P95ResponseTime = db.responseTimeAt(ctx, filters, int(p95Idx))
-		stats.Performance.P99ResponseTime = db.responseTimeAt(ctx, filters, int(p99Idx))
+		p50, p95, p99, err := db.responseTimePercentiles(ctx, filters, int(withResp))
+		if err != nil {
+			return err
+		}
+		stats.Performance.P50ResponseTime = p50
+		stats.Performance.P95ResponseTime = p95
+		stats.Performance.P99ResponseTime = p99
 	}
 
 	return nil
@@ -342,7 +345,10 @@ func (db *DB) getScanSessionStats(ctx context.Context, stats *DatabaseStats, fil
 	return nil
 }
 
-// GetTopHosts retrieves top hosts by request count with finding counts in a single query.
+// GetTopHosts retrieves top hosts by request count with per-host finding counts.
+// It uses a constant TWO queries — one for the top hosts, one grouped
+// finding-count query — instead of the previous 1 + N (a per-host count query),
+// so its cost no longer grows with the requested host limit.
 func (db *DB) GetTopHosts(ctx context.Context, filters QueryFilters, limit int) ([]HostStats, error) {
 	type hostRow struct {
 		Scheme       string `bun:"scheme"`
@@ -363,20 +369,51 @@ func (db *DB) GetTopHosts(ctx context.Context, filters QueryFilters, limit int) 
 		return nil, err
 	}
 
+	// Finding counts per ORIGIN (scheme, hostname, port) in ONE grouped query, so
+	// the key matches the request-count rows above. Grouping by hostname alone
+	// assigned the same hostname-wide count to every origin sharing the hostname
+	// (e.g. :80 and :443, or :8080 and :3000), over-attributing findings. Clear any
+	// incoming HostPattern so every origin is counted at once. COUNT(DISTINCT f.id)
+	// counts a finding once per origin even when linked to several of that origin's
+	// records.
+	fcFilters := filters
+	fcFilters.HostPattern = ""
+	type fcRow struct {
+		Scheme   string `bun:"scheme"`
+		Hostname string `bun:"hostname"`
+		Port     int    `bun:"port"`
+		Count    int64  `bun:"fc"`
+	}
+	var fcRows []fcRow
+	if err := db.scopedFindingsQuery(fcFilters).
+		Join("INNER JOIN finding_records AS fr ON fr.finding_id = f.id").
+		Join("INNER JOIN http_records AS r ON r.uuid = fr.record_uuid").
+		ColumnExpr("r.scheme AS scheme").
+		ColumnExpr("r.hostname AS hostname").
+		ColumnExpr("r.port AS port").
+		ColumnExpr("COUNT(DISTINCT f.id) AS fc").
+		GroupExpr("r.scheme, r.hostname, r.port").
+		Scan(ctx, &fcRows); err != nil {
+		return nil, err
+	}
+	type hostOrigin struct {
+		Scheme   string
+		Hostname string
+		Port     int
+	}
+	fcByOrigin := make(map[hostOrigin]int64, len(fcRows))
+	for _, fr := range fcRows {
+		fcByOrigin[hostOrigin{fr.Scheme, fr.Hostname, fr.Port}] = fr.Count
+	}
+
 	hostStats := make([]HostStats, 0, len(rows))
 	for _, r := range rows {
-		findingFilters := filters
-		findingFilters.HostPattern = r.Hostname
-		findingCount, err := db.countScopedFindings(ctx, findingFilters)
-		if err != nil {
-			return nil, err
-		}
 		hostStats = append(hostStats, HostStats{
 			Scheme:       r.Scheme,
 			Hostname:     r.Hostname,
 			Port:         r.Port,
 			RequestCount: r.RequestCount,
-			FindingCount: int64(findingCount),
+			FindingCount: fcByOrigin[hostOrigin{r.Scheme, r.Hostname, r.Port}],
 		})
 	}
 
@@ -403,22 +440,43 @@ func (db *DB) countScopedFindings(ctx context.Context, filters QueryFilters) (in
 		Count(ctx)
 }
 
-func (db *DB) responseTimeAt(ctx context.Context, filters QueryFilters, offset int) int64 {
-	if offset < 1 {
-		offset = 1
+// responseTimePercentiles computes P50/P95/P99 of response_time_ms over the
+// scoped with-response set in a single query. It ranks rows once with
+// ROW_NUMBER() (1-based ascending) inside a CTE, then selects the three ranked
+// rows, avoiding the three independent full sorts the previous OFFSET approach
+// incurred on the unindexed column. The rank indices mirror the old 1-based
+// offsets (clamped to >= 1).
+func (db *DB) responseTimePercentiles(ctx context.Context, filters QueryFilters, withResp int) (p50, p95, p99 int64, err error) {
+	rank := func(pct int) int {
+		idx := withResp * pct / 100
+		if idx < 1 {
+			idx = 1
+		}
+		return idx
 	}
-	var value int64
-	err := db.scopedRecordsQuery(filters).
-		Column("response_time_ms").
-		Where("has_response = ?", true).
-		Order("response_time_ms ASC").
-		Limit(1).
-		Offset(offset-1).
-		Scan(ctx, &value)
+	p50Rank, p95Rank, p99Rank := rank(50), rank(95), rank(99)
+
+	ordered := db.scopedRecordsQuery(filters).
+		ColumnExpr("response_time_ms AS rt").
+		ColumnExpr("ROW_NUMBER() OVER (ORDER BY response_time_ms ASC) AS rn").
+		Where("has_response = ?", true)
+
+	var res struct {
+		P50 int64
+		P95 int64
+		P99 int64
+	}
+	err = db.NewSelect().
+		With("pctl_ordered", ordered).
+		TableExpr("pctl_ordered").
+		ColumnExpr("COALESCE(MAX(CASE WHEN rn = ? THEN rt END), 0) AS p50", p50Rank).
+		ColumnExpr("COALESCE(MAX(CASE WHEN rn = ? THEN rt END), 0) AS p95", p95Rank).
+		ColumnExpr("COALESCE(MAX(CASE WHEN rn = ? THEN rt END), 0) AS p99", p99Rank).
+		Scan(ctx, &res)
 	if err != nil {
-		return 0
+		return 0, 0, 0, err
 	}
-	return value
+	return res.P50, res.P95, res.P99, nil
 }
 
 // FormatStats formats statistics as a human-readable string

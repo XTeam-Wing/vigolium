@@ -89,6 +89,10 @@ test/integration/*-test/
 **/vigolium-results/findings-draft/
 **/vigolium-results/longshot/
 **/vigolium-results/attack-surface/
+**/vigolium-results/codeql-artifacts/
+**/vigolium-results/codeql-queries/
+**/vigolium-results/semgrep-res/
+**/vigolium-results/semgrep-rules/
 **/piolium/audit-state.json
 **/piolium/file-records/
 **/piolium/attack-surface/
@@ -96,8 +100,8 @@ test/integration/*-test/
 
 # some binaries and outputs from the skill that we don't want to accidentally commit
 # better to ignore the whole directory since there are multiple outputs and it can be hard to keep track of them all
-public/presets/deparos/jsscan/jsscan-*
-internal/resources/deparos/jsscan/*
+public/presets/deparos/jstangle/jstangle-*
+internal/resources/deparos/jstangle/*
 
 internal/resources/spitolas/chromium/*
 
@@ -111,4 +115,9 @@ build/dist-license/
 build/dist-public/
 build/dist-npm/
 build/public-install.sh
+
+# Archon audit SAST working artifacts
+/archon/codeql-artifacts/
+/archon/codeql-queries/
+/archon/semgrep-res/
 .codegraph/

@@ -55,12 +55,7 @@ func (r *Repository) SaveFinding(ctx context.Context, event *output.ResultEvent,
 // finding can't drop the rest — preserving the error isolation of per-finding
 // SaveFinding while keeping the fast path a single transaction.
 func (r *Repository) SaveFindingsBatch(ctx context.Context, writes []FindingWrite) error {
-	type prepared struct {
-		finding     *Finding
-		recordUUIDs []string
-		inserted    bool
-	}
-	items := make([]prepared, 0, len(writes))
+	findings := make([]*Finding, 0, len(writes))
 	for i := range writes {
 		w := &writes[i]
 		if w.Event == nil {
@@ -75,47 +70,12 @@ func (r *Repository) SaveFindingsBatch(ctx context.Context, writes []FindingWrit
 			zap.L().Warn("SaveFindingsBatch: skipping unconvertible finding", zap.Error(err))
 			continue
 		}
-		items = append(items, prepared{finding: f, recordUUIDs: w.HTTPRecordUUIDs})
+		findings = append(findings, f)
 	}
-	if len(items) == 0 {
+	if len(findings) == 0 {
 		return nil
 	}
-
-	err := r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
-		for i := range items {
-			inserted, err := r.saveFindingIDB(ctx, tx, items[i].finding, items[i].recordUUIDs)
-			if err != nil {
-				return err
-			}
-			items[i].inserted = inserted
-		}
-		return nil
-	})
-	if err == nil {
-		// Fire hooks only after the transaction commits, so a mirror never sees a
-		// finding that was rolled back.
-		for i := range items {
-			if items[i].inserted {
-				r.emitFindingSaved(items[i].finding)
-			}
-		}
-		return nil
-	}
-
-	// Transaction failed — retry each finding on its own so a single bad finding
-	// doesn't sink the whole batch.
-	zap.L().Warn("SaveFindingsBatch: transaction failed, retrying findings individually", zap.Error(err))
-	var firstErr error
-	for i := range items {
-		inserted, e := r.saveFindingIDB(ctx, r.db, items[i].finding, items[i].recordUUIDs)
-		if inserted {
-			r.emitFindingSaved(items[i].finding)
-		}
-		if e != nil && firstErr == nil {
-			firstErr = e
-		}
-	}
-	return firstErr
+	return firstResultErr(r.saveFindingsBatchCore(ctx, findings))
 }
 
 // saveFindingIDB inserts a single finding using the given bun.IDB, which may be
@@ -142,7 +102,7 @@ func (r *Repository) saveFindingIDB(ctx context.Context, idb bun.IDB, finding *F
 	// If ON CONFLICT fired, no row was inserted — append records and evidence to existing finding
 	if finding.FindingHash != "" {
 		if n, _ := res.RowsAffected(); n == 0 {
-			return false, r.appendRecordsToFinding(ctx, idb, finding.ProjectUUID, finding.FindingHash, httpRecordUUIDs, buildEvidence(finding.Request, finding.Response))
+			return false, r.appendRecordsToFinding(ctx, idb, finding.ProjectUUID, finding.FindingHash, httpRecordUUIDs, buildEvidence(finding.Request, finding.Response), finding.ScanUUID)
 		}
 	}
 
@@ -154,18 +114,114 @@ func (r *Repository) saveFindingIDB(ctx context.Context, idb bun.IDB, finding *F
 // SaveFindingDirect inserts a pre-built Finding directly (without ResultEvent conversion).
 // Uses INSERT ON CONFLICT for atomic dedup when finding_hash is non-empty.
 func (r *Repository) SaveFindingDirect(ctx context.Context, finding *Finding) error {
+	_, err := r.SaveFindingReported(ctx, finding)
+	return err
+}
+
+// SaveFindingReported is SaveFindingDirect that additionally reports whether a
+// new finding row was inserted (true) vs collapsed into an existing finding by
+// dedup (false). The autopilot report_finding tool uses it so its run counter
+// only tallies distinct findings.
+func (r *Repository) SaveFindingReported(ctx context.Context, finding *Finding) (bool, error) {
 	if finding == nil {
-		return fmt.Errorf("invalid Finding")
+		return false, fmt.Errorf("invalid Finding")
 	}
 
 	finding.ProjectUUID = defaultProjectUUID(finding.ProjectUUID)
 
 	inserted, err := r.saveFindingIDB(ctx, r.db, finding, finding.HTTPRecordUUIDs)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if inserted {
 		r.emitFindingSaved(finding)
+	}
+	return inserted, nil
+}
+
+// FindingSaveResult reports the outcome of persisting one finding in a batched
+// direct save, aligned by index with the input slice passed to
+// SaveFindingsDirectBatch.
+type FindingSaveResult struct {
+	Inserted bool  // a new finding row was written (false on a dedup-append to an existing finding)
+	Err      error // non-nil if this finding failed to save
+}
+
+// SaveFindingsDirectBatch persists a batch of pre-built findings in a single
+// transaction — the batch analogue of SaveFindingDirect, used by bulk importers
+// to coalesce what would otherwise be one transaction (and fsync) per finding.
+// The returned slice is aligned with the input; the top-level error is the first
+// per-finding error, if any.
+func (r *Repository) SaveFindingsDirectBatch(ctx context.Context, findings []*Finding) ([]FindingSaveResult, error) {
+	for _, f := range findings {
+		if f != nil {
+			f.ProjectUUID = defaultProjectUUID(f.ProjectUUID)
+		}
+	}
+	results := r.saveFindingsBatchCore(ctx, findings)
+	return results, firstResultErr(results)
+}
+
+// saveFindingsBatchCore persists pre-built findings in one transaction, retrying
+// each finding individually if the transaction fails so one bad finding can't
+// drop the rest, and firing OnFindingSaved hooks only after commit so a mirror
+// never sees a rolled-back finding. nil entries are tolerated (zero-value
+// result). The returned slice is aligned with the input. This is the shared
+// engine behind SaveFindingsBatch (which adapts []FindingWrite) and
+// SaveFindingsDirectBatch (pre-built []*Finding); callers own input conversion
+// and ProjectUUID defaulting.
+func (r *Repository) saveFindingsBatchCore(ctx context.Context, findings []*Finding) []FindingSaveResult {
+	results := make([]FindingSaveResult, len(findings))
+	if len(findings) == 0 {
+		return results
+	}
+
+	err := r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+		for i, f := range findings {
+			if f == nil {
+				continue
+			}
+			inserted, err := r.saveFindingIDB(ctx, tx, f, f.HTTPRecordUUIDs)
+			if err != nil {
+				return err
+			}
+			results[i].Inserted = inserted
+		}
+		return nil
+	})
+	if err == nil {
+		for i, f := range findings {
+			if results[i].Inserted {
+				r.emitFindingSaved(f)
+			}
+		}
+		return results
+	}
+
+	zap.L().Warn("saveFindingsBatchCore: transaction failed, retrying findings individually", zap.Error(err))
+	for i, f := range findings {
+		results[i] = FindingSaveResult{}
+		if f == nil {
+			continue
+		}
+		inserted, e := r.saveFindingIDB(ctx, r.db, f, f.HTTPRecordUUIDs)
+		results[i].Inserted = inserted
+		results[i].Err = e
+		if inserted {
+			r.emitFindingSaved(f)
+		}
+	}
+	return results
+}
+
+// firstResultErr returns the first non-nil per-finding error in a batch result,
+// collapsing the aligned results into the single-error contract used by callers
+// (e.g. SaveFindingsBatch) that don't need per-finding outcomes.
+func firstResultErr(results []FindingSaveResult) error {
+	for i := range results {
+		if results[i].Err != nil {
+			return results[i].Err
+		}
 	}
 	return nil
 }
@@ -208,7 +264,7 @@ func (r *Repository) insertFindingRecords(ctx context.Context, idb bun.IDB, find
 // record UUIDs and additional evidence (request/response pair) to it. The lookup is
 // project-scoped so evidence from one project is never merged into another project's
 // finding, even when both share a finding_hash.
-func (r *Repository) appendRecordsToFinding(ctx context.Context, idb bun.IDB, projectUUID, findingHash string, newUUIDs []string, evidence string) error {
+func (r *Repository) appendRecordsToFinding(ctx context.Context, idb bun.IDB, projectUUID, findingHash string, newUUIDs []string, evidence string, scanUUID string) error {
 	// Only fetch the (potentially large) request/response bodies when there's
 	// evidence to append — they're needed solely to dedup against the survivor's
 	// own primary pair below.
@@ -230,6 +286,17 @@ func (r *Repository) appendRecordsToFinding(ctx context.Context, idb bun.IDB, pr
 	q := idb.NewUpdate().Model((*Finding)(nil)).
 		Set("http_record_uuids = ?", merged).
 		Where("id = ?", existing.ID)
+
+	// Attribute the finding to the scan that most recently observed it. Finding
+	// uniqueness is project-wide, so the earliest row is kept — but leaving its
+	// scan_uuid pinned to the FIRST scan means a re-detected finding silently
+	// escapes the current scan's fail-on gate, printed summary, and scan-scoped
+	// report. Bumping scan_uuid to the re-detecting scan keeps the finding
+	// attributed to the run that actually saw it. Skipped when the re-detection
+	// carries no scan id (e.g. an out-of-band import).
+	if scanUUID != "" {
+		q = q.Set("scan_uuid = ?", scanUUID)
+	}
 
 	// Skip evidence that just duplicates the survivor's own primary
 	// request/response (or an entry it already has) — otherwise re-emitting the
@@ -260,6 +327,40 @@ func (r *Repository) GetFindingByID(ctx context.Context, id int64) (*Finding, er
 	return finding, nil
 }
 
+// HydrateFindingRequests populates the Request field on findings that were
+// loaded without it — the list query (FindingsQueryBuilder) omits the
+// request/response blobs for speed. It fetches id→request for the given findings
+// in a single round-trip; findings that already carry a Request, or that have no
+// id, are skipped. Used by display paths that need a finding's own PoC request
+// (e.g. the tree's attack-URL rendering) without pulling the full raw view.
+func (r *Repository) HydrateFindingRequests(ctx context.Context, findings []*Finding) {
+	idx := make(map[int64]*Finding, len(findings))
+	ids := make([]int64, 0, len(findings))
+	for _, f := range findings {
+		if f == nil || f.ID == 0 || f.Request != "" {
+			continue
+		}
+		idx[f.ID] = f
+		ids = append(ids, f.ID)
+	}
+	if len(ids) == 0 {
+		return
+	}
+	var loaded []*Finding
+	if err := r.db.NewSelect().
+		Model(&loaded).
+		Column("id", "request").
+		Where("id IN (?)", bun.List(ids)).
+		Scan(ctx); err != nil {
+		return
+	}
+	for _, row := range loaded {
+		if f, ok := idx[row.ID]; ok {
+			f.Request = row.Request
+		}
+	}
+}
+
 // GetFindingsByRecordUUID retrieves findings that reference a specific HTTP record UUID.
 // Since http_record_uuids is a JSONB array, we use json_each to search inside it.
 func (r *Repository) GetFindingsByRecordUUID(ctx context.Context, uuid string) ([]*Finding, error) {
@@ -267,6 +368,7 @@ func (r *Repository) GetFindingsByRecordUUID(ctx context.Context, uuid string) (
 	err := r.db.NewSelect().
 		Model(&findings).
 		Where("f.id IN (SELECT finding_id FROM finding_records WHERE record_uuid = ?)", uuid).
+		Where("(f.record_kind IS NULL OR f.record_kind = '' OR f.record_kind = ?)", RecordKindFinding).
 		Order("found_at DESC").
 		Scan(ctx)
 	if err != nil {
@@ -290,6 +392,7 @@ func (r *Repository) GetFindingsBySeverity(ctx context.Context, projectUUID, sev
 	q := r.db.NewSelect().
 		Model(&findings).
 		Where("severity = ?", sev).
+		Where("(record_kind IS NULL OR record_kind = '' OR record_kind = ?)", RecordKindFinding).
 		Order("found_at DESC").
 		Limit(limit)
 	if projectUUID != "" {

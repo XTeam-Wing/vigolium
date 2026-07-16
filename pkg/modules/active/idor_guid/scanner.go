@@ -29,6 +29,34 @@ var idParamNames = []string{
 	"doc_id", "docid", "file_id", "fileid", "asset_id", "assetid",
 }
 
+// nonObjectControlParams are exact (lowercased) parameter names that carry a
+// pagination window, a request/version counter, an index, or a timestamp rather
+// than an enumerable object reference. Incrementing one of them returns "a valid
+// different resource" — the next page, the next request, the next framework
+// revision — *by design*, so the neighbor-differs oracle fires on every one of
+// them. These are the systematic idor-guid false positives observed in the wild
+// (page_number / page_size / limit pagination, and Salesforce Aura's r request
+// counter and _dfs definition-service version). Matched only when the name is
+// NOT itself an id name, so a genuine _id / account_id is still tested.
+var nonObjectControlParams = map[string]struct{}{
+	// pagination / windowing
+	"page": {}, "pageno": {}, "page_no": {}, "pagenum": {}, "page_num": {},
+	"pagenumber": {}, "page_number": {}, "pagesize": {}, "page_size": {},
+	"perpage": {}, "per_page": {}, "pagecount": {}, "page_count": {},
+	"limit": {}, "offset": {}, "count": {}, "size": {}, "length": {}, "len": {},
+	"rows": {}, "rowcount": {}, "start": {}, "end": {}, "skip": {}, "take": {},
+	"top": {}, "first": {}, "last": {}, "max": {}, "min": {}, "maxresults": {},
+	"cursor": {}, "from": {}, "to": {}, "num": {}, "results": {},
+	// counters / versions / indices / sequence
+	"r": {}, "v": {}, "n": {}, "i": {}, "p": {}, "seq": {}, "sequence": {},
+	"ver": {}, "version": {}, "rev": {}, "revision": {}, "idx": {}, "index": {},
+	"iteration": {}, "iter": {}, "attempt": {}, "retry": {}, "depth": {},
+	"level": {}, "lvl": {}, "step": {}, "part": {}, "chunk": {}, "batch": {},
+	// time / cache-busting / randomness
+	"t": {}, "ts": {}, "time": {}, "timestamp": {}, "cb": {}, "cachebuster": {},
+	"nocache": {}, "rnd": {}, "rand": {}, "random": {}, "cache": {},
+}
+
 // Module implements the IDOR GUID Predictability active scanner.
 type Module struct {
 	modkit.BaseActiveModule
@@ -178,8 +206,14 @@ func (m *Module) tryPredictedID(
 	// A finding is reported when:
 	// 1. The predicted ID returns 200 OK
 	// 2. The response body length > 100 (not empty/trivial)
-	// 3. The status matches the original but body content differs (different resource)
-	if respStatus == 200 && len(respBody) > 100 && respStatus == baselineStatus && respBody != baselineBody {
+	// 3. The status matches the original but the body differs SUBSTANTIALLY (a
+	//    genuinely different resource). An exact byte inequality (respBody !=
+	//    baselineBody) triggers on any single differing byte — a CSRF nonce, a
+	//    timestamp, a request-id echo — so an authenticated page with per-request
+	//    tokens looks like a "different object" on every predicted id. Requiring a
+	//    substantial difference (below the token-similarity floor) rules that out; a
+	//    real cross-object reference returns different DATA, not a re-nonced same page.
+	if respStatus == 200 && len(respBody) > 100 && respStatus == baselineStatus && !modkit.BodiesSimilar(respBody, baselineBody) {
 		// Content gate: a predicted-id response that is itself a login / SSO
 		// challenge (or an access-denied notice) is NOT a distinct object — it is
 		// the generic unauthenticated shell every protected endpoint returns, and
@@ -342,9 +376,27 @@ func qualifiesAsIDORCandidate(ip httpmsg.InsertionPoint, name, value string) boo
 		return false
 	}
 
+	// Pagination / counter / version / framework-control parameters carry a
+	// windowing or sequencing value, not an enumerable object reference. Their
+	// ±1 neighbor legitimately returns a different page / request / revision, so
+	// the neighbor-differs oracle false-positives on every one of them. Suppress
+	// them, but only when the name is NOT itself an id name so a genuine
+	// Mongo-style _id or account_id is still tested.
+	if !idNamed && isNonObjectControlParam(name) {
+		return false
+	}
+
 	// An ID-named parameter is always worth testing, whatever the value shape.
 	if idNamed {
 		return true
+	}
+
+	// A large epoch-like numeric (a 13-digit millisecond timestamp such as the
+	// Salesforce static-resource cache key in /resource/1603755438000/NavStyleSheet)
+	// is a cache-buster / version stamp, not an object id — its ±1 neighbor is
+	// meaningless. Only applied to non-id-named values, so ?id=<ts> is untouched.
+	if looksLikeEpochTimestamp(value) {
+		return false
 	}
 
 	// Otherwise the VALUE must itself look like an object reference: a UUID, or a
@@ -353,6 +405,35 @@ func qualifiesAsIDORCandidate(ip httpmsg.InsertionPoint, name, value string) boo
 		return true
 	}
 	return isNumeric(value) && !isFlagValue(value)
+}
+
+// isNonObjectControlParam reports whether a lowercased parameter name is a known
+// pagination / counter / version / index / timestamp control parameter rather
+// than an object reference. Underscore-prefixed names (`_dfs`, `_lrmc`,
+// `_style`, … — the framework-reserved convention used by Salesforce Aura and
+// others) are treated as control parameters too; the caller only reaches this
+// for non-id-named parameters, so a Mongo-style `_id` never lands here.
+func isNonObjectControlParam(name string) bool {
+	nameLower := strings.ToLower(name)
+	if strings.HasPrefix(nameLower, "_") {
+		return true
+	}
+	_, ok := nonObjectControlParams[nameLower]
+	return ok
+}
+
+// looksLikeEpochTimestamp reports whether a value is a 13-digit millisecond
+// epoch timestamp in a plausible recent window (2001-09 .. 2033-05). Such values
+// are cache-busters / last-modified stamps, not enumerable identifiers.
+func looksLikeEpochTimestamp(value string) bool {
+	if len(value) != 13 {
+		return false
+	}
+	n, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return false
+	}
+	return n >= 1_000_000_000_000 && n <= 2_000_000_000_000
 }
 
 // isFlagValue reports whether a numeric string is a boolean/flag value (0 or 1)

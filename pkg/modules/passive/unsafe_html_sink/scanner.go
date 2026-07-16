@@ -20,13 +20,22 @@ type sinkPattern struct {
 	severity severity.Severity
 	cwe      string
 	category string
+	// emptyCheck, when set, drops a match whose sink is delivered an empty string
+	// literal (el.innerHTML="", document.write("")): a clearing/no-op write that
+	// carries no markup and cannot be an injection point.
+	emptyCheck bool
 }
 
 // Compiled patterns at package level.
 var sinkPatterns = []sinkPattern{
 	{
-		name:     "dangerouslySetInnerHTML (React)",
-		pattern:  regexp.MustCompile(`dangerouslySetInnerHTML`),
+		name: "dangerouslySetInnerHTML (React)",
+		// Require an actual JSX/object assignment (`dangerouslySetInnerHTML={...}`
+		// or minified `dangerouslySetInnerHTML:{__html:x}`), not a bare mention of
+		// the prop name. React's own runtime bundle (main-*.js) ships a prop-filter
+		// that string-compares the name (`"dangerouslySetInnerHTML"!==a`); a bare
+		// pattern matched that on every React site — the dominant false positive.
+		pattern:  regexp.MustCompile(`dangerouslySetInnerHTML\s*[:=]`),
 		severity: severity.Low,
 		cwe:      "CWE-79",
 		category: "framework-xss",
@@ -53,18 +62,20 @@ var sinkPatterns = []sinkPattern{
 		category: "framework-xss",
 	},
 	{
-		name:     "innerHTML assignment",
-		pattern:  regexp.MustCompile(`\.innerHTML\s*=`),
-		severity: severity.Low,
-		cwe:      "CWE-79",
-		category: "dom-xss",
+		name:       "innerHTML assignment",
+		pattern:    regexp.MustCompile(`\.innerHTML\s*=`),
+		severity:   severity.Low,
+		cwe:        "CWE-79",
+		category:   "dom-xss",
+		emptyCheck: true,
 	},
 	{
-		name:     "outerHTML assignment",
-		pattern:  regexp.MustCompile(`\.outerHTML\s*=`),
-		severity: severity.Low,
-		cwe:      "CWE-79",
-		category: "dom-xss",
+		name:       "outerHTML assignment",
+		pattern:    regexp.MustCompile(`\.outerHTML\s*=`),
+		severity:   severity.Low,
+		cwe:        "CWE-79",
+		category:   "dom-xss",
+		emptyCheck: true,
 	},
 	{
 		name:     "insertAdjacentHTML call",
@@ -74,11 +85,12 @@ var sinkPatterns = []sinkPattern{
 		category: "dom-xss",
 	},
 	{
-		name:     "document.write call",
-		pattern:  regexp.MustCompile(`document\.write\s*\(`),
-		severity: severity.Low,
-		cwe:      "CWE-79",
-		category: "dom-xss",
+		name:       "document.write call",
+		pattern:    regexp.MustCompile(`document\.write\s*\(`),
+		severity:   severity.Low,
+		cwe:        "CWE-79",
+		category:   "dom-xss",
+		emptyCheck: true,
 	},
 	{
 		name:     "eval() call",
@@ -94,6 +106,19 @@ var sinkPatterns = []sinkPattern{
 		cwe:      "CWE-94",
 		category: "code-injection",
 	},
+}
+
+// assignsEmptyLiteral reports whether the text immediately following a sink
+// match (the value being assigned to .innerHTML/.outerHTML or passed to
+// document.write) is an empty string literal: an empty pair of double quotes,
+// single quotes, or backticks. Such writes clear or no-op the target and carry
+// no markup, so they are not injection points. The match already consumed the
+// = or ( so rest starts at the value.
+func assignsEmptyLiteral(rest string) bool {
+	rest = strings.TrimLeft(rest, " \t\r\n")
+	return strings.HasPrefix(rest, `""`) ||
+		strings.HasPrefix(rest, `''`) ||
+		strings.HasPrefix(rest, "``")
 }
 
 // Module implements the unsafe HTML sink passive scanner.
@@ -161,7 +186,10 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 	}
 
 	// Dedup by host+path
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
+	var diskSet *dedup.DiskSet
+	if scanCtx != nil {
+		diskSet = m.ds.Get(scanCtx.DedupMgr())
+	}
 	dedupKey := utils.Sha1(fmt.Sprintf("%s%s", urlx.Host, urlx.Path))
 	if diskSet != nil && diskSet.IsSeen(dedupKey) {
 		return nil, nil
@@ -176,8 +204,8 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 	var results []*output.ResultEvent
 
 	for _, sp := range sinkPatterns {
-		// Skip eval() detection for test/spec/mock files
-		if sp.category == "code-injection" && sp.name == "eval() call" && isTestFile {
+		// Test/spec/mock code intentionally exercises both eval and Function.
+		if sp.category == "code-injection" && isTestFile {
 			continue
 		}
 
@@ -190,6 +218,12 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 		for _, loc := range matches {
 			start := loc[0]
 			end := loc[1]
+			// Drop clearing/no-op sink writes that deliver an empty string literal
+			// (el.innerHTML="", document.write("")) — they carry no markup and are a
+			// common framework pattern, not an injection point.
+			if sp.emptyCheck && assignsEmptyLiteral(body[end:]) {
+				continue
+			}
 			// Expand context: up to 40 chars before and after the match
 			ctxStart := start - 40
 			if ctxStart < 0 {
@@ -202,25 +236,36 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 			snippet := strings.TrimSpace(body[ctxStart:ctxEnd])
 			extracted = append(extracted, modkit.Truncate(snippet, 150))
 		}
+		// Every match was an inert empty write — nothing to report for this sink.
+		if len(extracted) == 0 {
+			continue
+		}
 
 		results = append(results, &output.ResultEvent{
 			ModuleID:         ModuleID,
+			RecordKind:       output.RecordKindObservation,
+			EvidenceGrade:    output.EvidenceGradeObservation,
 			Host:             urlx.Host,
 			URL:              urlx.String(),
 			Matched:          urlx.String(),
+			Request:          string(ctx.Request().Raw()),
+			Response:         string(ctx.Response().Raw()),
 			ExtractedResults: extracted,
 			Info: output.Info{
 				Name:        fmt.Sprintf("Unsafe HTML Sink: %s", sp.name),
-				Description: fmt.Sprintf("Found %d occurrence(s) of %s in %s (%s)", len(matches), sp.name, urlx.Path, sp.cwe),
+				Description: fmt.Sprintf("Found %d occurrence(s) of %s in %s (%s). Sink presence is retained as an observation; no attacker-controlled source-to-sink flow or sanitizer analysis was established.", len(extracted), sp.name, urlx.Path, sp.cwe),
 				Severity:    sp.severity,
 				Confidence:  ModuleConfidence,
 				Tags:        []string{"xss", "injection", "source-analysis"},
 			},
 			Metadata: map[string]any{
-				"sink":       sp.name,
-				"cwe":        sp.cwe,
-				"category":   sp.category,
-				"matchCount": len(matches),
+				"sink":                   sp.name,
+				"cwe":                    sp.cwe,
+				"category":               sp.category,
+				"matchCount":             len(extracted),
+				"connected_source":       false,
+				"sanitizer_assessed":     false,
+				"taint_module_available": true,
 			},
 		})
 	}

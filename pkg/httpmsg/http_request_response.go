@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/textproto"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -170,6 +172,13 @@ func (h *HttpRequestResponse) BuildRetryableRequest() (*retryablehttp.Request, e
 	}
 	for _, header := range h.request.Headers() {
 		req.Header.Add(header.Name, header.Value)
+		if strings.EqualFold(header.Name, "Host") {
+			// Go transmits the Host header from req.Host, not req.Header["Host"];
+			// mirror an explicit/overridden Host here so it actually reaches the
+			// wire (host-header-injection probes, captured vhost authority).
+			// The dial target stays req.URL.Host, so only the sent Host: changes.
+			req.Host = header.Value
+		}
 	}
 	return req, nil
 }
@@ -234,8 +243,11 @@ func (h *HttpRequestResponse) MarshalJSON() ([]byte, error) {
 	type responsePayload struct {
 		StatusCode int          `json:"status_code"`
 		Headers    []HttpHeader `json:"headers"`
-		Body       string       `json:"body,omitempty"`
 		Raw        string       `json:"raw"`
+		// Note: the body is intentionally not serialized separately — Raw already
+		// contains it verbatim, and UnmarshalJSON reconstructs the response from
+		// Raw alone. Emitting a redundant "body" field meant a second full
+		// JSON-escape pass over the body and ~doubled the serialized body size.
 	}
 	type envelope struct {
 		URL      string           `json:"url"`
@@ -256,7 +268,6 @@ func (h *HttpRequestResponse) MarshalJSON() ([]byte, error) {
 		env.Response = &responsePayload{
 			StatusCode: h.response.StatusCode(),
 			Headers:    h.response.Headers(),
-			Body:       h.response.BodyToString(),
 			Raw:        string(h.response.Raw()),
 		}
 	}
@@ -321,7 +332,6 @@ func (h *HttpRequestResponse) UnmarshalJSON(data []byte) error {
 		var respData struct {
 			StatusCode int          `json:"status_code"`
 			Headers    []HttpHeader `json:"headers"`
-			Body       string       `json:"body"`
 			Raw        string       `json:"raw"`
 		}
 		if err := json.Unmarshal(respBin, &respData); err != nil {
@@ -425,48 +435,158 @@ func ParseRawRequest(raw string) (rr *HttpRequestResponse, err error) {
 	rr.request.raw = []byte(raw)
 
 	// Populate Service from host and URL scheme.
-	// Raw HTTP request lines use origin-form (no scheme), so absent an explicit
-	// signal we default to https — modern web is TLS by default, and downstream
-	// callers that need http explicitly should pass it via the URL field or
+	// Raw HTTP request lines use origin-form (no scheme), so we infer the scheme
+	// in priority order: an explicit scheme on the request line (absolute-form) >
+	// a well-known Host port (80/443) > a same-origin Origin/Referer header > the
+	// https default. The default is https because modern web is TLS by default;
+	// callers that need http explicitly can still pass it via the URL field or
 	// override the service with WithService.
 	if hostValue != "" {
-		port := 443
 		protocol := "https"
+		schemeKnown := false
+		portExplicit := false
+		port := 0
+
 		// Absolute-form request lines (e.g. CONNECT, proxy form) may carry a scheme.
 		switch urlx.Scheme {
 		case "http":
-			protocol = "http"
-			port = 80
+			protocol, schemeKnown = "http", true
 		case "https":
-			protocol = "https"
-			port = 443
+			protocol, schemeKnown = "https", true
 		}
-		// Extract port from Host header value (e.g. "127.0.0.1:3000")
+		// Extract port from Host header value (e.g. "127.0.0.1:3000").
 		if h, p, splitErr := net.SplitHostPort(hostValue); splitErr == nil {
 			hostValue = h
 			if parsed := parsePort(p); parsed > 0 {
-				port = parsed
-				// Infer scheme from well-known port only when no explicit scheme was present.
-				if urlx.Scheme == "" {
+				port, portExplicit = parsed, true
+				// Infer scheme from a well-known port only when none was explicit.
+				if !schemeKnown {
 					switch parsed {
 					case 80:
-						protocol = "http"
+						protocol, schemeKnown = "http", true
 					case 443:
-						protocol = "https"
+						protocol, schemeKnown = "https", true
 					}
 				}
 			}
 		}
-		// Also try from URL path (for absolute-form request lines like CONNECT)
-		urlPort := urlx.Port()
-		if urlPort != "" {
-			port = parsePort(urlPort)
+		// When neither the request line nor a well-known port pins the scheme,
+		// fall back to the scheme declared by a same-origin Origin/Referer header.
+		// Browser/proxy-captured requests to an http service on a non-standard port
+		// (e.g. "Host: localhost:3000" with "Referer: http://localhost:3000/")
+		// would otherwise be silently upgraded to https by the default below.
+		if !schemeKnown {
+			// Thread the already-computed target port (from the Host header, 0 when
+			// none) so a same-host Origin/Referer on a DIFFERENT port is not treated
+			// as same-origin and cannot flip the scheme (e.g. a :3000 frontend Origin
+			// on a request to an :8443 API must not infer http for the TLS service).
+			if s, _, ok := OriginRefererScheme(raw, hostValue, port); ok {
+				protocol = s
+			}
+		}
+		// Also try the port from the URL path (absolute-form lines like CONNECT).
+		if urlPort := urlx.Port(); urlPort != "" {
+			if parsed := parsePort(urlPort); parsed > 0 {
+				port, portExplicit = parsed, true
+			}
+		}
+		// Default the port from the resolved scheme when the Host carried none.
+		if !portExplicit {
+			if protocol == "http" {
+				port = 80
+			} else {
+				port = 443
+			}
 		}
 		service, _ := NewService(hostValue, port, protocol)
 		rr.request.service = service
 	}
 
 	return rr, nil
+}
+
+// OriginRefererScheme returns the URL scheme ("http" or "https") declared by the
+// request's Origin or Referer header, but only when that header names the same
+// host — and, when targetPort > 0, the same port — we are about to connect to. It
+// lets raw requests captured from a browser/proxy keep their real scheme when the
+// request line is origin-form (no scheme) and the port is non-standard — e.g. an
+// http service on :3000. A cross-origin Origin/Referer (a different host, or a
+// different port when targetPort is known, as in a CORS request or an external
+// referrer) is ignored so it cannot mislead scheme inference; Origin is preferred
+// over Referer as it is the exact origin the browser attached. host must be the
+// bare hostname (no port); targetPort is the port being connected to (0 when
+// unknown, which falls back to host-only matching). header names which header
+// supplied the scheme ("Origin"/"Referer"). Returns ok=false when neither header
+// yields a same-origin http/https scheme.
+func OriginRefererScheme(raw, host string, targetPort int) (scheme, header string, ok bool) {
+	if host == "" {
+		return "", "", false
+	}
+	sc := bufio.NewScanner(strings.NewReader(raw))
+	sc.Buffer(make([]byte, 0, 8*1024), 1024*1024)
+	refererScheme := ""
+	first := true
+	for sc.Scan() {
+		line := sc.Text()
+		if first { // request line
+			first = false
+			continue
+		}
+		if line == "" { // blank line terminates the header block
+			break
+		}
+		name, value, cut := strings.Cut(line, ":")
+		if !cut {
+			continue
+		}
+		if strings.EqualFold(name, "Origin") {
+			if s := sameHostScheme(value, host, targetPort); s != "" {
+				return s, "Origin", true
+			}
+		} else if refererScheme == "" && strings.EqualFold(name, "Referer") {
+			refererScheme = sameHostScheme(value, host, targetPort)
+		}
+	}
+	if refererScheme != "" {
+		return refererScheme, "Referer", true
+	}
+	return "", "", false
+}
+
+// sameHostScheme parses an absolute URL (an Origin or Referer value) and returns
+// its scheme only when it is http/https and its hostname case-insensitively
+// equals host. When targetPort > 0 the URL's authority port (an empty port
+// normalizes to the scheme default 80/443) must also equal targetPort — this
+// stops a same-host, different-port Origin/Referer from being treated as
+// same-origin. Returns "" otherwise (parse failure, opaque origin, non-http(s)
+// scheme, a cross-origin host, or a cross-port authority when targetPort is set).
+func sameHostScheme(rawURL, host string, targetPort int) string {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return ""
+	}
+	if !strings.EqualFold(u.Hostname(), host) {
+		return ""
+	}
+	if targetPort > 0 && originURLPort(u) != targetPort {
+		return ""
+	}
+	return u.Scheme
+}
+
+// originURLPort returns the authority port of u, normalizing an empty port to the
+// scheme's default (80 for http, 443 for https; 443 for any other scheme).
+func originURLPort(u *url.URL) int {
+	if p := u.Port(); p != "" {
+		return parsePort(p)
+	}
+	if dp := GetDefaultPort(u.Scheme); dp > 0 {
+		return dp
+	}
+	return 443
 }
 
 // ParseRawRequestWithURL parses a raw HTTP request with explicit URL override.
@@ -508,7 +628,7 @@ func GetRawRequestFromURL(url string) (*HttpRequestResponse, error) {
 	}
 	raw := fmt.Sprintf(
 		"GET %s HTTP/1.1\r\nHost: %s\r\n\r\n",
-		urlx.GetRelativePath(),
+		escapedRequestTarget(urlx),
 		urlx.Host,
 	)
 	rr, err := ParseRawRequest(raw)
@@ -533,6 +653,75 @@ func GetRawRequestFromURL(url string) (*HttpRequestResponse, error) {
 	}
 
 	return rr, nil
+}
+
+// GetRawRequestFromURLWithMethod creates a request from a URL while preserving
+// the discovered HTTP method, request headers, and body. This is the
+// method/body-aware counterpart to GetRawRequestFromURL: it lets non-GET
+// discoveries (form POSTs, JS-derived API calls) be imported without being
+// flattened to a bodyless GET, which would silently lose API and form coverage.
+//
+// When method is empty/GET and body is empty it delegates to
+// GetRawRequestFromURL for identical behavior. Header values containing CR/LF
+// are dropped to avoid request smuggling from malformed stored headers; Host and
+// Content-Length are always managed here (never taken from the stored map).
+func GetRawRequestFromURLWithMethod(rawURL, method string, headers map[string]string, body []byte) (*HttpRequestResponse, error) {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	if (method == "" || method == "GET") && len(body) == 0 {
+		return GetRawRequestFromURL(rawURL)
+	}
+	if method == "" {
+		method = "GET"
+	}
+
+	urlx, err := urlutil.ParseAbsoluteURL(rawURL, false)
+	if err != nil {
+		return nil, err
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %s HTTP/1.1\r\n", method, escapedRequestTarget(urlx))
+	fmt.Fprintf(&b, "Host: %s\r\n", urlx.Host)
+
+	// Emit stored headers deterministically, skipping ones we manage (Host is set
+	// above; Content-Length is derived from body) and any with control chars.
+	keys := make([]string, 0, len(headers))
+	for k := range headers {
+		switch http.CanonicalHeaderKey(k) {
+		case "Host", "Content-Length":
+			continue
+		}
+		if strings.ContainsAny(k, "\r\n") || strings.ContainsAny(headers[k], "\r\n") {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(&b, "%s: %s\r\n", k, headers[k])
+	}
+
+	if len(body) > 0 {
+		fmt.Fprintf(&b, "Content-Length: %d\r\n", len(body))
+	}
+	b.WriteString("\r\n")
+	if len(body) > 0 {
+		b.Write(body)
+	}
+
+	// The raw is internally built and trusted, so skip the ParseRawRequest
+	// re-parse + throwaway Service and wrap it directly with the correct service.
+	port := 80
+	protocol := "http"
+	if urlx.Scheme == "https" {
+		protocol = "https"
+		port = 443
+	}
+	if urlPort := urlx.Port(); urlPort != "" {
+		port = parsePort(urlPort)
+	}
+	service, _ := NewService(urlx.Host, port, protocol)
+	return NewRequestResponseRaw([]byte(b.String()), service), nil
 }
 
 // FromStdRequest creates HttpRequestResponse from a standard http.Request.

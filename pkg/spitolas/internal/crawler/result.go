@@ -2,6 +2,7 @@ package crawler
 
 import (
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/vigolium/vigolium/pkg/spitolas/internal/action"
@@ -17,6 +18,23 @@ type Result struct {
 	Stats     Stats
 	Fragments fragment.FragmentStats
 	Session   *CrawlSession
+
+	// HarvestedCookies is the browser's cookie jar at end of crawl (including any
+	// WAF/bot clearance cookies the real browser earned). BrowserUserAgent is the
+	// UA the browser presented. Both are carried forward so later scan phases can
+	// inherit the cleared session. Empty when harvesting was unavailable.
+	HarvestedCookies []*http.Cookie
+	BrowserUserAgent string
+
+	// HarvestedAuthorization is a JWT/Bearer token read from the app's client
+	// storage after a confirmed default-credential login (bare, no "Bearer "
+	// prefix). Token-based SPAs send it as an Authorization header rather than a
+	// cookie, so it is carried forward separately. Empty when no login succeeded.
+	HarvestedAuthorization string
+
+	// DOMXssFindings holds browser-confirmed DOM-based XSS on reflected client
+	// routes discovered during the crawl. The runner emits these as findings.
+	DOMXssFindings []DOMXssFinding
 }
 
 // Summary returns a text summary of the crawl.

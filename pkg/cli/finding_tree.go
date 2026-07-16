@@ -1,0 +1,445 @@
+package cli
+
+import (
+	"context"
+	"fmt"
+	"net/url"
+	"sort"
+	"strings"
+
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
+	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/pkg/terminal"
+)
+
+// urlRef is one affected location plus the finding id that reported it.
+type urlRef struct {
+	url string
+	id  int64
+}
+
+// findingPathGroup collapses findings under a path that share the same title
+// (severity + module + short + confidence) into a single node, with every
+// affected URL listed beneath it — one URL per line so nothing is truncated.
+// rep is the first finding of the group; the title/severity/confidence are read
+// off it, so there is a single source of truth.
+type findingPathGroup struct {
+	rep  *database.Finding
+	urls []urlRef
+}
+
+// treeBranch returns the connector drawn for a node and the bar drawn under it,
+// depending on whether the node is the last child of its parent.
+func treeBranch(isLast bool) (connector, childBar string) {
+	if isLast {
+		return "└── ", "    "
+	}
+	return "├── ", "│   "
+}
+
+// displayFindingTree renders findings as a host → path-prefix → finding tree,
+// mirroring the layout of `traffic --tree` but with severity, module, confidence
+// and matched-at per finding. Repeated titles under a path collapse into one
+// node with each affected URL on its own line. Findings without a URL
+// (source-audit findings) group under their repo name / source file.
+func displayFindingTree(db *database.DB, ctx context.Context, findings []*database.Finding, total int64) error {
+	printFindingsSummary(db, ctx, len(findings), total)
+
+	// Single-location findings can have their shown URL upgraded to the
+	// reproducible attack URL parsed from the finding's own request (active
+	// injection modules record the base request in matched_at but the real PoC
+	// URL only in the request line). The list query omits the request blob, so
+	// fetch it for just those findings in one batch before rendering.
+	needReq := make([]*database.Finding, 0, len(findings))
+	for _, f := range findings {
+		if findingCanUpgradeURL(f) {
+			needReq = append(needReq, f)
+		}
+	}
+	database.NewRepository(db).HydrateFindingRequests(ctx, needReq)
+
+	// One db-path root per source: a single root for a plain DB, or one per
+	// merged file under --glob-db so each finding's origin file is visible.
+	for _, root := range splitFindingsBySource(findings) {
+		fmt.Println(terminal.Bold(root.label))
+		renderFindingHostTree(root.findings)
+	}
+	return nil
+}
+
+// renderFindingHostTree prints the host → path-prefix → finding subtree beneath
+// an already-printed root line.
+func renderFindingHostTree(findings []*database.Finding) {
+	// Group by host, preserving a sorted, deterministic order.
+	hostMap := make(map[string][]*database.Finding)
+	for _, f := range findings {
+		key := findingHostKey(f)
+		hostMap[key] = append(hostMap[key], f)
+	}
+	hostKeys := make([]string, 0, len(hostMap))
+	for k := range hostMap {
+		hostKeys = append(hostKeys, k)
+	}
+	sort.Strings(hostKeys)
+
+	for hi, hostKey := range hostKeys {
+		hostFindings := hostMap[hostKey]
+		hostConnector, hostChildBar := treeBranch(hi == len(hostKeys)-1)
+		fmt.Printf("%s%s %s %s\n",
+			hostConnector,
+			terminal.BoldCyan(hostKey),
+			terminal.BoldMagenta(fmt.Sprintf("(%d findings)", len(hostFindings))),
+			findingHostSeverityTag(hostFindings))
+
+		// Group by first path segment (e.g. /api, /admin), like the traffic tree.
+		pathMap := make(map[string][]*database.Finding)
+		for _, f := range hostFindings {
+			p := findingPathPrefix(f)
+			pathMap[p] = append(pathMap[p], f)
+		}
+		pathPrefixes := make([]string, 0, len(pathMap))
+		for p := range pathMap {
+			pathPrefixes = append(pathPrefixes, p)
+		}
+		sort.Strings(pathPrefixes)
+
+		for pi, prefix := range pathPrefixes {
+			pathConnector, pathChildBar := treeBranch(pi == len(pathPrefixes)-1)
+			fmt.Printf("%s%s%s\n", hostChildBar, pathConnector, prefix)
+			printFindingGroups(groupPathFindings(pathMap[prefix]), hostChildBar+pathChildBar)
+		}
+	}
+}
+
+// findingRoot is one tree root: a db-path label and the findings shown under it.
+type findingRoot struct {
+	label    string
+	findings []*database.Finding
+}
+
+// splitFindingsBySource groups findings into per-root blocks. For a plain DB
+// read this is a single root (the DB path). Under --glob-db it's one root per
+// source file (in merge order) so each finding is shown beneath the database it
+// came from; any finding that can't be attributed falls back to a shared root.
+func splitFindingsBySource(findings []*database.Finding) []findingRoot {
+	if globDBMergedCount() == 0 {
+		return []findingRoot{{label: displayDBPath(), findings: findings}}
+	}
+	byFile := make(map[string][]*database.Finding)
+	var unattributed []*database.Finding
+	for _, f := range findings {
+		if file := globSourceForFinding(f.ID); file != "" {
+			byFile[file] = append(byFile[file], f)
+		} else {
+			unattributed = append(unattributed, f)
+		}
+	}
+	var roots []findingRoot
+	for _, s := range globDBSources {
+		if fs := byFile[s.file]; len(fs) > 0 {
+			roots = append(roots, findingRoot{label: terminal.ShortenHome(s.file), findings: fs})
+		}
+	}
+	if len(unattributed) > 0 {
+		roots = append(roots, findingRoot{label: displayDBPath(), findings: unattributed})
+	}
+	return roots
+}
+
+// printFindingGroups renders each collapsed title group under a path: the group
+// leaf, then one line per affected URL (in white) with its reporting id. prefix
+// is the accumulated indentation of all ancestor levels (host + path bars).
+func printFindingGroups(groups []*findingPathGroup, prefix string) {
+	for gi, g := range groups {
+		gConnector, gChildBar := treeBranch(gi == len(groups)-1)
+		fmt.Printf("%s%s%s\n", prefix, gConnector, formatFindingGroupLeaf(g))
+		for _, u := range g.urls {
+			fmt.Printf("%s%s    %s %s  %s\n",
+				prefix, gChildBar,
+				terminal.BoldMagenta("→"),
+				terminal.White(u.url),
+				terminal.Gray(fmt.Sprintf("#%d", u.id)))
+		}
+	}
+}
+
+// groupPathFindings collapses findings that share a title into one group and
+// returns the groups worst-severity first (then module name), each carrying its
+// affected URLs de-duplicated and ordered by finding id.
+func groupPathFindings(findings []*database.Finding) []*findingPathGroup {
+	groupMap := make(map[string]*findingPathGroup)
+	var order []string
+	for _, f := range findings {
+		key := strings.ToLower(f.Severity) + "\x00" + strings.ToLower(f.Confidence) + "\x00" + f.ModuleName + "\x00" + f.ModuleShort
+		g := groupMap[key]
+		if g == nil {
+			g = &findingPathGroup{rep: f}
+			groupMap[key] = g
+			order = append(order, key)
+		}
+		for _, loc := range findingDisplayLocations(f) {
+			g.urls = append(g.urls, urlRef{url: loc, id: f.ID})
+		}
+	}
+
+	groups := make([]*findingPathGroup, 0, len(order))
+	for _, k := range order {
+		g := groupMap[k]
+		g.urls = dedupURLRefs(g.urls)
+		groups = append(groups, g)
+	}
+	sort.SliceStable(groups, func(i, j int) bool {
+		ri, rj := severityRank(groups[i].rep.Severity), severityRank(groups[j].rep.Severity)
+		if ri != rj {
+			return ri > rj
+		}
+		return groups[i].rep.ModuleName < groups[j].rep.ModuleName
+	})
+	return groups
+}
+
+// dedupURLRefs removes duplicate URLs (keeping the lowest finding id) and orders
+// the result by id then URL for stable output.
+func dedupURLRefs(refs []urlRef) []urlRef {
+	seen := make(map[string]int64, len(refs))
+	for _, r := range refs {
+		if id, ok := seen[r.url]; !ok || r.id < id {
+			seen[r.url] = r.id
+		}
+	}
+	out := make([]urlRef, 0, len(seen))
+	for u, id := range seen {
+		out = append(out, urlRef{url: u, id: id})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].id != out[j].id {
+			return out[i].id < out[j].id
+		}
+		return out[i].url < out[j].url
+	})
+	return out
+}
+
+// findingHostKey derives the tree's top-level grouping key: the scheme://host of
+// the finding's URL, falling back to the bare hostname, a URL parsed from the
+// first matched-at entry, then the repo name for source-audit findings.
+func findingHostKey(f *database.Finding) string {
+	if f.URL != "" {
+		if u, err := url.Parse(f.URL); err == nil && u.Host != "" {
+			return schemeHost(u)
+		}
+	}
+	if f.Hostname != "" {
+		return f.Hostname
+	}
+	if len(f.MatchedAt) > 0 {
+		if u, err := url.Parse(f.MatchedAt[0]); err == nil && u.Host != "" {
+			return schemeHost(u)
+		}
+	}
+	if f.RepoName != "" {
+		return f.RepoName
+	}
+	return "(unknown)"
+}
+
+// schemeHost renders a parsed URL as scheme://host, defaulting a missing scheme
+// to http so the key stays stable.
+func schemeHost(u *url.URL) string {
+	scheme := u.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+	return scheme + "://" + u.Host
+}
+
+// findingCanUpgradeURL reports whether a finding is eligible to have its shown
+// URL upgraded to the request's PoC URL: only single-location findings qualify
+// (grouped multi-URL findings keep every matched location). Shared by the tree's
+// request-hydration filter and findingDisplayLocations so the eligibility rule
+// has a single owner.
+func findingCanUpgradeURL(f *database.Finding) bool {
+	return len(f.MatchedAt) <= 1
+}
+
+// findingDisplayLocations returns the URLs to list under a finding in the tree.
+// For an eligible single-location finding it upgrades the shown URL to the
+// reproducible attack URL parsed from the finding's own request line, when that
+// request targets the same endpoint (host+path) with a payload-bearing
+// query/fragment: active injection modules (XSS, …) record the base request in
+// matched_at but the real proof-of-concept URL only in the request. Grouped
+// multi-URL findings — and any request that points at a different endpoint — are
+// returned unchanged so the tree never redirects the reader off the matched
+// location.
+func findingDisplayLocations(f *database.Finding) []string {
+	if !findingCanUpgradeURL(f) {
+		return f.MatchedAt
+	}
+	locations := f.MatchedAt
+	if len(locations) == 0 {
+		locations = []string{findingURLValue(f)}
+	}
+	if poc := pocURLFromRequest(f.Request, locations[0]); poc != "" {
+		return []string{poc}
+	}
+	return locations
+}
+
+// pocURLFromRequest extracts the reproducible attack URL from a finding's stored
+// raw request, but only when it targets the same endpoint as baseLoc (same host
+// and path) — so a payload-bearing query/fragment is surfaced while a request
+// pointing at an unrelated resource is ignored. Returns "" when there is nothing
+// to upgrade: no request, unparseable, a different endpoint, or identical to base.
+func pocURLFromRequest(rawRequest, baseLoc string) string {
+	if rawRequest == "" || baseLoc == "" {
+		return ""
+	}
+	baseU, err := url.Parse(baseLoc)
+	if err != nil || baseU.Host == "" {
+		return ""
+	}
+	// httpmsg owns request-line parsing; GetPath returns the request-target
+	// (path+query, or the absolute URL for absolute-form requests).
+	target, _ := httpmsg.GetPath([]byte(rawRequest))
+	if target == "" {
+		return ""
+	}
+	ref, err := url.Parse(target)
+	if err != nil {
+		return ""
+	}
+	// ResolveReference handles both an origin-form target (resolved against the
+	// base scheme+host) and an absolute-form target (returned as-is).
+	pocU := baseU.ResolveReference(ref)
+	// Never redirect the reader off the matched endpoint: host + path must match;
+	// only the payload-bearing query/fragment may differ.
+	if !strings.EqualFold(pocU.Host, baseU.Host) || pocU.Path != baseU.Path {
+		return ""
+	}
+	poc := pocU.String()
+	if poc == baseLoc {
+		return ""
+	}
+	return poc
+}
+
+// findingPathPrefix returns the first path segment of a finding's location
+// (e.g. "/api"), used to bucket findings under a host. Source-audit findings
+// without a URL fall back to their source file.
+func findingPathPrefix(f *database.Finding) string {
+	raw := f.URL
+	if raw == "" && len(f.MatchedAt) > 0 {
+		raw = f.MatchedAt[0]
+	}
+	path := ""
+	if raw != "" {
+		if u, err := url.Parse(raw); err == nil && u.Path != "" {
+			path = u.Path
+		} else if strings.HasPrefix(raw, "/") {
+			path = raw
+		}
+	}
+	if path == "" && f.SourceFile != "" {
+		return f.SourceFile
+	}
+	if path == "" {
+		return "/"
+	}
+	parts := strings.Split(path, "/")
+	if len(parts) > 1 && parts[1] != "" {
+		return "/" + parts[1]
+	}
+	return "/"
+}
+
+// formatFindingGroupLeaf renders a collapsed group's title line: a colored
+// severity tag, module name, short description (or description fallback) and
+// confidence. The finding id(s) live on the per-URL lines below.
+func formatFindingGroupLeaf(g *findingPathGroup) string {
+	var b strings.Builder
+	b.WriteString(colorSeverityTag(g.rep.Severity))
+	b.WriteString(" ")
+	b.WriteString(terminal.Cyan(g.rep.ModuleName))
+
+	short := g.rep.ModuleShort
+	if short == "" {
+		short = g.rep.Description
+	}
+	if short != "" {
+		b.WriteString(" — ")
+		b.WriteString(terminal.White(clicommon.Truncate(short, 70)))
+	}
+	// Trailing "(confidence, module-type)" tag — e.g. "(certain, active)" — so the
+	// leaf shows both how sure the finding is and whether an active or passive
+	// module produced it. Either part is omitted when absent.
+	var tag []string
+	if g.rep.Confidence != "" {
+		tag = append(tag, clicommon.ColorConfidence(g.rep.Confidence))
+	}
+	if g.rep.ModuleType != "" {
+		tag = append(tag, colorModuleType(g.rep.ModuleType))
+	}
+	if len(tag) > 0 {
+		b.WriteString(" (")
+		b.WriteString(strings.Join(tag, ", "))
+		b.WriteString(")")
+	}
+	return b.String()
+}
+
+// severityColor returns the terminal color function for a severity label
+// (identity for unknown severities). Shared by the tree's severity tag and the
+// per-host count so the palette is defined once.
+func severityColor(sev string) func(string) string {
+	switch strings.ToLower(sev) {
+	case "critical":
+		return terminal.BoldMagenta
+	case "high":
+		return terminal.BoldRed
+	case "medium":
+		return terminal.BoldYellow
+	case "low":
+		return terminal.Green
+	case "suspect":
+		return terminal.BoldCyan
+	case "info":
+		return terminal.BoldBlue
+	default:
+		return func(s string) string { return s }
+	}
+}
+
+// colorSeverityTag renders a bracketed, colored severity tag like "[HIGH]".
+func colorSeverityTag(sev string) string {
+	return severityColor(sev)("[" + strings.ToUpper(sev) + "]")
+}
+
+// severityCountBuckets orders the per-host count from most to least severe.
+var severityCountBuckets = []struct{ key, label string }{
+	{"critical", "C"},
+	{"high", "H"},
+	{"medium", "M"},
+	{"low", "L"},
+	{"suspect", "S"},
+	{"info", "I"},
+}
+
+// findingHostSeverityTag renders a compact per-host severity count like
+// "[C:1 H:2 M:1]", omitting zero-count severities.
+func findingHostSeverityTag(findings []*database.Finding) string {
+	counts := make(map[string]int, len(findings))
+	for _, f := range findings {
+		counts[strings.ToLower(f.Severity)]++
+	}
+	var parts []string
+	for _, b := range severityCountBuckets {
+		if n := counts[b.key]; n > 0 {
+			parts = append(parts, severityColor(b.key)(fmt.Sprintf("%s:%d", b.label, n)))
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return terminal.Gray("[") + strings.Join(parts, " ") + terminal.Gray("]")
+}

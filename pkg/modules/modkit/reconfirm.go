@@ -547,6 +547,31 @@ func ExecuteRaw(client *http.Requester, service *httpmsg.Service, rawReq []byte,
 	return resp.Response().StatusCode, resp.Body().String(), true
 }
 
+// ExecuteRawWithResponse is ExecuteRaw that ALSO returns the full raw response
+// (status line + headers + body) alongside the body, from a single request. A
+// module uses the body for its content/similarity checks and the full response as
+// the finding's proving evidence, so it no longer has to issue the request twice
+// (and no longer depends on the executor backfilling a — possibly mismatched —
+// baseline response).
+func ExecuteRawWithResponse(client *http.Requester, service *httpmsg.Service, rawReq []byte, opts http.Options) (status int, body, fullResponse string, ok bool) {
+	req, err := httpmsg.ParseRawRequest(string(rawReq))
+	if err != nil {
+		return 0, "", "", false
+	}
+	if service != nil {
+		req = req.WithService(service)
+	}
+	resp, _, err := client.Execute(req, opts)
+	if err != nil {
+		return 0, "", "", false
+	}
+	defer resp.Close()
+	if resp.Response() == nil {
+		return 0, "", "", false
+	}
+	return resp.Response().StatusCode, resp.Body().String(), resp.FullResponseString(), true
+}
+
 // fetchResponse re-issues a raw request and returns its status code and full raw
 // response string (status line + headers + body, so header/Location injections
 // are visible). The bool is false on any parse/HTTP/empty-response error.
@@ -904,6 +929,39 @@ func fetchResponseBodyParsed(client *http.Requester, req *httpmsg.HttpRequestRes
 	return resp.Response().StatusCode, resp.Body().String(), true
 }
 
+// MaxErrorSignatureSpan bounds how many bytes a single error/leak-signature regex
+// match may cover before it is treated as page noise rather than a genuine
+// server-emitted error. Every DBMS / framework error signature names a compact
+// string, so a real leak matches a short span; a match spanning far more than this
+// is a loosely-anchored pattern (an "X.*?Y" whose lazy filler bridged two
+// coincidental words) that ran across unrelated content in a large body — the
+// motivating false positive being a case-insensitive "Oracle.*?Driver" matching a
+// 60KB span of a 547KB Salesforce Aura app shell. Shared by the error-based
+// signature modules (sqli-error-based, insecure_deserialization, ...).
+const MaxErrorSignatureSpan = 512
+
+// MatchWithinSpan reports whether re has SOME match in body whose span is at most
+// maxSpan bytes. It first runs the cheap first-match MatchString (which
+// short-circuits and scans capture-free), so the common no-match path over a large
+// body stays a single lightweight scan, and only enumerates matches
+// (FindAllStringIndex) once at least one exists. Enumerating ALL matches — rather
+// than checking only the leftmost — means a genuine short signature elsewhere in
+// the body is still detected even when the leftmost match happens to be an
+// over-long, blob-spanning coincidence. It is the shared "is this match a
+// plausibly compact error signature, not page noise?" gate for the error-based
+// injection modules.
+func MatchWithinSpan(re *regexp.Regexp, body string, maxSpan int) bool {
+	if !re.MatchString(body) {
+		return false
+	}
+	for _, loc := range re.FindAllStringIndex(body, -1) {
+		if loc[1]-loc[0] <= maxSpan {
+			return true
+		}
+	}
+	return false
+}
+
 // ConfirmMatchReproduces re-confirms that a regex-matched server-side error/leak
 // signature was genuinely introduced by an injected payload rather than ambient
 // page noise (a per-request random token, a static error string, or a signature a
@@ -1001,6 +1059,14 @@ func DifferentialSurfaceUnreliable(resp *httpmsg.HttpResponse) bool {
 	}
 	if ClassifyContentType(resp.Header("Content-Type")) == ContentClassHTML &&
 		len(resp.Body()) >= LargeDynamicHTMLBytes {
+		return true
+	}
+	// An opaque, high-entropy body (a compressed or encrypted CDN/challenge blob) is
+	// not a trustworthy differential surface: its per-request content churn
+	// manufactures phantom TRUE/FALSE differentials for the boolean/size oracles that
+	// gate on this. The cache-header and large-HTML checks above miss a blob served
+	// with a 200 and no cache header (the evr-kr.acme.com /cdn-cgi challenge class).
+	if infra.LooksOpaqueBody(resp.BodyToString()) {
 		return true
 	}
 	return false

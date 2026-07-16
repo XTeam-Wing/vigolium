@@ -62,6 +62,83 @@ func createTestEntry(url string) *TrafficEntry {
 	}
 }
 
+// TestWriteEntryParamValueVariantsKept verifies that up to maxParamVariants
+// DISTINCT query-value variants of one endpoint shape survive dedup, that further
+// variants collapse back onto the shape, and that exact repeats are still dropped.
+func TestWriteEntryParamValueVariantsKept(t *testing.T) {
+	mock := &mockWriter{}
+	capture := &Capture{
+		writer:           mock,
+		logged:           make(map[string]struct{}),
+		seenHashes:       make(map[string]bool),
+		shapeVariants:    make(map[string]int),
+		maxParamVariants: 3,
+		noColor:          true,
+	}
+
+	// Five distinct category values of the same shape (/catalog?category=…).
+	for _, v := range []string{"Books", "Gin", "Juice", "Accessories", "Accompaniments"} {
+		capture.writeEntry(createTestEntry("https://example.com/catalog?category=" + v))
+	}
+
+	// Only the first 3 distinct variants are kept; the rest collapse onto the shape.
+	if mock.getWriteCount() != 3 {
+		t.Errorf("Expected 3 variants written (cap=3), got %d", mock.getWriteCount())
+	}
+	if capture.duplicateCount != 2 {
+		t.Errorf("Expected 2 over-cap variants dropped, got %d", capture.duplicateCount)
+	}
+
+	// An exact repeat of an already-written variant is still a duplicate.
+	before := mock.getWriteCount()
+	capture.writeEntry(createTestEntry("https://example.com/catalog?category=Books"))
+	if mock.getWriteCount() != before {
+		t.Errorf("Exact-repeat variant should be deduped, write count changed to %d", mock.getWriteCount())
+	}
+}
+
+// TestWriteEntryParamVariantsDisabled verifies maxParamVariants<=1 reproduces the
+// original value-blind behavior: all value-variants of a shape collapse to one.
+func TestWriteEntryParamVariantsDisabled(t *testing.T) {
+	mock := &mockWriter{}
+	capture := &Capture{
+		writer:           mock,
+		logged:           make(map[string]struct{}),
+		seenHashes:       make(map[string]bool),
+		shapeVariants:    make(map[string]int),
+		maxParamVariants: 1,
+		noColor:          true,
+	}
+	for _, v := range []string{"1", "2", "3", "4"} {
+		capture.writeEntry(createTestEntry("https://example.com/catalog/product?productId=" + v))
+	}
+	if mock.getWriteCount() != 1 {
+		t.Errorf("Expected value-blind collapse to 1 record, got %d", mock.getWriteCount())
+	}
+}
+
+// TestWriteEntryDistinctShapesUnaffectedByVariantCap verifies the per-shape cap is
+// scoped per shape: different param-name sets and path-only URLs are independent.
+func TestWriteEntryDistinctShapesUnaffectedByVariantCap(t *testing.T) {
+	mock := &mockWriter{}
+	capture := &Capture{
+		writer:           mock,
+		logged:           make(map[string]struct{}),
+		seenHashes:       make(map[string]bool),
+		shapeVariants:    make(map[string]int),
+		maxParamVariants: 2,
+		noColor:          true,
+	}
+	// Two shapes (category vs searchTerm) + one path-only URL: all independent.
+	capture.writeEntry(createTestEntry("https://example.com/catalog?category=Books"))
+	capture.writeEntry(createTestEntry("https://example.com/catalog?category=Gin"))
+	capture.writeEntry(createTestEntry("https://example.com/catalog?searchTerm=a"))
+	capture.writeEntry(createTestEntry("https://example.com/about"))
+	if mock.getWriteCount() != 4 {
+		t.Errorf("Expected 4 records across distinct shapes, got %d", mock.getWriteCount())
+	}
+}
+
 // TestWriteEntryBasicDedup tests basic deduplication: same hash written once, duplicates skipped.
 func TestWriteEntryBasicDedup(t *testing.T) {
 	mock := &mockWriter{}
@@ -818,12 +895,12 @@ func TestComputeHashAuthHeaderCaseInsensitive(t *testing.T) {
 // log filter: traffic on a host unrelated to the configured target is
 // suppressed, while same/sub-host traffic is logged.
 func TestShouldLogEntryCrossOriginFilter(t *testing.T) {
-	c := New(&mockWriter{}, true, false, false, false, false, "eaccess.mis.teach.stryker.com", "spider")
+	c := New(&mockWriter{}, true, false, false, false, false, "eaccess.mis.teach.globex.com", "spider")
 
-	if c.shouldLogEntry(createTestEntry("https://eaccess.mis.teach.stryker.com/app")) != true {
+	if c.shouldLogEntry(createTestEntry("https://eaccess.mis.teach.globex.com/app")) != true {
 		t.Errorf("same-host entry should be logged")
 	}
-	if c.shouldLogEntry(createTestEntry("https://www.stryker.com/us/en/x.html")) != false {
+	if c.shouldLogEntry(createTestEntry("https://www.globex.com/us/en/x.html")) != false {
 		t.Errorf("cross-origin entry should be suppressed before adoption")
 	}
 }
@@ -834,31 +911,31 @@ func TestShouldLogEntryCrossOriginFilter(t *testing.T) {
 // host, every adopted-host line is dropped from stderr even though records are
 // written. SetTargetHost must flip that.
 func TestSetTargetHostUnsuppressesAdoptedHost(t *testing.T) {
-	c := New(&mockWriter{}, true, false, false, false, false, "eaccess.mis.teach.stryker.com", "spider")
+	c := New(&mockWriter{}, true, false, false, false, false, "eaccess.mis.teach.globex.com", "spider")
 
-	adopted := createTestEntry("https://www.stryker.com/us/en/training.html")
+	adopted := createTestEntry("https://www.globex.com/us/en/training.html")
 	if c.shouldLogEntry(adopted) != false {
 		t.Fatalf("precondition: adopted-host entry should be suppressed before SetTargetHost")
 	}
 
 	// Crawler adopts the off-host redirect target into scope.
-	c.SetTargetHost("www.stryker.com")
+	c.SetTargetHost("www.globex.com")
 
 	if c.shouldLogEntry(adopted) != true {
 		t.Errorf("adopted-host entry should be logged after SetTargetHost")
 	}
-	if c.targetHostValue() != "www.stryker.com" {
-		t.Errorf("targetHostValue() = %q, want %q", c.targetHostValue(), "www.stryker.com")
+	if c.targetHostValue() != "www.globex.com" {
+		t.Errorf("targetHostValue() = %q, want %q", c.targetHostValue(), "www.globex.com")
 	}
 }
 
 // TestSetTargetHostStaticStillSuppressed confirms re-pointing the filter does
 // not override the unconditional static-content suppression.
 func TestSetTargetHostStaticStillSuppressed(t *testing.T) {
-	c := New(&mockWriter{}, true, false, false, false, false, "eaccess.mis.teach.stryker.com", "spider")
-	c.SetTargetHost("www.stryker.com")
+	c := New(&mockWriter{}, true, false, false, false, false, "eaccess.mis.teach.globex.com", "spider")
+	c.SetTargetHost("www.globex.com")
 
-	css := createTestEntry("https://www.stryker.com/assets/app.css")
+	css := createTestEntry("https://www.globex.com/assets/app.css")
 	css.Response.Headers = map[string]string{"content-type": "text/css"}
 	if c.shouldLogEntry(css) != false {
 		t.Errorf("static content on adopted host should still be suppressed")

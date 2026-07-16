@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
 )
 
@@ -16,7 +17,9 @@ func TestNew(t *testing.T) {
 	require.NotNil(t, m)
 	assert.Equal(t, ModuleID, m.ID())
 	assert.Equal(t, ModuleName, m.Name())
-	assert.Equal(t, severity.Medium, m.Severity())
+	// Introspection-enabled is schema disclosure / a hardening gap (many public
+	// GraphQL APIs enable it by design), reported as a Low-severity lead.
+	assert.Equal(t, severity.Info, m.Severity())
 	assert.Equal(t, severity.Firm, m.Confidence())
 	assert.Equal(t, modkit.PassiveScanScopeResponse, m.Scope())
 	assert.Equal(t, modkit.ScanScopeRequest, m.ScanScopes())
@@ -44,6 +47,8 @@ func TestIntrospectionDetected(t *testing.T) {
 	require.Len(t, results, 1)
 	assert.Contains(t, results[0].Info.Name, "GraphQL Introspection")
 	assert.True(t, len(results[0].ExtractedResults) >= 2)
+	assert.Equal(t, output.RecordKindObservation, results[0].RecordKind)
+	assert.False(t, results[0].IsFinding())
 }
 
 func TestNoMatchOnRegularJSON(t *testing.T) {
@@ -104,4 +109,12 @@ func TestTypeIntrospection(t *testing.T) {
 	results, err := m.ScanPerRequest(ctx, scanCtx)
 	require.NoError(t, err)
 	require.Len(t, results, 1)
+}
+
+func TestMarkerStringsWithoutIntrospectionShapeDoNotMatch(t *testing.T) {
+	m := New()
+	ctx := makeHTTPCtx("application/json", `{"message":"__schema queryType types"}`)
+	results, err := m.ScanPerRequest(ctx, &modkit.ScanContext{})
+	require.NoError(t, err)
+	assert.Empty(t, results)
 }

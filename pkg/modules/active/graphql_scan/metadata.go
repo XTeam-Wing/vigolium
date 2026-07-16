@@ -9,14 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `**What it means:** A reachable GraphQL endpoint shows one or more weaknesses: introspection is enabled (the full schema is exposed), a field argument leaks database errors indicating SQL injection, or the endpoint accepts batched queries.
+	ModuleDesc = `**What it means:** A confirmed GraphQL endpoint exposes security-relevant behavior. Introspection and consoles are observations; batching, depth, predictable same-principal lookup, SQL-error differences, and reflection are candidates. A finding requires altered query logic or other demonstrated impact.
 
-**How it's exploited:** Introspection maps the schema to reveal hidden mutations and sensitive fields. An injectable argument reads or alters data via crafted SQL. Batching packs many operations into one request to bypass rate limiting and amplify denial-of-service.
+**How it's exploited:** Attackers enumerate the schema, stress query execution, probe object access, inject resolver inputs, or turn reflected errors into executable markup.
 
-**Fix:** Disable introspection in production, use parameterized queries in resolvers, and cap batching while enforcing rate limits and query depth limits.`
+**Fix:** Restrict introspection and consoles, parameterize resolvers, limit batching and complexity, authorize every object, and encode errors.`
 
-	ModuleConfirmation = "Confirmed when GraphQL endpoint responds to introspection queries, SQL payloads produce database errors, or batch queries execute successfully"
+	ModuleConfirmation = "A live endpoint requires an exact, reproduced data.__typename response; each check is then classified as observation, candidate, or finding according to whether exploit impact is directly demonstrated"
 	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Certain
-	ModuleTags         = []string{"graphql", "injection", "info-disclosure", "moderate"}
+	ModuleTags         = []string{"graphql", "injection", "info-disclosure", "idor", "bola", "xss", "dos", "batching", "console", "moderate"}
 )

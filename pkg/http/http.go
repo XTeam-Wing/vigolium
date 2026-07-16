@@ -8,10 +8,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/http/httptrace"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
@@ -21,6 +24,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/core/network"
 	"github.com/vigolium/vigolium/pkg/core/services"
+	"github.com/vigolium/vigolium/pkg/deparos/waf"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/types"
 	"go.uber.org/zap"
@@ -28,8 +32,12 @@ import (
 )
 
 const (
-	MaxBodyRead           = int64(30 * 1024 * 1024) // 30MB
-	responseHeaderTimeout = 5 * time.Second
+	MaxBodyRead = int64(30 * 1024 * 1024) // 30MB
+	// responseHeaderTimeoutFloor is the minimum transport ResponseHeaderTimeout.
+	// It sits comfortably above the slowest time-based probe (time-blind SQLi
+	// sleeps ~6s) so those responses are never aborted at the transport layer, and
+	// it never drops below the configured request timeout (see respHeaderTimeout).
+	responseHeaderTimeoutFloor = 30 * time.Second
 )
 
 // Options per-request
@@ -62,6 +70,247 @@ type Requester struct {
 	// to outgoing requests. Set per scan task via WithContext so cancellation
 	// reaches modules that call Execute (not ExecuteContext). nil → Background.
 	defaultCtx context.Context
+	// carried holds browser-harvested per-host sessions (cookies + optional
+	// pinned User-Agent) carried forward from the spidering phase. It is a
+	// pointer to an atomic-published store so WithContext's shallow copy shares
+	// one instance. Always non-nil after NewRequester.
+	carried *carriedSessionStore
+	// blockNotifier fires a one-time-per-host callback when a response is
+	// classified as a WAF/CDN block (captcha / bot-detection / challenge page),
+	// so the scan can warn the operator that traffic is being filtered. Pointer
+	// field so WithContext's shallow copy shares one instance (and never copies
+	// its mutex). Always non-nil after NewRequester; inert until SetBlockNotifier
+	// installs a sink.
+	blockNotifier *blockNotifier
+	// respObserver forwards server-error responses (5xx) to an installed sink so a
+	// consumer (the executor) can corroborate a leaked database error surfaced by
+	// ANY module's probe, not just the module that sent it. Pointer field so
+	// WithContext's shallow copy shares one instance. Always non-nil after
+	// NewRequester; inert until SetResponseObserver installs a sink.
+	respObserver *responseObserver
+	// edgePacer pre-arms the host limiter's pacing the first time a host is seen
+	// behind a CDN/WAF edge, so the active phase paces from its first request
+	// instead of bursting into the edge and arming a rate-based WAF (see
+	// maybePaceEdge). Pointer field so WithContext's shallow copy shares one
+	// instance (and its once-per-host dedup). Always non-nil after NewRequester.
+	edgePacer *edgePacer
+	// poolStats accumulates connection-pool telemetry (reuse ratio, TLS handshakes)
+	// via httptrace. Pointer field so WithContext copies and anonymous views share
+	// one scan-wide instance. Always non-nil after NewRequester.
+	poolStats *poolStats
+}
+
+// edgePacer fingerprints the CDN/WAF edge fronting a host from ordinary (non-block)
+// responses and, the first time a host is seen, pre-arms the host limiter's pacing so
+// the active phase never bursts into the edge and arms a rate-based WAF. Each host is
+// claimed on its first response, so the header fingerprint runs at most once per host
+// — a non-edge host never re-runs it for the rest of the scan. The seen set is a
+// sync.Map for lock-free reads on the already-claimed hot path (every response to a
+// WAF-fronted host). The operator notice is emitted by the limiter's own
+// SetPreArmNotifier, fired once per host across every requester that shares the
+// limiter, so this only owns the per-requester dedup.
+type edgePacer struct {
+	seen sync.Map // key: lowercased host → struct{}; present once fingerprinted
+}
+
+// claim records key as fingerprinted, returning true only for the caller that first
+// claimed it (lock-free via LoadOrStore), so each host is fingerprinted exactly once
+// under concurrency.
+func (p *edgePacer) claim(key string) bool {
+	_, loaded := p.seen.LoadOrStore(key, struct{}{})
+	return !loaded
+}
+
+// BlockNotice describes a WAF/CDN block observed on scan traffic. It is passed
+// to the sink registered via SetBlockNotifier, once per host.
+type BlockNotice struct {
+	Host    string // host the block was observed on
+	WAFType string // detected WAF/CDN vendor (e.g. "cloudflare", "akamai", "generic")
+	Status  int    // HTTP status code of the blocking response
+}
+
+// blockNotifier detects WAF/CDN block responses on the requester's traffic and
+// invokes sink exactly once per host. A single warning per host is enough: it
+// tells the operator that host is filtering traffic and the scan against it is
+// likely to be throttled or blocked, without one line per blocked request.
+type blockNotifier struct {
+	sink func(BlockNotice) // installed once at scan setup, before concurrency starts
+	mu   sync.Mutex
+	seen map[string]struct{} // hosts already warned about (lowercased)
+}
+
+// report classifies resp and, on the first confirmed block for host, invokes the
+// sink. It is the ergonomic wrapper around reportBlock — classify once, then dedup —
+// used by tests and any caller that hasn't already classified the response.
+func (n *blockNotifier) report(host string, resp *httpUtils.ResponseChain) {
+	if n == nil || n.sink == nil || host == "" || resp == nil {
+		return
+	}
+	n.reportBlock(host, classifyWAFBlock(resp), responseChainStatus(resp))
+}
+
+// reportBlock invokes the sink exactly once per host for a precomputed WAF/CDN block
+// classification (nil = not a block → no-op). It is a no-op without a sink, so the
+// per-response cost is a single nil check until SetBlockNotifier is called. A host is
+// only marked "seen" once a block is confirmed, so an ordinary application 403 does
+// not suppress a later genuine WAF block on the same host. Callers that already
+// classified the response (the hot path shares one result with the limiter feedback)
+// call this directly; report is the classify-then-dedup convenience wrapper.
+func (n *blockNotifier) reportBlock(host string, block *waf.BlockResult, status int) {
+	if n == nil || n.sink == nil || host == "" || block == nil {
+		return
+	}
+
+	// Claim the host under lock so concurrent workers on the same host emit exactly
+	// one warning; the sink runs outside the lock.
+	key := strings.ToLower(host)
+	n.mu.Lock()
+	if _, dup := n.seen[key]; dup {
+		n.mu.Unlock()
+		return
+	}
+	n.seen[key] = struct{}{}
+	n.mu.Unlock()
+
+	n.sink(BlockNotice{
+		Host:    host,
+		WAFType: block.WAFType,
+		Status:  status,
+	})
+}
+
+// carriedSessionStore holds per-host CarriedSessions. Sessions are written once
+// (after spidering, before scanning concurrency starts) and read on every
+// outgoing request, so the map is published via an atomic.Pointer: reads on the
+// hot path are a single lock-free load, and the common no-spider case (nil map)
+// short-circuits without touching a lock. It is a pointer field on Requester so
+// WithContext's shallow copy shares one store (and never copies the atomic).
+type carriedSessionStore struct {
+	m atomic.Pointer[map[string]httpmsg.CarriedSession]
+}
+
+func (s *carriedSessionStore) set(sessions map[string]httpmsg.CarriedSession) {
+	s.m.Store(&sessions)
+}
+
+func (s *carriedSessionStore) load() map[string]httpmsg.CarriedSession {
+	if p := s.m.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// SetCarriedSessions installs browser-harvested per-host sessions on the
+// requester. Keys are normalized to bare lowercase hostnames; a request is
+// matched against them by host so a session only ever reaches the host it was
+// harvested from. Cookies are merged into (never over) a request's existing
+// Cookie header, and a non-empty UserAgent is pinned — both applied before the
+// operator's -H custom headers so an explicit -H Cookie/User-Agent still wins.
+// Safe to call once during scan setup; a nil/empty map is a no-op.
+func (r *Requester) SetCarriedSessions(sessions map[string]httpmsg.CarriedSession) {
+	if r == nil || r.carried == nil || len(sessions) == 0 {
+		return
+	}
+	normalized := make(map[string]httpmsg.CarriedSession, len(sessions))
+	for host, sess := range sessions {
+		key := httpmsg.NormalizeHost(host)
+		if key == "" {
+			continue
+		}
+		normalized[key] = sess
+	}
+	r.carried.set(normalized)
+}
+
+// ObservedResponse is the payload handed to a response observer for a server-error
+// response. RequestRaw and Body are the observer's to read synchronously; a sink
+// that retains them must copy (the underlying buffers are reused after Execute).
+type ObservedResponse struct {
+	Host        string
+	URL         string
+	ContentType string
+	Status      int
+	RequestRaw  []byte
+	Body        []byte
+}
+
+// responseObserver forwards 5xx responses to an installed sink. A 5xx is the
+// classic surface on which an application leaks a database error in response to a
+// malformed probe, so gating on it keeps the per-response cost a single status
+// comparison until an error actually occurs.
+type responseObserver struct {
+	// sink is accessed concurrently: installed/cleared from scan setup/teardown
+	// (SetResponseObserver) while request goroutines — including scan goroutines
+	// that outlive a per-module timeout — read it in report. Hold it in an
+	// atomic.Pointer so those accesses are race-free. responseObserver is only ever
+	// held via *responseObserver (shared across WithContext clones), so the atomic
+	// is never copied.
+	sink atomic.Pointer[func(ObservedResponse)]
+}
+
+// report hands a server-error response to the sink. Gated on status >= 500 so the
+// common 2xx/3xx/4xx hot path pays only one integer comparison. The Body is the
+// already-buffered response body (no extra I/O); the sink runs synchronously on the
+// request goroutine, so it must be cheap and must copy anything it retains.
+func (o *responseObserver) report(host, urlStr string, reqRaw []byte, resp *httpUtils.ResponseChain, status int) {
+	if o == nil || status < 500 || resp == nil {
+		return
+	}
+	sink := o.sink.Load()
+	if sink == nil {
+		return
+	}
+	httpResp := resp.Response()
+	if httpResp == nil {
+		return
+	}
+	var body []byte
+	if b := resp.Body(); b != nil {
+		body = b.Bytes()
+	}
+	if len(body) == 0 {
+		return
+	}
+	(*sink)(ObservedResponse{
+		Host:        host,
+		URL:         urlStr,
+		ContentType: httpResp.Header.Get("Content-Type"),
+		Status:      status,
+		RequestRaw:  reqRaw,
+		Body:        body,
+	})
+}
+
+// SetResponseObserver installs a sink invoked for every server-error (5xx) response
+// on this requester's traffic, so the executor can corroborate a leaked database
+// error from ANY module's probe rather than only the module that sent it. The sink
+// runs synchronously on the request goroutine — it must be
+// cheap and non-blocking, and must copy any request/response bytes it retains. Call
+// during scan setup; a nil sink clears the observer. The installed sink is shared by
+// every WithContext clone of this requester.
+func (r *Requester) SetResponseObserver(sink func(ObservedResponse)) {
+	if r == nil || r.respObserver == nil {
+		return
+	}
+	if sink == nil {
+		r.respObserver.sink.Store(nil)
+		return
+	}
+	r.respObserver.sink.Store(&sink)
+}
+
+// SetBlockNotifier installs a sink invoked once per host the first time a
+// response on that host is classified as a WAF/CDN block (captcha, bot-detection,
+// or challenge page). It lets the scan warn the operator that traffic is being
+// filtered and results against that host may be incomplete. The sink runs on the
+// request goroutine, so it must be cheap and non-blocking. Call once during scan
+// setup, before scanning concurrency starts; a nil sink is a no-op. The
+// installed sink is shared by every WithContext clone of this requester.
+func (r *Requester) SetBlockNotifier(sink func(BlockNotice)) {
+	if r == nil || r.blockNotifier == nil || sink == nil {
+		return
+	}
+	r.blockNotifier.sink = sink
 }
 
 // WithContext returns a shallow copy of the Requester whose context-less Execute
@@ -144,6 +393,16 @@ func NewRequester(options *types.Options, services *services.Services) (*Request
 	// always >= the old 100 floor.
 	maxIdleConns := maxIdlePerHost * 10
 
+	// ResponseHeaderTimeout is the transport-level cap on waiting for response
+	// headers. The old hard-coded 5s aborted deliberately-delayed responses (e.g.
+	// time-based blind SQLi probes that sleep ~6s) as transport-level false
+	// negatives. Floor it well above any time-based probe (and never below the
+	// configured request timeout) so those probes complete; the request/context
+	// timeout — not this transport backstop — governs a genuinely stalled server.
+	// The floor also guards against a degenerate/misconfigured tiny options.Timeout
+	// making the transport reject every response instantly.
+	respHeaderTimeout := max(timeout, responseHeaderTimeoutFloor)
+
 	// Transport factory
 	makeTransport := func() *http.Transport {
 		t := &http.Transport{
@@ -166,7 +425,7 @@ func NewRequester(options *types.Options, services *services.Services) (*Request
 			MaxIdleConns:           maxIdleConns,
 			MaxIdleConnsPerHost:    maxIdlePerHost,
 			IdleConnTimeout:        90 * time.Second,
-			ResponseHeaderTimeout:  responseHeaderTimeout,
+			ResponseHeaderTimeout:  respHeaderTimeout,
 			MaxResponseHeaderBytes: 48 * 1024,
 			ReadBufferSize:         16 * 1024,
 		}
@@ -246,6 +505,26 @@ func NewRequester(options *types.Options, services *services.Services) (*Request
 		rawClientNoRedir: rawClientNoRedir,
 		services:         services,
 		customHeaders:    parseHeaders(options.Headers),
+		carried:          &carriedSessionStore{},
+		blockNotifier:    &blockNotifier{seen: make(map[string]struct{})},
+		respObserver:     &responseObserver{},
+		edgePacer:        &edgePacer{},
+		poolStats:        newPoolStats(),
+	}
+
+	// Keep the edge-pacer's once-per-host dedup in sync with the limiter's entry
+	// lifetime: when an idle host is evicted, drop it from the dedup so a fresh,
+	// full-rate entry created later is re-fingerprinted and re-armed rather than
+	// pinned at full rate by the stale (monotonic) claim.
+	if services != nil && services.HostLimiter != nil {
+		ep := r.edgePacer
+		// The subscription lives for the limiter's (scan's) lifetime. Anonymous views
+		// (CloneWithoutCredentials) share this edgePacer rather than registering their
+		// own, so the number of subscriptions stays bounded to the real setup-time
+		// requesters (main + per-session).
+		services.HostLimiter.AddEvictNotifier(func(host string) {
+			ep.seen.Delete(strings.ToLower(host))
+		})
 	}
 
 	if options.ClusterRequests {
@@ -255,6 +534,46 @@ func NewRequester(options *types.Options, services *services.Services) (*Request
 	}
 
 	return r, nil
+}
+
+// applyCarriedSession merges the browser-harvested session for the request's
+// host into the outgoing request: a pinned User-Agent (only when one was
+// carried) and the harvested cookies merged into any existing Cookie header.
+// A no-op when no session was harvested or none matches this host.
+func (r *Requester) applyCarriedSession(req *retryablehttp.Request) {
+	if r.carried == nil {
+		return
+	}
+	// Fast-out before deriving the host key: most scans don't --spider, so the
+	// map is nil and this costs a single lock-free load on the request hot path.
+	sessions := r.carried.load()
+	if len(sessions) == 0 {
+		return
+	}
+	// req.Hostname() is already port-stripped, so the lookup key only needs
+	// case-folding to match the NormalizeHost-normalized map keys.
+	sess, ok := sessions[strings.ToLower(req.Hostname())]
+	if !ok {
+		return
+	}
+	if sess.UserAgent != "" {
+		req.Header.Set("User-Agent", sess.UserAgent)
+	}
+	if sess.CookieHeader != "" {
+		req.Header.Set("Cookie", httpmsg.MergeCookieHeaders(req.Header.Get("Cookie"), sess.CookieHeader))
+	}
+	// Fill a harvested token-session credential only when the request carries no
+	// Authorization of its own — so a replayed authenticated request keeps its own
+	// token, and (since this runs before -H) an explicit -H Authorization still wins.
+	// Bearer tokens are origin-scoped (scheme+host+port), unlike cookies, so attach
+	// the token only when the request's origin matches the one it was harvested from —
+	// a token minted for https://host:3000 must never leak to http://host:8080 on the
+	// same hostname. An empty Origin (older harvest) falls back to the hostname-only
+	// scoping already applied by the map lookup above.
+	if sess.AuthorizationHeader != "" && req.Header.Get("Authorization") == "" &&
+		(sess.Origin == "" || httpmsg.OriginMatchesURL(sess.Origin, req.URL.URL)) {
+		req.Header.Set("Authorization", sess.AuthorizationHeader)
+	}
 }
 
 // parseHeaders parses header strings in "Name: Value" format.
@@ -267,6 +586,125 @@ func parseHeaders(headers []string) map[string]string {
 		}
 	}
 	return result
+}
+
+// CloneWithoutCredentials returns a lightweight anonymous VIEW over the same
+// scan-scoped requester: it shares the transport (connection pool), rate limiter,
+// response observer, block notifier, edge-pacing dedup, and request clusterer, and
+// isolates only the credential surface — a fresh cookie jar and credential-stripped
+// headers. Authorization-differential modules must not reuse the primary
+// requester's cookie jar/custom auth headers: deleting Authorization from one raw
+// request is otherwise undone by doRequest, which reapplies r.customHeaders
+// immediately before sending.
+//
+// Sharing rather than rebuilding (the previous NewRequester clone) matters on a
+// large corpus: each old clone minted its own http.Transport + four HTTP clients +
+// jar with no idle-connection reclamation, so probe traffic fragmented the pool
+// (extra TCP/TLS handshakes) and — because it also got a fresh response observer /
+// block state — was invisible to the executor's scan-wide 5xx corroboration and
+// edge pacing. The view fixes both: probes reuse the warm pool and stay observed.
+// The clusterer is safe to share because it keys on the full raw-request hash
+// (computeClusterKey), so a credential-stripped probe never collides with an
+// authenticated request.
+func (r *Requester) CloneWithoutCredentials() (*Requester, error) {
+	view, err := r.cloneSharingTransport()
+	if err != nil {
+		return nil, err
+	}
+	view.customHeaders = stripCredentialHeaderMap(r.customHeaders)
+	return view, nil
+}
+
+// CloneForScan returns a per-scan requester that SHARES the expensive
+// transport (connection pool), dialer, and host rate limiter with r, but gives
+// the scan its OWN behavioral state that concurrent scans would otherwise
+// corrupt on a single shared requester: a fresh cookie jar, a fresh response
+// observer (the 5xx corroboration sink — installed per-Execute, so on a shared
+// requester the last writer wins and the first to finish clears it for the
+// rest), and a fresh request clusterer (keyed on the request hash — sharing it
+// would serve one scan's response to another scan's byte-identical request).
+//
+// The server holds one shared requester and runs multiple lightweight scans
+// (scan-url / scan-request) concurrently; this isolates their evidence and
+// cookies. The edge-pacer and block-notifier stay shared: they dedup per host
+// across the whole process, and giving each scan its own edge-pacer would
+// register a new (never-removed) evict subscription on the shared limiter and
+// leak subscriptions over the server's lifetime.
+func (r *Requester) CloneForScan() (*Requester, error) {
+	scoped, err := r.cloneSharingTransport()
+	if err != nil {
+		return nil, err
+	}
+	scoped.respObserver = &responseObserver{}
+	if r.services.Options.ClusterRequests {
+		scoped.clusterer = NewRequestClustererWithSize(ClustererSizeForConcurrency(r.services.Options.Concurrency))
+	} else {
+		scoped.clusterer = nil
+	}
+	return scoped, nil
+}
+
+// cloneSharingTransport returns a shallow copy of r that SHARES the transport
+// (connection pool), dialer, and rate limiter, with a fresh cookie jar on its two
+// retry clients so cookies are isolated while pooling is preserved. Callers then
+// override only the behavioral state they need to isolate (credential headers,
+// response observer, clusterer). Errors if r has no runtime options.
+func (r *Requester) cloneSharingTransport() (*Requester, error) {
+	if r == nil || r.services == nil || r.services.Options == nil {
+		return nil, errors.New("cannot clone requester without runtime options")
+	}
+
+	// Fresh cookie jar wrapping the SAME shared transport, so the clone's cookies
+	// never mix with the parent jar while connection pooling is preserved.
+	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	if err != nil {
+		return nil, errors.Wrap(err, "could not create cookiejar")
+	}
+
+	retryOpts := retryablehttp.DefaultOptionsSpraying
+	retryOpts.RetryMax = r.services.Options.Retries
+	retryOpts.RetryWaitMax = 10 * time.Second
+
+	clone := *r
+	clone.client = cloneRetryClientWithJar(r.client, jar, retryOpts)
+	clone.clientNoRedir = cloneRetryClientWithJar(r.clientNoRedir, jar, retryOpts)
+	return &clone, nil
+}
+
+// cloneRetryClientWithJar rebuilds a retryablehttp client that shares src's
+// transport, timeout, and redirect policy (all carried on the copied *http.Client)
+// but swaps in a fresh cookie jar, so an anonymous view keeps connection pooling
+// while isolating cookies.
+func cloneRetryClientWithJar(src *retryablehttp.Client, jar http.CookieJar, opts retryablehttp.Options) *retryablehttp.Client {
+	base := *src.HTTPClient // shares Transport + CheckRedirect, keeps Timeout
+	base.Jar = jar
+	return retryablehttp.NewWithHTTPClient(&base, opts)
+}
+
+// stripCredentialHeaderMap returns a copy of the header map with credential-bearing
+// entries (per credentialHeaderName) removed.
+func stripCredentialHeaderMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for name, value := range in {
+		if credentialHeaderName(name) {
+			continue
+		}
+		out[name] = value
+	}
+	return out
+}
+
+func credentialHeaderName(name string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	switch normalized {
+	case "authorization", "proxy-authorization", "cookie", "x-api-key", "api-key",
+		"x-api-token", "x-auth-token", "x-access-token", "x-session-token":
+		return true
+	}
+	return strings.Contains(normalized, "credential") ||
+		strings.HasSuffix(normalized, "-token") ||
+		strings.HasSuffix(normalized, "-api-key") ||
+		strings.HasSuffix(normalized, "-session-id")
 }
 
 func makeRedirectFunc(sameHostOnly bool, maxRedirects int) func(*http.Request, []*http.Request) error {
@@ -328,6 +766,16 @@ func (r *Requester) executeDirectly(ctx context.Context, input *httpmsg.HttpRequ
 		return nil, 0, hosterrors.ErrUnresponsiveHost
 	}
 
+	// Global requests-per-second cap (only when --rate-limit was set). Acquire a
+	// rate token BEFORE holding a scarce per-host concurrency slot so a throttled
+	// request doesn't occupy a slot while it waits. Wait honors ctx, so scan
+	// shutdown / phase deadline unblocks it promptly.
+	if r.services.RateLimiter != nil {
+		if err := r.services.RateLimiter.Wait(ctx); err != nil {
+			return nil, 0, err
+		}
+	}
+
 	// Per-host rate limiting (concurrency control)
 	if r.services.HostLimiter != nil && host != "" {
 		// Context-aware acquire: a scan shutdown or phase deadline unblocks a
@@ -349,26 +797,109 @@ func (r *Requester) executeDirectly(ctx context.Context, input *httpmsg.HttpRequ
 		}
 		// Feed transport failures (timeout/reset/refused) to the adaptive limiter
 		// so it can back the host off; a no-op in static mode.
-		r.reportHostFeedback(host, 0, err)
+		r.reportHostFeedback(host, 0, err, false)
 		return nil, 0, err
 	}
 
 	if r.services.HostErrors != nil {
 		r.services.HostErrors.MarkSuccess(input.ID())
 	}
-	r.reportHostFeedback(host, responseChainStatus(resp), nil)
+	// Classify a WAF/CDN block once (cheap status pre-gate; only reads the body on a
+	// block-status response) and feed that single result to both consumers: the
+	// adaptive limiter (arms/backs-off WAF-auto-arm throttling) and the once-per-host
+	// operator warning. Sharing the result avoids re-running ClassifyParts per block.
+	status := responseChainStatus(resp)
+	block := classifyWAFBlock(resp)
+	r.reportHostFeedback(host, status, nil, block != nil)
+	r.blockNotifier.reportBlock(host, block, status)
+	// Proactively pace a host the first time it is seen behind a CDN/WAF edge, so a
+	// later phase's burst never arms a rate-based WAF. Runs on every phase's traffic
+	// through this shared requester (heuristics/discovery hit each host before the
+	// active phase), so the pre-arm lands ahead of the active-module fan-out.
+	r.maybePaceEdge(host, resp, block != nil)
+	// Forward server errors to the corroboration observer. Gate on 5xx here (not
+	// just inside report) so the URL string is materialized only for server errors,
+	// never on the 2xx/3xx/4xx hot path. No-op without an installed sink.
+	if status >= 500 && r.respObserver.sink.Load() != nil {
+		urlStr := ""
+		if u, err := input.URL(); err == nil && u != nil {
+			urlStr = u.String()
+		}
+		r.respObserver.report(host, urlStr, input.Request().Raw(), resp, status)
+	}
 	return resp, int(time.Since(start).Seconds()), nil
+}
+
+// classifyWAFBlock returns the WAF/CDN block classification for resp, or nil if it is
+// not a block. It short-circuits on a cheap status pre-gate (waf.IsBlockStatusCode)
+// so the common 2xx/3xx hot path never reads the body or runs the classifier; only a
+// block-status response pays the ClassifyParts cost. Uses the same accessors as the
+// notifier (never FullResponse). This is the single classification both the limiter
+// feedback and the operator warning share.
+func classifyWAFBlock(resp *httpUtils.ResponseChain) *waf.BlockResult {
+	if resp == nil {
+		return nil
+	}
+	httpResp := resp.Response()
+	if httpResp == nil || !waf.IsBlockStatusCode(httpResp.StatusCode) {
+		return nil
+	}
+	var body []byte
+	if b := resp.Body(); b != nil {
+		body = b.Bytes()
+	}
+	return waf.ClassifyParts(httpResp.StatusCode, httpResp.Header, body)
 }
 
 // reportHostFeedback forwards a per-request outcome to the adaptive host limiter.
 // No-op without a limiter/host; in static mode Feedback itself is a no-op. It runs
 // only on the executeDirectly path, so a clusterer cache hit (no network request)
-// correctly produces no feedback.
-func (r *Requester) reportHostFeedback(host string, statusCode int, err error) {
+// correctly produces no feedback. wafBlocked marks a classified WAF/CDN block, which
+// arms WAF-auto-arm throttling and always counts as host distress.
+func (r *Requester) reportHostFeedback(host string, statusCode int, err error, wafBlocked bool) {
 	if host == "" || r.services.HostLimiter == nil {
 		return
 	}
-	r.services.HostLimiter.Feedback(host, statusCode, err)
+	r.services.HostLimiter.Feedback(host, statusCode, err, wafBlocked)
+}
+
+// maybePaceEdge pre-arms the host limiter's pacing the first time host is seen behind
+// a CDN/WAF edge, so a later phase paces that host from its first request instead of
+// bursting into the edge and arming a rate-based WAF. It runs at most once per host:
+// an edge-fronted host is claimed and short-circuits thereafter; a block response
+// (blocked=true) claims the host too — reactive arming (Feedback + blockNotifier)
+// already handles it, so we stop re-fingerprinting and fire no pacing notice. Cheap
+// on the hot path: a nil/static-mode check, then a map lookup, then a handful of
+// header checks only until the host is claimed.
+func (r *Requester) maybePaceEdge(host string, resp *httpUtils.ResponseChain, blocked bool) {
+	if r.edgePacer == nil || host == "" || resp == nil {
+		return
+	}
+	if r.services.HostLimiter == nil || !r.services.HostLimiter.PreArmable() {
+		return
+	}
+	// Claim the host on its first response (lock-free once claimed): every later
+	// response for it short-circuits here, so a non-edge host never re-runs the header
+	// fingerprint for the rest of the scan. Edge headers ride every response, so the
+	// first one is representative — no need to re-check.
+	if !r.edgePacer.claim(strings.ToLower(host)) {
+		return
+	}
+	// A block response is already arming this host reactively (Feedback + the block
+	// notifier); the claim above stops us re-fingerprinting, and no pacing notice is due.
+	if blocked {
+		return
+	}
+	httpResp := resp.Response()
+	if httpResp == nil {
+		return
+	}
+	// The limiter arms the host once and fires the operator notice via its own
+	// SetPreArmNotifier, so the notice is emitted exactly once per host even when a
+	// different requester (auth prep, a second phase) first tripped the pre-arm.
+	if vendor := waf.EdgeFront(httpResp.Header); vendor != "" {
+		r.services.HostLimiter.PreArm(host, vendor)
+	}
 }
 
 // responseChainStatus returns the HTTP status code from a response chain, or 0
@@ -405,6 +936,14 @@ var defaultHeaderTemplate = func() http.Header {
 func (r *Requester) doRequest(ctx context.Context, input *httpmsg.HttpRequestResponse, opts Options) (*httpUtils.ResponseChain, error) {
 	start := time.Now()
 
+	// Attach connection-pool tracing so scan diagnostics can surface reuse ratio /
+	// handshake churn (OPT-3). One shared ClientTrace, so this costs a single context
+	// wrap. The rawhttp path bypasses net/http, so it is intentionally not traced.
+	if r.poolStats != nil && !opts.RawRequest {
+		ctx = httptrace.WithClientTrace(ctx, r.poolStats.ct)
+		r.poolStats.requests.Add(1)
+	}
+
 	req, err := input.BuildRetryableRequestWithContext(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to build request")
@@ -433,6 +972,15 @@ func (r *Requester) doRequest(ctx context.Context, input *httpmsg.HttpRequestRes
 			req.Header.Set("Host", h)
 		}
 	}
+
+	// Apply a browser-harvested session for this request's host (cookies + an
+	// optional pinned User-Agent) so content-discovery and dynamic-assessment
+	// inherit the WAF/bot-cleared session the spidering browser established.
+	// Applied BEFORE custom headers so an explicit -H Cookie/User-Agent still
+	// wins; cookies are merged into (never over) any Cookie already on the
+	// request, and the session only applies to the exact host it was harvested
+	// from.
+	r.applyCarriedSession(req)
 
 	// Apply custom headers (after defaults to allow override)
 	for name, value := range r.customHeaders {

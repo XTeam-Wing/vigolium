@@ -34,6 +34,7 @@ var (
 	globalScanOnReceive           bool
 	globalFullNativeScanOnReceive bool
 	globalMaxPerHost              int
+	globalNoWafPacing             bool
 	globalMaxHostError            int
 	globalMaxFindingsPerModule    int
 	globalListModules             bool
@@ -49,6 +50,8 @@ var (
 	globalRateLimit   int
 	globalModules     []string
 	globalModuleTags  []string
+	globalModuleIDs   []string
+	globalPassiveOnly bool
 	globalScanUUID    string
 	globalSpecURL     bool
 	globalSpecHeader  []string
@@ -129,8 +132,8 @@ Common workflows:
   • vigolium agent       — run an agentic scan (autopilot, swarm, query, olium)
   • vigolium server      — start the REST API + ingest proxy
   • vigolium ingest      — push HTTP traffic into the database
-  • vigolium db          — inspect, export, or prune stored data
-  • vigolium project     — manage multi-tenant projects
+  • vigolium finding     — inspect and export scan findings
+  • vigolium traffic     — inspect and export captured HTTP traffic
 
 Run 'vigolium <command> --help' for command-specific flags and examples, or 'vigolium --full-example' for a curated tour.`,
 	SilenceUsage: true,
@@ -255,6 +258,11 @@ Run 'vigolium <command> --help' for command-specific flags and examples, or 'vig
 func init() {
 	// Color the "Error:" prefix red for all cobra error messages
 	rootCmd.SetErrPrefix(terminal.ErrorPrefix())
+
+	// Suggest the closest registered flag on a mistyped one (e.g. --module →
+	// --modules). Set once on root; every subcommand inherits it via
+	// FlagErrorFunc()'s walk to the parent.
+	rootCmd.SetFlagErrorFunc(flagErrorFunc)
 
 	pf := rootCmd.PersistentFlags()
 

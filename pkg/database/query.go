@@ -42,6 +42,7 @@ type QueryFilters struct {
 	ModuleName     string   // Filter findings by module name
 	ModuleType     string   // Filter findings by module type (active, passive, nuclei, etc.)
 	FindingSource  string   // Filter findings by source (audit, spa, agent, etc.)
+	RecordKinds    []string // finding (default), candidate, observation
 	RepoName       string   // Filter findings by repo name
 	Status         []string // Filter findings by lifecycle status (draft, triaged, false_positive, accepted_risk, fixed)
 
@@ -50,10 +51,17 @@ type QueryFilters struct {
 	DateTo   *time.Time
 
 	// Full-text search
-	SearchTerm   string // Search across URLs, paths
-	FuzzyTerm    string // Broad fuzzy search across multiple fields
-	HeaderSearch string // Search in headers
-	BodySearch   string // Search in request/response body
+	SearchTerm   string   // Search across URLs, paths
+	SearchTerms  []string // Findings: repeatable search terms, AND-combined (each further narrows the match)
+	FuzzyTerm    string   // Broad fuzzy search across multiple fields
+	HeaderSearch string   // Search in headers
+	BodySearch   string   // Search in request/response body
+
+	// Negative / exclusion search — drop rows where the term appears in the same
+	// corpus the positive counterpart scans.
+	ExcludeTerms        []string // Repeatable, AND-combined: a row is dropped if ANY term matches (inverse of SearchTerms)
+	ExcludeHeaderSearch string   // Drop rows whose header/raw corpus contains the term (inverse of HeaderSearch)
+	ExcludeBodySearch   string   // Drop rows whose body/raw corpus contains the term (inverse of BodySearch)
 
 	// Pagination
 	Limit  int
@@ -63,6 +71,73 @@ type QueryFilters struct {
 	SortBy  string // Field to sort by
 	SortAsc bool   // Sort ascending (default: descending)
 }
+
+// EffectiveSearchTerms returns the search terms to AND-combine: the repeatable
+// SearchTerms when set, otherwise the single SearchTerm. Blank terms are
+// dropped, so callers can loop the result directly.
+func (f QueryFilters) EffectiveSearchTerms() []string {
+	terms := f.SearchTerms
+	if len(terms) == 0 && f.SearchTerm != "" {
+		terms = []string{f.SearchTerm}
+	}
+	return nonBlank(terms)
+}
+
+// EffectiveExcludeTerms returns the exclusion search terms with blanks dropped,
+// so callers can loop the result directly. Each term becomes an independent
+// NOT (...) conjunct — a row is dropped if ANY term matches.
+func (f QueryFilters) EffectiveExcludeTerms() []string {
+	return nonBlank(f.ExcludeTerms)
+}
+
+// nonBlank returns the input with empty strings dropped.
+func nonBlank(in []string) []string {
+	var out []string
+	for _, t := range in {
+		if t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// Search-corpus predicates — the single source of truth for "what --search
+// scans" on each table. The positive (--search/--header/--body) and negative
+// (--exclude-*) forms share one predicate so they can never drift: positive
+// callers pass the bare string, negative callers prefix "NOT ". COALESCE is
+// used throughout so the negated form is NULL-safe (a bare NOT (NULL LIKE ?)
+// evaluates to NULL and would wrongly drop the row); it is a no-op for the
+// positive form because search terms are always non-blank.
+const (
+	// recordSearchPredicate scans http_records: URL, path, and the raw
+	// request/response corpus (headers + body). Four ? placeholders.
+	recordSearchPredicate = "(COALESCE(r.url, '') LIKE ? OR COALESCE(r.path, '') LIKE ? OR " +
+		"COALESCE(CAST(r.raw_request AS TEXT), '') LIKE ? OR COALESCE(CAST(r.raw_response AS TEXT), '') LIKE ?)"
+
+	// rawCorpusPredicate scans just the raw request/response corpus, backing
+	// --header/--body and their inverses. Two ? placeholders.
+	rawCorpusPredicate = "(COALESCE(CAST(r.raw_request AS TEXT), '') LIKE ? OR COALESCE(CAST(r.raw_response AS TEXT), '') LIKE ?)"
+
+	// severitySortRankExpr maps f.severity to its numeric risk rank for ORDER BY,
+	// so a severity sort ranks by risk instead of alphabetically. Mirrors
+	// severity_gate's canonical order (info<suspect<low<medium<high<critical).
+	severitySortRankExpr = "CASE f.severity" +
+		" WHEN 'critical' THEN 6 WHEN 'high' THEN 5 WHEN 'medium' THEN 4" +
+		" WHEN 'low' THEN 3 WHEN 'suspect' THEN 2 WHEN 'info' THEN 1 ELSE 0 END"
+
+	// findingSearchPredicate scans a finding's own fields plus its linked HTTP
+	// records (via the finding_records junction). The record columns sit inside
+	// EXISTS, which is boolean and never NULL, so they need no COALESCE. Twelve
+	// ? placeholders: 7 finding fields then 5 record fields.
+	findingSearchPredicate = "((COALESCE(f.module_name, '') LIKE ? OR COALESCE(f.module_short, '') LIKE ? OR COALESCE(f.description, '') LIKE ? OR " +
+		"COALESCE(f.module_id, '') LIKE ? OR COALESCE(f.matched_at, '') LIKE ? OR COALESCE(f.request, '') LIKE ? OR COALESCE(f.response, '') LIKE ?)" +
+		" OR EXISTS (SELECT 1 FROM finding_records fr2" +
+		" INNER JOIN http_records r ON r.uuid = fr2.record_uuid" +
+		" WHERE fr2.finding_id = f.id AND (" +
+		" r.url LIKE ? OR r.path LIKE ? OR r.hostname LIKE ?" +
+		" OR CAST(r.raw_request AS TEXT) LIKE ? OR CAST(r.raw_response AS TEXT) LIKE ?" +
+		")))"
+)
 
 // QueryBuilder builds filtered database queries
 type QueryBuilder struct {
@@ -239,9 +314,19 @@ func (qb *QueryBuilder) applyFilters(query *bun.SelectQuery) {
 		}
 	}
 
-	if qb.filters.SearchTerm != "" {
-		searchPattern := "%" + qb.filters.SearchTerm + "%"
-		query.Where("r.url LIKE ? OR r.path LIKE ?", searchPattern, searchPattern)
+	// Search across URL, path, and the raw request/response corpus (headers +
+	// body live in raw_request/raw_response). Multiple terms are AND-combined:
+	// every term must match somewhere, so repeating --search narrows the results.
+	for _, term := range qb.filters.EffectiveSearchTerms() {
+		p := "%" + term + "%"
+		query.Where(recordSearchPredicate, p, p, p, p)
+	}
+
+	// Exclusion search: drop records where ANY term appears anywhere --search
+	// scans (the inverse predicate). Each term is an independent NOT conjunct.
+	for _, term := range qb.filters.EffectiveExcludeTerms() {
+		p := "%" + term + "%"
+		query.Where("NOT "+recordSearchPredicate, p, p, p, p)
 	}
 
 	// Header and body searches scan raw_request/raw_response — these contain
@@ -249,6 +334,10 @@ func (qb *QueryBuilder) applyFilters(query *bun.SelectQuery) {
 	// via the same strategy (FTS5 when available, CAST LIKE fallback).
 	qb.applyRawCorpusSearch(query, qb.filters.HeaderSearch)
 	qb.applyRawCorpusSearch(query, qb.filters.BodySearch)
+
+	// Exclusion counterparts: drop records whose raw corpus contains the term.
+	qb.applyRawCorpusExclude(query, qb.filters.ExcludeHeaderSearch)
+	qb.applyRawCorpusExclude(query, qb.filters.ExcludeBodySearch)
 }
 
 // applyRawCorpusSearch adds a substring filter over the raw_request/raw_response
@@ -260,9 +349,19 @@ func (qb *QueryBuilder) applyRawCorpusSearch(query *bun.SelectQuery, term string
 	if term == "" {
 		return
 	}
-	searchPattern := "%" + term + "%"
-	query.Where("(CAST(r.raw_request AS TEXT) LIKE ? OR CAST(r.raw_response AS TEXT) LIKE ?)",
-		searchPattern, searchPattern)
+	p := "%" + term + "%"
+	query.Where(rawCorpusPredicate, p, p)
+}
+
+// applyRawCorpusExclude drops rows whose raw_request/raw_response corpus contains
+// the term — the inverse of applyRawCorpusSearch (same predicate, negated). A
+// blank term is a no-op.
+func (qb *QueryBuilder) applyRawCorpusExclude(query *bun.SelectQuery, term string) {
+	if term == "" {
+		return
+	}
+	p := "%" + term + "%"
+	query.Where("NOT "+rawCorpusPredicate, p, p)
 }
 
 // applySorting applies sorting to the query
@@ -279,6 +378,14 @@ func (qb *QueryBuilder) applySorting(query *bun.SelectQuery) {
 	}
 
 	query.Order(fmt.Sprintf("%s %s", sortColumn, order))
+
+	// Append the unique uuid as a stable tie-breaker so rows sharing the primary
+	// sort value — e.g. the default second-precision created_at — keep a
+	// deterministic, page-stable order under concurrent ingestion instead of
+	// shifting between requests. Skip when the sort column already IS the uuid.
+	if sortColumn != "r.uuid" {
+		query.Order(fmt.Sprintf("r.uuid %s", order))
+	}
 }
 
 // mapSortColumn maps user-friendly sort names to actual column names
@@ -451,7 +558,9 @@ var AllowedCleanTables = map[string]cleanableTable{
 	"findings":                 {SQLName: "findings", CascadeFirst: []string{"finding_records"}},
 	"finding_records":          {SQLName: "finding_records"},
 	"scans":                    {SQLName: "scans"},
-	"agentic_scans":            {SQLName: "agentic_scans"},
+	"agentic_scans":            {SQLName: "agentic_scans", CascadeFirst: []string{"agent_sections", "agent_finding_candidates"}},
+	"agent_sections":           {SQLName: "agent_sections"},
+	"agent_finding_candidates": {SQLName: "agent_finding_candidates"},
 	"oast_interactions":        {SQLName: "oast_interactions"},
 	"scan_logs":                {SQLName: "scan_logs"},
 	"authentication_hostnames": {SQLName: "authentication_hostnames"},
@@ -495,6 +604,10 @@ var allTablesDeleteOrder = []string{
 	"oast_interactions",
 	"scan_logs",
 	"authentication_hostnames",
+	// Durable-autopilot child tables are cleared before the parent agentic_scans
+	// so a full wipe leaves no orphan sections/candidates behind.
+	"agent_sections",
+	"agent_finding_candidates",
 	"agentic_scans",
 	"scopes",
 	"scans",
@@ -601,6 +714,15 @@ func (fqb *FindingsQueryBuilder) ExecuteWithCount(ctx context.Context) ([]*Findi
 
 // applyFindingFilters applies filter conditions to a findings query
 func (fqb *FindingsQueryBuilder) applyFindingFilters(query *bun.SelectQuery) {
+	// Existing callers are finding-oriented. Keep observations/candidates
+	// queryable through an explicit filter without allowing them to inflate
+	// vulnerability lists, reports, stats, or CI gates by default.
+	if len(fqb.filters.RecordKinds) > 0 {
+		query.Where("f.record_kind IN (?)", bun.List(fqb.filters.RecordKinds))
+	} else {
+		query.Where("(f.record_kind IS NULL OR f.record_kind = '' OR f.record_kind = ?)", RecordKindFinding)
+	}
+
 	// Project scoping
 	if fqb.filters.ProjectUUID != "" {
 		query.Where("f.project_uuid = ?", fqb.filters.ProjectUUID)
@@ -660,22 +782,43 @@ func (fqb *FindingsQueryBuilder) applyFindingFilters(query *bun.SelectQuery) {
 		query.Where("f.status IN (?)", bun.List(fqb.filters.Status))
 	}
 
-	// Domain filtering (join http_records to filter by hostname via junction table)
+	// Domain filtering via associated HTTP records. Uses EXISTS (not a JOIN) so a
+	// finding linked to N records on the matching host yields ONE row, not N — a
+	// JOIN here duplicated both the listed rows and the ScanAndCount total. Matches
+	// the non-duplicating pattern used by the path/method/status/source filters below.
 	if fqb.filters.HostPattern != "" {
-		query.Join("INNER JOIN finding_records AS fr ON fr.finding_id = f.id")
-		query.Join("INNER JOIN http_records AS r ON r.uuid = fr.record_uuid")
 		if strings.Contains(fqb.filters.HostPattern, "*") {
 			pattern := strings.ReplaceAll(fqb.filters.HostPattern, "*", "%")
-			query.Where("r.hostname LIKE ?", pattern)
+			query.Where(`EXISTS (SELECT 1 FROM finding_records fr2
+				INNER JOIN http_records r ON r.uuid = fr2.record_uuid
+				WHERE fr2.finding_id = f.id AND r.hostname LIKE ?)`, pattern)
 		} else {
-			query.Where("r.hostname = ?", fqb.filters.HostPattern)
+			query.Where(`EXISTS (SELECT 1 FROM finding_records fr2
+				INNER JOIN http_records r ON r.uuid = fr2.record_uuid
+				WHERE fr2.finding_id = f.id AND r.hostname = ?)`, fqb.filters.HostPattern)
 		}
 	}
 
-	// Search across description, module_id, matched_at
-	if fqb.filters.SearchTerm != "" {
-		p := "%" + fqb.filters.SearchTerm + "%"
-		query.Where("(f.description LIKE ? OR f.module_id LIKE ? OR f.matched_at LIKE ?)", p, p, p)
+	// Search across the finding's own fields (module metadata, matched location,
+	// request/response snippet) AND the linked HTTP records' url/path/host and
+	// raw request/response corpus. Multiple terms are AND-combined: every term
+	// must match somewhere, so repeating --search progressively narrows.
+	for _, term := range fqb.filters.EffectiveSearchTerms() {
+		p := "%" + term + "%"
+		query.Where(findingSearchPredicate,
+			p, p, p, p, p, p, p, // finding fields
+			p, p, p, p, p) // record fields
+	}
+
+	// Exclusion search: drop findings where ANY term matches the same corpus
+	// --search scans (the inverse predicate). Each term is an independent NOT
+	// conjunct; the record side uses EXISTS so a finding is dropped when a linked
+	// record matches.
+	for _, term := range fqb.filters.EffectiveExcludeTerms() {
+		p := "%" + term + "%"
+		query.Where("NOT "+findingSearchPredicate,
+			p, p, p, p, p, p, p, // finding fields
+			p, p, p, p, p) // record fields
 	}
 
 	// Fuzzy search across finding fields and associated HTTP records
@@ -749,6 +892,27 @@ func (fqb *FindingsQueryBuilder) applyFindingFilters(query *bun.SelectQuery) {
 			))`, bp, bp)
 	}
 
+	// Exclusion counterparts: drop findings that have a linked record whose raw
+	// corpus contains the term (NOT EXISTS — a NULL corpus column simply doesn't
+	// match, so no COALESCE guard is needed here).
+	if fqb.filters.ExcludeHeaderSearch != "" {
+		hp := "%" + fqb.filters.ExcludeHeaderSearch + "%"
+		query.Where(`NOT EXISTS (SELECT 1 FROM finding_records fr2
+			INNER JOIN http_records r ON r.uuid = fr2.record_uuid
+			WHERE fr2.finding_id = f.id AND (
+				CAST(r.raw_request AS TEXT) LIKE ? OR CAST(r.raw_response AS TEXT) LIKE ?
+			))`, hp, hp)
+	}
+
+	if fqb.filters.ExcludeBodySearch != "" {
+		bp := "%" + fqb.filters.ExcludeBodySearch + "%"
+		query.Where(`NOT EXISTS (SELECT 1 FROM finding_records fr2
+			INNER JOIN http_records r ON r.uuid = fr2.record_uuid
+			WHERE fr2.finding_id = f.id AND (
+				CAST(r.raw_request AS TEXT) LIKE ? OR CAST(r.raw_response AS TEXT) LIKE ?
+			))`, bp, bp)
+	}
+
 	// Date range filtering
 	if fqb.filters.DateFrom != nil {
 		query.Where("f.found_at >= ?", fqb.filters.DateFrom)
@@ -771,6 +935,13 @@ func (fqb *FindingsQueryBuilder) applyFindingSorting(query *bun.SelectQuery) {
 		order = "ASC"
 	}
 	query.Order(fmt.Sprintf("%s %s", sortColumn, order))
+	// Secondary key on the unique id makes the row order total (and therefore
+	// list positions reproducible across runs) when the primary sort column has
+	// ties — e.g. several findings sharing a found_at, common under --glob-db
+	// merges. Skipped when id is already the primary sort.
+	if sortColumn != "f.id" {
+		query.Order("f.id " + order)
+	}
 }
 
 // mapFindingSortColumn maps sort names to actual finding column names
@@ -781,7 +952,12 @@ func (fqb *FindingsQueryBuilder) mapFindingSortColumn(name string) string {
 	case "created_at", "created":
 		return "f.created_at"
 	case "severity":
-		return "f.severity"
+		// Rank by risk, not lexically: a plain "f.severity" string sort ordered
+		// "suspect" > "medium" > "low" > "info" > "high" > "critical", which is
+		// nonsense for a severity view. Mirror severity_gate's canonical ranking
+		// (info < suspect < low < medium < high < critical). Portable across
+		// SQLite/Postgres.
+		return severitySortRankExpr
 	case "module_name", "module":
 		return "f.module_name"
 	case "module_id":
@@ -799,14 +975,23 @@ type SeverityCount struct {
 	Count    int64  `bun:"count" json:"count"`
 }
 
-// CountFindingsBySeverity returns finding counts grouped by severity.
-func CountFindingsBySeverity(ctx context.Context, db *DB, projectUUID string) (map[string]int64, error) {
+// CountFindingsBySeverity returns finding counts grouped by severity, filtered by
+// project and, when hostnames is non-empty, restricted to findings on those in-scope
+// hosts. Empty hostnames means no host filter. Findings are scoped by hostname only
+// (the findings table carries no scheme/port column), unlike the origin-precise record
+// scoping; this lets the scan-completion summary count only findings on the hosts
+// actually scanned, not leftovers from prior scans in the same project.
+func CountFindingsBySeverity(ctx context.Context, db *DB, projectUUID string, hostnames ...string) (map[string]int64, error) {
 	var rows []SeverityCount
 	q := db.NewSelect().
 		Model((*Finding)(nil)).
-		ColumnExpr("severity, COUNT(*) AS count")
+		ColumnExpr("severity, COUNT(*) AS count").
+		Where("(record_kind IS NULL OR record_kind = '' OR record_kind = ?)", RecordKindFinding)
 	if projectUUID != "" {
 		q = q.Where("project_uuid = ?", projectUUID)
+	}
+	if len(hostnames) > 0 {
+		q = q.Where("hostname IN (?)", bun.List(hostnames))
 	}
 	err := q.GroupExpr("severity").
 		Scan(ctx, &rows)
@@ -819,6 +1004,36 @@ func CountFindingsBySeverity(ctx context.Context, db *DB, projectUUID string) (m
 		result[row.Severity] = row.Count
 	}
 	return result, nil
+}
+
+// CountRecordsByColumn returns http_record counts grouped by a single column
+// (one of method, status_code, response_content_type), filtered by project
+// (empty = every row, e.g. a --glob-db merge). Keys are the column values as
+// text. Powers the traffic listing's status/method/content-type summary.
+func CountRecordsByColumn(ctx context.Context, db *DB, projectUUID, column string) (map[string]int64, error) {
+	switch column {
+	case "method", "status_code", "response_content_type":
+	default:
+		return nil, fmt.Errorf("CountRecordsByColumn: unsupported column %q", column)
+	}
+	var rows []struct {
+		Key   string `bun:"key"`
+		Count int64  `bun:"count"`
+	}
+	q := db.NewSelect().
+		Model((*HTTPRecord)(nil)).
+		ColumnExpr("CAST(? AS TEXT) AS key, COUNT(*) AS count", bun.Ident(column))
+	if projectUUID != "" {
+		q = q.Where("project_uuid = ?", projectUUID)
+	}
+	if err := q.GroupExpr(column).Scan(ctx, &rows); err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64, len(rows))
+	for _, r := range rows {
+		out[r.Key] = r.Count
+	}
+	return out, nil
 }
 
 // CountFindingsByAgenticScan returns finding counts grouped by severity for
@@ -834,6 +1049,7 @@ func CountFindingsByAgenticScan(ctx context.Context, db *DB, agenticScanUUID str
 		Model((*Finding)(nil)).
 		ColumnExpr("severity, COUNT(*) AS count").
 		Where("agentic_scan_uuid = ?", agenticScanUUID).
+		Where("(record_kind IS NULL OR record_kind = '' OR record_kind = ?)", RecordKindFinding).
 		GroupExpr("severity").
 		Scan(ctx, &rows)
 	if err != nil {
@@ -862,6 +1078,7 @@ func CountFindingsByAgenticScans(ctx context.Context, db *DB, agenticScanUUIDs [
 		Model((*Finding)(nil)).
 		ColumnExpr("severity, COUNT(*) AS count").
 		Where("agentic_scan_uuid IN (?)", bun.List(agenticScanUUIDs)).
+		Where("(record_kind IS NULL OR record_kind = '' OR record_kind = ?)", RecordKindFinding).
 		GroupExpr("severity").
 		Scan(ctx, &rows)
 	if err != nil {
@@ -878,17 +1095,19 @@ func CountFindingsByAgenticScans(ctx context.Context, db *DB, agenticScanUUIDs [
 	return result, nil
 }
 
-// CountFindingsByModule returns finding counts grouped by module_id.
-func CountFindingsByModule(ctx context.Context, db *DB, projectUUID string) (map[string]int64, error) {
+// CountFindingsByModule returns finding counts grouped by module_id, scoped to
+// one agentic-scan run when agenticScanUUID is non-empty (empty = all rows).
+func CountFindingsByModule(ctx context.Context, db *DB, agenticScanUUID string) (map[string]int64, error) {
 	var rows []struct {
 		ModuleID string `bun:"module_id"`
 		Count    int64  `bun:"count"`
 	}
 	q := db.NewSelect().
 		Model((*Finding)(nil)).
-		ColumnExpr("module_id, COUNT(*) AS count")
-	if projectUUID != "" {
-		q = q.Where("project_uuid = ?", projectUUID)
+		ColumnExpr("module_id, COUNT(*) AS count").
+		Where("(record_kind IS NULL OR record_kind = '' OR record_kind = ?)", RecordKindFinding)
+	if agenticScanUUID != "" {
+		q = q.Where("agentic_scan_uuid = ?", agenticScanUUID)
 	}
 	if err := q.GroupExpr("module_id").Scan(ctx, &rows); err != nil {
 		return nil, err
@@ -902,9 +1121,10 @@ func CountFindingsByModule(ctx context.Context, db *DB, projectUUID string) (map
 	return result, nil
 }
 
-// CountFindingsByURL returns finding counts grouped by URL. Findings with
-// an empty URL are skipped — they aren't endpoint-attributable anyway.
-func CountFindingsByURL(ctx context.Context, db *DB, projectUUID string) (map[string]int64, error) {
+// CountFindingsByURL returns finding counts grouped by URL, scoped to one
+// agentic-scan run when agenticScanUUID is non-empty (empty = all rows).
+// Findings with an empty URL are skipped — they aren't endpoint-attributable.
+func CountFindingsByURL(ctx context.Context, db *DB, agenticScanUUID string) (map[string]int64, error) {
 	var rows []struct {
 		URL   string `bun:"url"`
 		Count int64  `bun:"count"`
@@ -912,9 +1132,10 @@ func CountFindingsByURL(ctx context.Context, db *DB, projectUUID string) (map[st
 	q := db.NewSelect().
 		Model((*Finding)(nil)).
 		ColumnExpr("url, COUNT(*) AS count").
-		Where("url IS NOT NULL AND url != ''")
-	if projectUUID != "" {
-		q = q.Where("project_uuid = ?", projectUUID)
+		Where("url IS NOT NULL AND url != ''").
+		Where("(record_kind IS NULL OR record_kind = '' OR record_kind = ?)", RecordKindFinding)
+	if agenticScanUUID != "" {
+		q = q.Where("agentic_scan_uuid = ?", agenticScanUUID)
 	}
 	if err := q.GroupExpr("url").Scan(ctx, &rows); err != nil {
 		return nil, err
@@ -934,7 +1155,8 @@ func CountFindingsByConfidence(ctx context.Context, db *DB, projectUUID string) 
 	}
 	q := db.NewSelect().
 		Model((*Finding)(nil)).
-		ColumnExpr("confidence, COUNT(*) AS count")
+		ColumnExpr("confidence, COUNT(*) AS count").
+		Where("(record_kind IS NULL OR record_kind = '' OR record_kind = ?)", RecordKindFinding)
 	if projectUUID != "" {
 		q = q.Where("project_uuid = ?", projectUUID)
 	}

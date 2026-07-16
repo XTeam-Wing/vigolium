@@ -15,7 +15,7 @@ import (
 	"github.com/uptrace/bun"
 
 	"github.com/vigolium/vigolium/pkg/deparos/internal/dedup"
-	"github.com/vigolium/vigolium/pkg/deparos/jsscan/linkfinder"
+	"github.com/vigolium/vigolium/pkg/deparos/jstangle/linkfinder"
 )
 
 // SiteMap implements Storage using database backend with bun
@@ -191,7 +191,7 @@ func migrateSchema(ctx context.Context, db *bun.DB) error {
 			discovered_at INTEGER,
 			fingerprint_attrs TEXT,
 			tags TEXT,
-			kingfisher_findings TEXT,
+			secret_findings TEXT,
 			first_seen_session INTEGER,
 			last_seen_session INTEGER,
 			hash TEXT
@@ -217,6 +217,14 @@ func migrateSchema(ctx context.Context, db *bun.DB) error {
 			content_type TEXT,
 			headers TEXT,
 			cookies TEXT,
+			source_url TEXT,
+			record_kind TEXT,
+			confidence TEXT,
+			extractor TEXT,
+			module_path TEXT,
+			source_line INTEGER,
+			template_json TEXT,
+			schema_version INTEGER NOT NULL DEFAULT 1,
 			created_at INTEGER NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS observed (
@@ -227,11 +235,46 @@ func migrateSchema(ctx context.Context, db *bun.DB) error {
 			frequency INTEGER NOT NULL DEFAULT 1,
 			updated_at INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS jstangle_source_artifacts (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			source_node_id INTEGER NOT NULL,
+			session_id INTEGER NOT NULL,
+			hash TEXT NOT NULL,
+			generated_url TEXT NOT NULL,
+			virtual_url TEXT NOT NULL,
+			source_path TEXT NOT NULL,
+			language TEXT NOT NULL,
+			content_sha256 TEXT NOT NULL,
+			content TEXT NOT NULL,
+			created_at INTEGER NOT NULL
+		)`,
 	}
 
 	for _, ddl := range tables {
 		if _, err := db.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("failed to create table: %w", err)
+		}
+	}
+
+	// CREATE TABLE IF NOT EXISTS does not add columns to existing scan DBs.
+	// Apply additive, nullable v2 columns and tolerate duplicate-column errors on
+	// databases that already carry them.
+	columnMigrations := []string{
+		"ALTER TABLE extractions ADD COLUMN source_url TEXT",
+		"ALTER TABLE extractions ADD COLUMN record_kind TEXT",
+		"ALTER TABLE extractions ADD COLUMN confidence TEXT",
+		"ALTER TABLE extractions ADD COLUMN extractor TEXT",
+		"ALTER TABLE extractions ADD COLUMN module_path TEXT",
+		"ALTER TABLE extractions ADD COLUMN source_line INTEGER",
+		"ALTER TABLE extractions ADD COLUMN template_json TEXT",
+		"ALTER TABLE extractions ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1",
+	}
+	for _, ddl := range columnMigrations {
+		if _, err := db.ExecContext(ctx, ddl); err != nil {
+			message := strings.ToLower(err.Error())
+			if !strings.Contains(message, "duplicate column") && !strings.Contains(message, "already exists") {
+				return fmt.Errorf("failed to migrate extraction schema: %w", err)
+			}
 		}
 	}
 
@@ -241,6 +284,9 @@ func migrateSchema(ctx context.Context, db *bun.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_session_nodes_timestamp ON session_nodes(timestamp)",
 		"CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_hash ON extractions(hash)",
 		"CREATE INDEX IF NOT EXISTS idx_ext_hostname ON extractions(hostname)",
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_jstangle_source_artifact_hash ON jstangle_source_artifacts(hash)",
+		"CREATE INDEX IF NOT EXISTS idx_jstangle_source_artifact_session ON jstangle_source_artifacts(session_id)",
+		"CREATE INDEX IF NOT EXISTS idx_jstangle_source_artifact_generated ON jstangle_source_artifacts(generated_url)",
 		"CREATE INDEX IF NOT EXISTS idx_obs_hostname ON observed(hostname)",
 		"CREATE UNIQUE INDEX IF NOT EXISTS idx_obs_hostname_type_value ON observed(hostname, type, value)",
 	}
@@ -278,10 +324,10 @@ func (s *SiteMap) ensureSession() error {
 	return nil
 }
 
-// BatchUpdateKingfisherFindings updates kingfisher findings for nodes identified by URL.
-func (s *SiteMap) BatchUpdateKingfisherFindings(urlFindings map[string]string) error {
+// BatchUpdateSecretFindings updates secret findings for nodes identified by URL.
+func (s *SiteMap) BatchUpdateSecretFindings(urlFindings map[string]string) error {
 	ctx := context.Background()
-	return s.repo.BatchUpdateKingfisherFindings(ctx, urlFindings)
+	return s.repo.BatchUpdateSecretFindings(ctx, urlFindings)
 }
 
 // Close ends the session and releases resources
@@ -330,7 +376,7 @@ func (s *SiteMap) SessionDBID() int64 {
 	return s.sessionDBID
 }
 
-// Extractions returns the extraction repository for storing spider/jsscan/form extractions.
+// Extractions returns the extraction repository for storing spider/jstangle/form extractions.
 func (s *SiteMap) Extractions() *ExtractionRepository {
 	return s.extractionRepo
 }
@@ -370,7 +416,10 @@ func (s *SiteMap) Store(result *Result) error {
 			result.Request.Method,
 			result.Response.StatusCode,
 			serverHeader,
-			result.URL.Path,
+			// Escaped (wire) path: keeps a path-normalization bypass distinct
+			// ("/%23/../x" vs "/x", or the decoded "/#/../x" whose "#" would
+			// otherwise strip to "/"), matching the request actually sent.
+			result.URL.EscapedPath(),
 			result.URL.RawQuery,
 			result.Request.Body,
 		)

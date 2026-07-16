@@ -3,7 +3,7 @@ import { cac } from "cac";
 import chalk from "chalk";
 import pkg from "../package.json" with { type: "json" };
 import { AUTHOR, BUILD_DATE, COMMIT_HASH, DOCS, WEBSITE } from "./build-info.js";
-import type { AgentPlatform } from "./engine/types.js";
+import type { AgentPlatform, AgentTransport } from "./engine/types.js";
 
 const TAGLINE =
   "vigolium-audit is an autonomous source-code security audit agent. It drives Claude or Codex through a multi-agent pipeline — gathering advisories, surfacing candidates, proposing attack paths, debating exploitability, and killing false positives — to surface high-confidence, exploitable findings in your repository.";
@@ -34,6 +34,10 @@ cli.option(
   "--agent <agent>",
   "Agent platform (claude|codex). Defaults to claude where it applies; ignored by deterministic commands (strip/status/list/...) and by `merge --premerge-only`.",
 );
+cli.option(
+  "--transport <transport>",
+  "Headless adapter transport (auto|sdk|cli). Codex auto prefers the Agent SDK; interactive (-i) always uses the native CLI. `verify` also accepts both.",
+);
 
 // --- examples (shown under `vigolium-audit --help`) -----------------------------------
 // Each entry: cyan section header, then per-command pairs of (gray comment, command).
@@ -47,8 +51,17 @@ const blank = () => cli.example("");
 
 section("# Quickstart");
 cmd("preflight: binary + auth + ping", "vigolium-audit verify claude");
+cmd("preflight both Codex transports", "vigolium-audit verify codex --transport both");
 cmd("3-phase headless surface scan", "vigolium-audit run --mode lite --target ./repo");
 cmd("full 15-phase audit, interactive (auto-installs harness, cleans up on exit)", "vigolium-audit run --mode deep --agent claude -i");
+cmd("Codex Agent SDK deep audit", "vigolium-audit run --mode deep --agent codex --transport sdk");
+blank();
+
+section("# Harness install (persistent; run -i also auto-installs ephemerally)");
+cmd("install the claude harness into ~/.config/vigolium-audit/harness-claude", "vigolium-audit setup claude");
+cmd("install both claude + codex harnesses", "vigolium-audit setup");
+cmd("remove one platform's harness", "vigolium-audit uninstall --agent codex");
+cmd("remove all installed harnesses", "vigolium-audit uninstall");
 blank();
 
 section("# Auth overrides (one-shot, restored on exit)");
@@ -137,6 +150,9 @@ const runCmd = cli
   .option("--target <path-or-url>", "Target directory, or a remote git URL (https://github.com/..., https://gitlab.com/..., git@host:owner/repo, git://, ssh://). A URL is cloned with --depth=1 into ./<owner-repo>/ under the current working directory and used as the audit target; an existing same-remote checkout there is reused in place.", { default: "." })
   .option("--source <path-or-url>", "Alias of --target (parity with `vigolium agent audit --source`); accepts the same path or remote git URL forms.")
   .option("-i, --interactive", "Enable Ink TUI (auto-disabled when stdout is not a TTY)")
+  .option("--tmux", "Interactive runs (-i): launch the agent handoff command inside a detached tmux session and stream its output to stdout (attach with `tmux attach -t <session>`). Requires tmux on PATH.")
+  .option("--agent-binary <path>", "Interactive runs (-i): path or command name of the agent binary to exec (e.g. a wrapper like 'cc'/'cw' that pre-loads env). Overrides auto-detection. Leading ~/ is expanded; a bare name is resolved via PATH.")
+  .option("--disallowed-tools <tools>", "Interactive claude runs (-i): pass through to the CLI as --disallowedTools (e.g. \"AskUserQuestion\" to stop the agent blocking on an interactive prompt).")
   .option("--from-audit <id>", "Source audit id for confirm/merge/diff modes")
   .option("--baseline <ref>", "Baseline git ref for diff mode")
   .option("--max-cost <usd>", "Hard cost cap in USD; abort when exceeded")
@@ -185,10 +201,20 @@ runSection("# Quickstart");
 runCmdEx("fast 3-phase headless surface scan", "vigolium-audit run --mode lite --target ./repo");
 runCmdEx("full multi-phase audit (recon, candidates, attack paths, debate)", "vigolium-audit run --mode deep --target ./repo");
 runCmdEx("interactive — drops you into the CLI with the vigolium-audit harness installed", "vigolium-audit run --mode deep -i");
+runCmdEx("Codex Agent SDK (also selected by Codex auto)", "vigolium-audit run --mode deep --agent codex --transport sdk");
+runCmdEx("Codex interactive — canonical mode prompt starts automatically", "vigolium-audit run --mode deep --agent codex -i");
 runCmdEx("remote target as a git URL (clones into ./<owner-repo>/ under cwd)", "vigolium-audit run --mode deep --target https://github.com/Yoast/wordpress-seo");
 runCmdEx("GitLab URL works the same way", "vigolium-audit run --mode deep --target https://gitlab.com/owner/repo");
 runCmdEx("SSH form also accepted", "vigolium-audit run --mode deep --target git@github.com:owner/repo.git");
 runCmdEx("--source is an alias of --target (accepts paths or git URLs)", "vigolium-audit run --mode deep --source ./repo");
+runBlank();
+
+runSection("# Interactive handoff tweaks (-i only)");
+runCmdEx("run the handoff inside a detached tmux session and stream it (attach with `tmux attach`)", "vigolium-audit run --mode deep -i --tmux");
+runCmdEx("use a custom claude wrapper that sets up env (e.g. 'cc'/'cw')", "vigolium-audit run --mode deep -i --agent-binary cc");
+runCmdEx("point at an absolute binary path", "vigolium-audit run --mode deep -i --agent-binary ~/.local/bin/claude");
+runCmdEx("stop the agent blocking on questions (claude)", "vigolium-audit run --mode deep -i --disallowed-tools AskUserQuestion");
+runCmdEx("all three together", "vigolium-audit run --mode deep -i --tmux --agent-binary cw --disallowed-tools AskUserQuestion");
 runBlank();
 
 runSection("# Audit modes (each mode runs a different phase graph)");
@@ -250,11 +276,59 @@ runCmdEx("stream NDJSON phase events", "vigolium-audit run --mode lite --json | 
 runCmdEx("verbose: tool inputs/results, thinking, child stderr", "vigolium-audit run --mode lite --debug");
 runCmdEx("capture verbose output to a file", "vigolium-audit run --mode lite --debug 2> vigolium-audit.log");
 
+const bridgeCmd = cli
+  .command(
+    "bridge <action>",
+    "Sidecar: drive Claude/Codex via the Agent SDK for a single task. <action> is a task preset (triage|exploit|plan), `run` (raw prompt), `serve` (long-lived NDJSON daemon), or `list`. The vigolium-scanner skill is always loaded so the agent can operate the vigolium CLI. Built for the Go vigolium binary to call.",
+  )
+  .option("--model <model>", "Model forwarded to the agent runtime (e.g. sonnet|opus|a full model id). Defaults to the task preset or the runtime default; VIGOLIUM_AUDIT_MODEL also honored.")
+  .option("--cwd <dir>", "Working directory the agent operates on (the target under assessment). Defaults to --target or the current directory.")
+  .option("--target <dir>", "Alias of --cwd.")
+  .option("--prompt <text>", "User instruction / task text.")
+  .option("--prompt-file <path>", "Read the user prompt from a file (use '-' semantics by piping stdin instead).")
+  .option("--input <text>", "Structured input context (e.g. a finding), inlined under a '# Task input' block.")
+  .option("--input-file <path>", "Read structured input context (e.g. a finding JSON) from a file.")
+  .option("--system-prompt <text>", "Override the system prompt (honored for the `run` action only).")
+  .option("--system-prompt-file <path>", "Read the system-prompt override from a file.")
+  .option("--skill <name>", "Load an extra skill on top of the task defaults (repeatable). vigolium-scanner is always loaded.")
+  .option("--allow-tools <list>", "Comma-separated tool allow-list. Default: no restriction (all tools).")
+  .option("--deny-tools <list>", "Comma-separated tools to deny. AskUserQuestion is always denied (headless).")
+  .option("--max-turns <n>", "Hard cap on conversation turns.")
+  .option("--resume <sessionId>", "Resume a prior session (from an earlier run's `session` event) so a follow-up continues the same conversation, e.g. triage → exploit.")
+  .option("--output <mode>", "json|text — override the task's output mode. json extracts the final fenced JSON block into result.output.")
+  .option("--permission <profile>", "Least-privilege profile: read-only|workspace-write|full-access. Overrides the task default (plan/triage=read-only, exploit=workspace-write, run=full-access).")
+  .option("--network", "Allow the agent network egress (Codex enforces; profile default otherwise).")
+  .option("--no-network", "Deny the agent network egress (Codex enforces).")
+  .option("--no-bypass-permissions", "Do NOT bypass tool-permission prompts (default: bypass, required for autonomous tool use).")
+  .option("--oauth-token <token>", "Set CLAUDE_CODE_OAUTH_TOKEN for the run/daemon")
+  .option("--oauth-cred-file <path>", "Override platform creds for the run/daemon; original backed up + restored on exit")
+  .option("--api-key <key>", "Pass as platform API key env (claude → ANTHROPIC_API_KEY, codex → OPENAI_API_KEY)")
+  .action(async (action: string, opts) => {
+    const { bridgeCommand } = await import("./cli/bridge.js");
+    await bridgeCommand(action, opts);
+  });
+
+const bridgeEx = (comment: string, command: string) => {
+  bridgeCmd.example(`# ${comment}`);
+  bridgeCmd.example(`  ${command}`);
+};
+bridgeEx("triage a finding (JSON in, JSON verdict out), machine-readable", "vigolium-audit bridge triage --input-file finding.json --cwd ./repo --json");
+bridgeEx("plan an attack against a target's code + attack surface", "vigolium-audit bridge plan --input-file vigolium-results/attack-surface/summary.md --cwd ./repo");
+bridgeEx("develop a PoC for a confirmed finding against a live target", "vigolium-audit bridge exploit --input-file finding.json --prompt 'target: https://staging.example.com' --cwd ./repo");
+bridgeEx("triage then exploit on the SAME conversation (chain via --resume)", "vigolium-audit bridge exploit --resume <sessionId-from-triage> --json");
+bridgeEx("raw prompt, no preset, pick a skill and model", "vigolium-audit bridge run --prompt 'summarize the auth flow' --skill audit --model opus --cwd ./repo");
+bridgeEx("pipe the prompt via stdin", "echo 'is the /admin route authenticated?' | vigolium-audit bridge run --cwd ./repo");
+bridgeEx("long-lived daemon: Go sends NDJSON requests on stdin, reads events on stdout", "vigolium-audit bridge serve --cwd ./repo --json");
+bridgeEx("list available task presets", "vigolium-audit bridge list");
+
 cli
   .command("verify <platform>", "Verify install + adapter probe")
-  .action(async (platform: string, opts: { json?: boolean }) => {
+  .action(async (platform: string, opts: { json?: boolean; transport?: string }) => {
     const { verifyCommand } = await import("./cli/verify.js");
-    await verifyCommand(platform, { json: !!opts.json });
+    await verifyCommand(platform, {
+      json: !!opts.json,
+      ...(opts.transport !== undefined ? { transport: opts.transport } : {}),
+    });
   });
 
 cli
@@ -267,10 +341,23 @@ cli
   });
 
 cli
-  .command("uninstall <platform>", "Manually remove leftover vigolium-audit harness state (escape hatch — `vigolium-audit run -i` already auto-cleans)")
-  .action(async (platform: string, opts: { json?: boolean }) => {
+  .command(
+    "setup [platform]",
+    "Install the vigolium-audit harness into the agent config dir (claude → ~/.config/vigolium-audit/harness-claude, codex → ~/.codex/agents). Pass a platform or --agent <platform>; omit to install both. Persistent — removed by `vigolium-audit uninstall`.",
+  )
+  .action(async (platform: string | undefined, opts: { json?: boolean; agent?: string }) => {
+    const { setupCommand } = await import("./cli/setup.js");
+    await setupCommand(platform ?? opts.agent, { json: !!opts.json });
+  });
+
+cli
+  .command(
+    "uninstall [platform]",
+    "Remove installed vigolium-audit harness state. Pass a platform (claude|codex) or --agent <platform>; omit to remove all. (`vigolium-audit run -i` already auto-cleans its own ephemeral install.)",
+  )
+  .action(async (platform: string | undefined, opts: { json?: boolean; agent?: string }) => {
     const { uninstallCommand } = await import("./cli/uninstall.js");
-    await uninstallCommand(platform, { json: !!opts.json });
+    await uninstallCommand(platform ?? opts.agent, { json: !!opts.json });
   });
 
 cli
@@ -300,6 +387,7 @@ cli
       force?: boolean;
       premergeOnly?: boolean;
       agent?: AgentPlatform;
+      transport?: AgentTransport;
       model?: string;
       maxCost?: number;
       strict?: boolean;
@@ -355,6 +443,7 @@ cli
       path: string | undefined,
       opts: {
         agent?: string;
+        transport?: AgentTransport;
         strict?: boolean;
         maxCost?: string;
         output?: string;
@@ -407,6 +496,7 @@ const confirmCmd = cli
       path: string | undefined,
       opts: {
         agent?: string;
+        transport?: AgentTransport;
         model?: string;
         interactive?: boolean;
         fromAudit?: string;

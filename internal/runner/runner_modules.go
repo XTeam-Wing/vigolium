@@ -52,12 +52,13 @@ func (r *Runner) groupFindingsByValue(ctx context.Context, phase string, hostnam
 		return
 	}
 	deleted, grouped, err := r.repository.GroupFindingsByValue(ctx, r.options.ProjectUUID, database.GroupFindingOptions{
-		PerHost:   gc.PerHost,
-		Tags:      gc.Tags,
-		ByModule:  gc.ByModule,
-		ByRule:    gc.ByRule,
-		MaxURLs:   gc.MaxURLs,
-		Hostnames: hostnames,
+		PerHost:       gc.PerHost,
+		Tags:          gc.Tags,
+		ByModule:      gc.ByModule,
+		ByRule:        gc.ByRule,
+		BundleSuspect: gc.BundleSuspect,
+		MaxURLs:       gc.MaxURLs,
+		Hostnames:     hostnames,
 	})
 	if err != nil {
 		zap.L().Warn("Finding value-grouping failed", zap.String("phase", phase), zap.Error(err))
@@ -119,6 +120,13 @@ func (r *Runner) resolveAllModules(infra *phaseInfra) ([]modules.ActiveModule, [
 }
 
 // getModulesToExecute returns the active and passive modules to execute based on options.
+//
+// Sentinel convention for options.Modules / options.PassiveModules: a nil/empty
+// slice selects ZERO modules for that category; []string{"all"} selects every
+// module; any other list selects those IDs. Callers disable a whole category by
+// leaving its slice empty — e.g. scan-url's --no-passive nils PassiveModules and
+// server's --passive-only nils Modules. Do not make an empty slice default to
+// "all" without updating those callers.
 func (r *Runner) getModulesToExecute() ([]modules.ActiveModule, []modules.PassiveModule) {
 	var activeModules []modules.ActiveModule
 	var passiveModules []modules.PassiveModule

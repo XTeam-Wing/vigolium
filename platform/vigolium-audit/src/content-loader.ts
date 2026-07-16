@@ -44,6 +44,21 @@ interface ResolvedRoots {
 
 const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
 
+/**
+ * Split a markdown source into its YAML frontmatter (parsed to an object) and
+ * the body after the closing `---`. Non-object / absent frontmatter yields an
+ * empty object and the whole source as the body. Shared by every content kind
+ * (agent-defs here, bridge task presets) so the frontmatter contract stays in
+ * one place.
+ */
+export function parseFrontmatter(src: string): { data: Record<string, unknown>; body: string } {
+  const match = src.match(FRONTMATTER_RE);
+  if (!match) return { data: {}, body: src };
+  const parsed = parseYaml(match[1]!);
+  const data = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+  return { data, body: match[2] ?? "" };
+}
+
 class FilesystemContentLoader implements ContentLoader {
   constructor(private readonly roots: ResolvedRoots) {}
 
@@ -88,14 +103,7 @@ class FilesystemContentLoader implements ContentLoader {
       ?? join(this.roots.contentRoot, "agent-defs", `${name}.md`);
     if (!existsSync(path)) throw new Error(`agent-def not found: ${name} (looked in ${path})`);
     const src = await readFile(path, "utf8");
-    const match = src.match(FRONTMATTER_RE);
-    let fm: Record<string, unknown> = {};
-    let body = src;
-    if (match) {
-      const parsed = parseYaml(match[1]!);
-      if (parsed && typeof parsed === "object") fm = parsed as Record<string, unknown>;
-      body = match[2] ?? "";
-    }
+    const { data: fm, body } = parseFrontmatter(src);
     const tools = parseToolsList(fm["allowed-tools"] ?? fm["tools"]);
     return {
       name,
@@ -108,16 +116,34 @@ class FilesystemContentLoader implements ContentLoader {
 
   async loadCommand(mode: string, opts: { variant?: ContentVariant } = {}): Promise<CommandDef> {
     const variant = opts.variant ?? "default";
+    const overridePath = await this.resolveOverride("commands", `${mode}.md`);
+    if (overridePath) {
+      const src = await readFile(overridePath, "utf8");
+      return parseCommandDef(src, overridePath);
+    }
+
+    const canonicalPath = join(this.roots.contentRoot, "command-defs", `${mode}.md`);
     const variantPath =
       variant === "sdk"
         ? join(this.roots.contentRoot, "sdk-variants", "command-defs", `${mode}.md`)
         : null;
-    const path = (await this.resolveOverride("commands", `${mode}.md`))
-      ?? (variantPath && existsSync(variantPath) ? variantPath : null)
-      ?? join(this.roots.contentRoot, "command-defs", `${mode}.md`);
-    if (!existsSync(path)) throw new Error(`command-def not found: ${mode} (looked in ${path})`);
-    const src = await readFile(path, "utf8");
-    return parseCommandDef(src, path);
+    if (!existsSync(canonicalPath)) {
+      throw new Error(`command-def not found: ${mode} (looked in ${canonicalPath})`);
+    }
+
+    const canonical = parseCommandDef(await readFile(canonicalPath, "utf8"), canonicalPath);
+    if (!variantPath || !existsSync(variantPath)) return canonical;
+
+    // SDK variants transform prose and tool names only. Keep orchestration
+    // metadata (phase graph, agents, completion contracts) canonical so a
+    // stale generated variant can never silently weaken engine enforcement.
+    const sdk = parseCommandDef(await readFile(variantPath, "utf8"), variantPath);
+    return {
+      ...canonical,
+      body: sdk.body,
+      ...(sdk.allowed_tools_raw !== undefined ? { allowed_tools_raw: sdk.allowed_tools_raw } : {}),
+      source_path: variantPath,
+    };
   }
 
   async resolveSkillDir(name: string): Promise<string> {

@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
 )
 
@@ -42,7 +43,7 @@ func scan(t *testing.T, path, body string) []*severityFinding {
 	out := make([]*severityFinding, 0, len(results))
 	for _, r := range results {
 		assert.Equal(t, ModuleID, r.ModuleID)
-		out = append(out, &severityFinding{name: r.Info.Name, sev: r.Info.Severity})
+		out = append(out, &severityFinding{name: r.Info.Name, sev: r.Info.Severity, kind: r.RecordKind})
 	}
 	return out
 }
@@ -50,6 +51,7 @@ func scan(t *testing.T, path, body string) []*severityFinding {
 type severityFinding struct {
 	name string
 	sev  severity.Severity
+	kind output.RecordKind
 }
 
 func find(findings []*severityFinding, name string) *severityFinding {
@@ -68,6 +70,7 @@ func TestWildcardSend_Medium(t *testing.T) {
 	f := find(scan(t, "/app/main.js", body), "postMessage Sent to Wildcard Origin (*)")
 	require.NotNil(t, f, "expected wildcard-send finding")
 	assert.Equal(t, severity.Medium, f.sev)
+	assert.Equal(t, output.RecordKindCandidate, f.kind)
 }
 
 // TestWildcardSend_ObjectArg covers an object message argument plus a transfer list.
@@ -103,6 +106,7 @@ func TestInlineHandler_NoOriginCheck_Medium(t *testing.T) {
 	f := find(findings, "postMessage Handler Without Origin Validation")
 	require.NotNil(t, f, "expected unchecked-handler finding")
 	assert.Equal(t, severity.Medium, f.sev)
+	assert.Equal(t, output.RecordKindCandidate, f.kind)
 	assert.Nil(t, find(findings, "postMessage Handler Detected"), "should not also be reported as Info")
 }
 
@@ -123,6 +127,7 @@ func TestInlineHandler_WithOriginGuard_Info(t *testing.T) {
 	f := find(findings, "postMessage Handler Detected")
 	require.NotNil(t, f, "expected Info handler-detected finding")
 	assert.Equal(t, severity.Info, f.sev)
+	assert.Equal(t, output.RecordKindObservation, f.kind)
 	assert.Nil(t, find(findings, "postMessage Handler Without Origin Validation"), "validated handler must not be Medium")
 }
 
@@ -160,6 +165,59 @@ func TestWorkerAddEventListener_NoFinding(t *testing.T) {
 	body := `worker.addEventListener("message", e => process(e.data)); ws.addEventListener('message', onMsg);`
 	findings := scan(t, "/app/worker.js", body)
 	assert.Empty(t, findings, "worker/ws addEventListener('message') must not be flagged")
+}
+
+// TestWildcardSend_SchedulerEmptyPayload_NoFinding drops the MessageChannel
+// feature-detection self-ping postMessage("","*"), a benign bundler pattern.
+func TestWildcardSend_SchedulerEmptyPayload_NoFinding(t *testing.T) {
+	t.Parallel()
+	body := `!function(){return e.postMessage("","*"),e.onmessage=r}();`
+	findings := scan(t, "/static/chunks/main-93dbaebda72da021.js", body)
+	assert.Empty(t, findings, "empty-payload self-ping carries no data and must be dropped entirely")
+}
+
+// TestWildcardSend_SchedulerCoercion_NoFinding drops the scalar string-coercion
+// scheduler token postMessage(id+"","*") emitted by setImmediate polyfills.
+func TestWildcardSend_SchedulerCoercion_NoFinding(t *testing.T) {
+	t.Parallel()
+	body := `global.postMessage(id + '', '*'); c.postMessage(e+"","*");`
+	findings := scan(t, "/vendors~main.js", body)
+	assert.Empty(t, findings, "string-coercion scheduler tokens must be dropped")
+}
+
+// TestWildcardSend_SelfAlias_Low keeps an ambiguous same-window/alias send (e.g.
+// axios' P.postMessage(e,"*")) as Low, out of the Medium bucket.
+func TestWildcardSend_SelfAlias_Low(t *testing.T) {
+	t.Parallel()
+	body := `var P=window;P.postMessage(e,"*");`
+	findings := scan(t, "/vendors~main-776354fc.js", body)
+	assert.Nil(t, find(findings, "postMessage Sent to Wildcard Origin (*)"), "self-alias send must not be Medium")
+	f := find(findings, "postMessage to Wildcard Origin (same-window)")
+	require.NotNil(t, f, "self-alias send should still be reported at Low")
+	assert.Equal(t, severity.Low, f.sev)
+}
+
+// TestWildcardSend_CrossDocument_Medium keeps a genuine cross-document data send
+// (window.parent.postMessage({...},"*")) at Medium.
+func TestWildcardSend_CrossDocument_Medium(t *testing.T) {
+	t.Parallel()
+	body := `window.parent.postMessage({Name:n,Payload:t},"*");`
+	f := find(scan(t, "/Include/TEMP3/639173581050000000.js", body), "postMessage Sent to Wildcard Origin (*)")
+	require.NotNil(t, f, "cross-document object send must be flagged")
+	assert.Equal(t, severity.Medium, f.sev)
+}
+
+// TestServiceWorkerHandler_Info keeps a service-worker message handler at Info:
+// SW message events are same-origin, so the missing origin check is not the
+// cross-origin DOM-XSS class.
+func TestServiceWorkerHandler_Info(t *testing.T) {
+	t.Parallel()
+	body := `self.addEventListener("message",e=>{const t=e.data;if(!t)return;handle(t);});`
+	findings := scan(t, "/service-worker.js", body)
+	assert.Nil(t, find(findings, "postMessage Handler Without Origin Validation"), "service-worker handler must not be Medium")
+	f := find(findings, "postMessage Handler Detected")
+	require.NotNil(t, f, "service-worker handler should still be reported at Info")
+	assert.Equal(t, severity.Info, f.sev)
 }
 
 // TestCleanCode_NoFinding verifies benign JS produces no findings.

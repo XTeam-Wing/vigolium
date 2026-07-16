@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -43,7 +44,13 @@ var scanCmd = &cobra.Command{
 	Long: `Run the native scan pipeline against one or more targets. Phases run in order:
 ingestion → discovery → external-harvest → spidering → known-issue-scan → dynamic-assessment → extension.
 
-Use --only / --skip to limit phases, --strategy or --scanning-profile for tuned presets, and --ext / --ext-dir to load custom JavaScript extensions.`,
+Use --only / --skip to limit phases, --strategy or --scanning-profile for tuned presets, and --ext / --ext-dir to load custom JavaScript extensions.
+
+Targets may be passed as positional URLs (vigolium scan https://a https://b), via
+repeated -t/--target, or from -T/--target-file; the three combine and duplicates
+are removed. A positional value is always treated as a target URL, never a file —
+use -T or -i for files.`,
+	Args: cobra.ArbitraryArgs,
 	RunE: runScanCmd,
 }
 
@@ -53,6 +60,7 @@ func init() {
 	registerInputSourceFlags(flags)
 	registerHTTPClientFlags(flags)
 	registerScanModuleFlags(flags)
+	registerModuleSelectionFlags(flags)
 	registerScanPipelineFlags(flags)
 	registerSpecFlags(flags)
 	registerNativeScanFlags(flags, true)
@@ -90,6 +98,22 @@ func shouldWidenKnownIssueScanSeverities(onlyPhase string, severitiesExplicit bo
 	return false // already covers every level
 }
 
+// mergePositionalTargets combines positional target URLs with repeated --target
+// values, preserving order (positional first) and removing duplicates and blanks.
+func mergePositionalTargets(positional, flagged []string) []string {
+	seen := make(map[string]bool, len(positional)+len(flagged))
+	out := make([]string, 0, len(positional)+len(flagged))
+	for _, src := range [][]string{positional, flagged} {
+		for _, t := range src {
+			if t = strings.TrimSpace(t); t != "" && !seen[t] {
+				seen[t] = true
+				out = append(out, t)
+			}
+		}
+	}
+	return out
+}
+
 func runScanCmd(cmd *cobra.Command, args []string) (err error) {
 	defer syncLogger()
 
@@ -105,17 +129,29 @@ func runScanCmd(cmd *cobra.Command, args []string) (err error) {
 
 	// Copy global flags into scan options
 	scanOpts.ScanUUID = globalScanUUID
-	scanOpts.Modules = resolveModules()
-	scanOpts.PassiveModules = []string{"all"}
-	scanOpts.Targets = globalTargets
+	if err := validateModuleSelectionFlags(false); err != nil {
+		return err
+	}
+	scanOpts.Modules, scanOpts.PassiveModules = resolveModuleSelection(false)
+	// Positional URLs combine with repeated -t/--target (positional first),
+	// de-duplicated. `run` passes nil here since its positional arg is a phase.
+	scanOpts.Targets = mergePositionalTargets(args, globalTargets)
 	scanOpts.TargetsFilePaths = globalTargetFiles
 	scanOpts.InputFileMode = globalInputMode
 	scanOpts.InputReadTimeout = globalInputReadTimeout
 	scanOpts.Timeout = globalTimeout
 	scanOpts.Concurrency = globalConcurrency
 	scanOpts.MaxPerHost = globalMaxPerHost
+	scanOpts.NoWafPacing = globalNoWafPacing
 	scanOpts.ConcurrencyExplicitlySet = cmd.Flags().Changed("concurrency")
 	scanOpts.MaxPerHostExplicitlySet = cmd.Flags().Changed("max-per-host")
+	// --rate-limit is enforced only when the operator sets it explicitly, so
+	// default scans keep their current throughput. When set it drives the native
+	// token-bucket cap here; the known-issue-scan / nuclei limiter is wired from
+	// the same value once settings load below.
+	if cmd.Flags().Changed("rate-limit") {
+		scanOpts.RateLimit = globalRateLimit
+	}
 	scanOpts.MaxHostError = globalMaxHostError
 	scanOpts.MaxFindingsPerModule = globalMaxFindingsPerModule
 	scanOpts.Verbose = globalVerbose
@@ -202,6 +238,13 @@ func runScanCmd(cmd *cobra.Command, args []string) (err error) {
 
 	if scanOpts.ScopeOriginMode != "" {
 		settings.Scope.CLIOriginMode = scanOpts.ScopeOriginMode
+	}
+
+	// Propagate an explicit --rate-limit into the scanning pace so the
+	// known-issue-scan / nuclei limiter honors it (previously it read only its
+	// config default and the flag was dropped for native scans entirely).
+	if cmd.Flags().Changed("rate-limit") {
+		settings.ScanningPace.RateLimit = globalRateLimit
 	}
 
 	// Override OAST URL if --oast-url flag is set
@@ -302,6 +345,12 @@ func runScanCmd(cmd *cobra.Command, args []string) (err error) {
 	if globalSkipHeuristics {
 		scanOpts.HeuristicsCheck = "none"
 	}
+
+	// A hand-picked module selection (--module-id / -m) implies a targeted,
+	// low-noise scan, so auto-skip the broad known-issue-scan pass before phase
+	// selection resolves it. Must run after the strategy sets KnownIssueScanEnabled
+	// and before ApplyNativePhaseSelection consumes SkipPhases.
+	autoSkipKnownIssueScanForModuleSelection(scanOpts)
 
 	if err := runner.ApplyNativePhaseSelection(scanOpts, func() {
 		settings.DynamicAssessment.Extensions.Enabled = true
@@ -442,6 +491,9 @@ func runScanCmd(cmd *cobra.Command, args []string) (err error) {
 		if err := settings.Spidering.Validate(); err != nil {
 			return fmt.Errorf("invalid spidering configuration: %w", err)
 		}
+	}
+	if scanNoCarryBrowserSession {
+		scanOpts.CarryBrowserSession = false
 	}
 	if scanOpts.ExternalHarvestEnabled {
 		if len(settings.ExternalHarvester.Sources) == 0 {
@@ -725,9 +777,11 @@ func reportNativeScanSuccess(db *database.DB, settings *config.Settings, repo *d
 	finishFSExport(db, scanOpts)
 	uploadNativeScanResults(settings, scanOpts, repo)
 	if !scanOpts.Silent {
-		fmt.Fprintf(os.Stderr, "\n%s %s\n", terminal.Aqua(terminal.SymbolSparkle), terminal.BoldAqua("Native scan completed"))
-		printScanCompletionSummary(repo, time.Since(scanStart))
+		hosts := summaryScopeHosts(context.Background(), repo, settings, scanOpts.Targets, scanOpts.ProjectUUID, scanOpts.ScanUUID)
+		printScanCompletionSummary(repo, scanOpts.ProjectUUID, hosts, time.Since(scanStart))
 	}
+	maybePrintScanFindings(context.Background(), db, scanOpts.ProjectUUID, scanOpts.ScanUUID)
+	maybePrintScanTraffic(context.Background(), db, scanOpts.ProjectUUID)
 	evaluateFailOnGate(repo, scanOpts.ProjectUUID, scanOpts.ScanUUID, scanOpts.Silent)
 }
 
@@ -747,11 +801,14 @@ func runStatelessTargetFile(cmd *cobra.Command, settings *config.Settings, strat
 		return fmt.Errorf("target file(s) %s contain no targets", strings.Join(scanOpts.TargetsFilePaths, ", "))
 	}
 
-	// Parallel fan-out: with -P > 1 and more than one target, scan targets
-	// concurrently as isolated child processes instead of looping sequentially
-	// in this process. A single target (or -P 1) keeps the in-process path
-	// below unchanged — there is nothing to parallelize and no exec overhead.
-	if scanOpts.Parallel > 1 && len(targets) > 1 {
+	// Fan-out dispatch: any multi-target run routes through the fan-out, which
+	// scans targets as isolated child processes and prints the compact
+	// start/done progress lines plus a roll-up. With -P > 1 it runs several at a
+	// time; at -P 1 the same path serializes (one worker slot) so a sequential
+	// run gets the identical progress output — only the concurrency differs. A
+	// single target keeps the in-process path below (live per-target console,
+	// full banner) — there is nothing to fan out and no exec overhead.
+	if len(targets) > 1 {
 		return runStatelessTargetsParallel(cmd, settings, strategyName, targets)
 	}
 
@@ -764,13 +821,32 @@ func runStatelessTargetFile(cmd *cobra.Command, settings *config.Settings, strat
 	origFiles := scanOpts.TargetsFilePaths
 	origOutput := scanOpts.Output
 	origPrinted := scanOpts.ScanConfigPrinted
+	origCaptured := scanOpts.CapturedConsole
 	scanOpts.TargetsFilePaths = nil
 	defer func() {
 		scanOpts.Targets = origTargets
 		scanOpts.TargetsFilePaths = origFiles
 		scanOpts.Output = origOutput
 		scanOpts.ScanConfigPrinted = origPrinted
+		scanOpts.CapturedConsole = origCaptured
 	}()
+
+	// Per-target console capture: mirror each target's live console session to a
+	// sibling <output>-<host>.console.log — the same artifact the -P parallel
+	// fan-out writes for every child, so a sequential (non-P) split-by-host run is
+	// no longer missing it. Only worthwhile when the requested output is deferred
+	// to files (jsonl/html/sqlite/fs): with a plain console format the console IS
+	// the output and a second copy would be redundant (and would nest with the
+	// console-format transcript executeNativeScan starts itself). Skipped when
+	// there's no live console to capture (silent, -j JSON, CI output). Setting
+	// CapturedConsole makes each per-target run read like a console scan (findings
+	// streamed in human-readable form, no repetitive "[status]" ticker), matching
+	// what the -P children write; the terminal still sees everything live because
+	// the capture passes bytes through to the real streams.
+	captureConsole := !scanOpts.Silent && !globalJSON && !globalCIOutput && hasDeferredOutputFormat(scanOpts.OutputFormats)
+	if captureConsole {
+		scanOpts.CapturedConsole = true
+	}
 
 	multi := len(targets) > 1
 	for i, target := range targets {
@@ -797,7 +873,38 @@ func runStatelessTargetFile(cmd *cobra.Command, settings *config.Settings, strat
 				terminal.HiCyan(target))
 		}
 
-		if scanErr := executeNativeScan(cmd, settings, strategyName); scanErr != nil {
+		// Start the per-target console capture after the [i/N] header (a parent-loop
+		// line, not part of the scan) so the log opens on the scan banner — the same
+		// shape a -P child writes. Anchored to the resolved per-target output so it
+		// lands next to the sqlite/html files as <output>-<host>.console.log.
+		var (
+			tc          *transcriptCapture
+			consolePath string
+		)
+		if captureConsole {
+			consolePath = perTargetConsolePath(scanOpts.Output)
+			if c, terr := startTranscriptCapture(consolePath); terr != nil {
+				fmt.Fprintf(os.Stderr, "%s Failed to capture console log to %s (%v); scanning without it\n",
+					terminal.WarnPrefix(), terminal.Cyan(consolePath), terr)
+				consolePath = ""
+			} else {
+				tc = c
+			}
+		}
+
+		scanErr := executeNativeScan(cmd, settings, strategyName)
+
+		// Restore the real streams before printing where the log landed, so that
+		// note reaches the terminal instead of being swallowed into the log file.
+		if tc != nil {
+			tc.Stop()
+		}
+		if consolePath != "" && !scanOpts.Silent {
+			fmt.Fprintf(os.Stderr, "%s Console log written to %s\n",
+				terminal.InfoSymbol(), terminal.Cyan(consolePath))
+		}
+
+		if scanErr != nil {
 			zap.L().Error("Stateless target scan failed",
 				zap.String("target", target),
 				zap.Error(scanErr))
@@ -808,6 +915,19 @@ func runStatelessTargetFile(cmd *cobra.Command, settings *config.Settings, strat
 	}
 
 	return nil
+}
+
+// hasDeferredOutputFormat reports whether formats requests any file-based output
+// (jsonl/html/sqlite/fs) rather than only the live console. It's the signal that
+// a captured <output>.console.log is worth writing: with a plain console format
+// the console already IS the output.
+func hasDeferredOutputFormat(formats []string) bool {
+	for _, f := range formats {
+		if f != "console" {
+			return true
+		}
+	}
+	return false
 }
 
 // readTargetFilesLines reads every target file in paths (each one URL/address
@@ -996,8 +1116,10 @@ func (e *emptySource) Close() error                                   { return n
 // the specified output path using the given generator function. projectUUID
 // scopes the query: "" exports the whole DB (stateless temp DB), a non-empty
 // value scopes to one project so a persisted report matches the sibling jsonl
-// export and never leaks other projects' findings.
-func generateReportFromDB(ctx context.Context, db *database.DB, outputPath string, omitResponse bool, projectUUID string, rf reportFormatEntry) error {
+// export and never leaks other projects' findings. scanUUID further restricts the
+// findings to a single scan (empty = all of the project's), so a persisted scan's
+// report reflects that run rather than the project's whole history.
+func generateReportFromDB(ctx context.Context, db *database.DB, outputPath string, omitResponse bool, projectUUID, scanUUID string, rf reportFormatEntry, onTrim func(output.ReportTrimInfo)) error {
 	autoTarget, autoDuration := computeReportMeta(ctx, db)
 	meta := output.HTMLReportMeta{
 		Title:           "Vigolium Scan Report",
@@ -1005,6 +1127,9 @@ func generateReportFromDB(ctx context.Context, db *database.DB, outputPath strin
 		ScanDuration:    autoDuration,
 		ScanTarget:      autoTarget,
 		ReportSharedURL: scanReportSharedURL,
+		// nil keeps the generator's default inline "Note:" line; the stateless
+		// export path passes a collector so the trim summary folds into "Exports".
+		OnTrim: onTrim,
 	}
 	// Prefer the streaming generator when the format has one: it renders the
 	// report by pulling rows one at a time instead of loading the whole result
@@ -1014,7 +1139,7 @@ func generateReportFromDB(ctx context.Context, db *database.DB, outputPath strin
 	// honor only an explicit --omit-response, never force it on here.
 	if rf.streamGenerate != nil {
 		produce := func(emit func(any) error) error {
-			return streamExportData(ctx, db, omitResponse, projectUUID, emit)
+			return streamExportData(ctx, db, omitResponse, projectUUID, scanUUID, emit)
 		}
 		return rf.streamGenerate(produce, outputPath, meta)
 	}
@@ -1110,6 +1235,13 @@ func maybeGenerateReports(db *database.DB, opts *types.Options) {
 		return
 	}
 	ctx := context.Background()
+	// Scope the report's findings to this scan on a persisted (shared) DB, so a
+	// re-run's report reflects that run rather than the project's whole history. A
+	// stateless run's temp DB already holds only this scan, so it needs no filter.
+	scanScope := ""
+	if !opts.Stateless {
+		scanScope = opts.ScanUUID
+	}
 	for _, rf := range reportFormats {
 		if !opts.HasFormat(rf.format) {
 			continue
@@ -1118,7 +1250,7 @@ func maybeGenerateReports(db *database.DB, opts *types.Options) {
 		if rf.beforeMsg != "" {
 			fmt.Fprintf(os.Stderr, "%s %s\n", terminal.InfoSymbol(), rf.beforeMsg)
 		}
-		if err := generateReportFromDB(ctx, db, outPath, opts.OmitResponse, exportProjectScope(opts), rf); err != nil {
+		if err := generateReportFromDB(ctx, db, outPath, opts.OmitResponse, exportProjectScope(opts), scanScope, rf, nil); err != nil {
 			fmt.Fprintf(os.Stderr, "%s Failed to generate %s: %v\n", terminal.ErrorPrefix(), rf.label, err)
 		} else {
 			fmt.Fprintf(os.Stderr, "%s %s: %s\n", terminal.InfoSymbol(), rf.label, terminal.Cyan(outPath))
@@ -1148,10 +1280,70 @@ func finishFSExport(db *database.DB, opts *types.Options) {
 	fsPrintSummary(stats)
 }
 
+// exportedFile records one materialized file/directory for the unified stateless
+// export summary printed at the end of finishStatelessExport. detail is an
+// optional parenthetical (e.g. "53 records").
+type exportedFile struct {
+	label  string // format name: console, jsonl, sqlite, html, fs, …
+	path   string
+	detail string
+}
+
+// fsExportOutputs turns an fs-export result into unified summary rows — one per
+// directory actually written (traffic and/or findings) — so the fs format lists
+// alongside the other formats instead of printing its own separate block.
+func fsExportOutputs(stats fsExportStats) []exportedFile {
+	var out []exportedFile
+	if stats.TrafficDir != "" {
+		out = append(out, exportedFile{label: "fs", path: stats.TrafficDir, detail: fmt.Sprintf("%d records", stats.Traffic)})
+	}
+	if stats.FindingsDir != "" {
+		out = append(out, exportedFile{label: "fs", path: stats.FindingsDir, detail: fmt.Sprintf("%d findings", stats.Findings)})
+	}
+	return out
+}
+
+// displayExportPath renders an export destination as an absolute path with the
+// home directory collapsed to "~", so the summary shows exactly where a file
+// landed regardless of the cwd. Falls back to the raw path if it can't be made
+// absolute.
+func displayExportPath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	return terminal.ShortenHome(abs)
+}
+
+// printExportSummary lists every materialized output under one aligned "Exports"
+// header, so a multi-format run reports its files consistently instead of
+// interleaving differently-shaped per-format "exported to" messages. Paths are
+// shown absolute (home collapsed to "~"). No-ops when nothing was written.
+func printExportSummary(outputs []exportedFile) {
+	if len(outputs) == 0 {
+		return
+	}
+	labelW := 0
+	for _, o := range outputs {
+		if len(o.label) > labelW {
+			labelW = len(o.label)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "\n%s %s\n", terminal.InfoSymbol(), terminal.BoldAqua("Exports"))
+	for _, o := range outputs {
+		line := fmt.Sprintf("  %-*s  %s", labelW, o.label, terminal.Cyan(displayExportPath(o.path)))
+		if o.detail != "" {
+			line += "  " + terminal.Gray("("+o.detail+")")
+		}
+		fmt.Fprintln(os.Stderr, line)
+	}
+}
+
 // finishStatelessExport writes the full database export to the output file(s)
 // when running in stateless mode. StandardWriter's live file output is
 // suppressed in stateless mode, so every requested format (console, jsonl,
-// html, report, pdf) is materialized here from the database.
+// html, report, pdf) is materialized here from the database, then listed under a
+// single unified "Exports" summary.
 func finishStatelessExport(db *database.DB, opts *types.Options, outputPath string, skipConsole bool) {
 	if !opts.Stateless {
 		return
@@ -1164,7 +1356,7 @@ func finishStatelessExport(db *database.DB, opts *types.Options, outputPath stri
 			if stats, err := writeFSExport(ctx, db, database.QueryFilters{}, "", fsExportOptions{omitResponse: opts.OmitResponse}); err != nil {
 				fmt.Fprintf(os.Stderr, "%s Failed to export fs tree: %v\n", terminal.ErrorPrefix(), err)
 			} else {
-				fsPrintSummary(stats)
+				printExportSummary(fsExportOutputs(stats))
 			}
 		}
 		return
@@ -1172,6 +1364,11 @@ func finishStatelessExport(db *database.DB, opts *types.Options, outputPath stri
 
 	basePath := types.StripFormatExtension(outputPath)
 
+	// Materialize every requested format, collecting one row per output file/dir,
+	// then print them together under a single "Exports" summary. Failures still
+	// print inline (they're not successes to list); the trailing summary lists
+	// only what was actually written.
+	var outputs []exportedFile
 	for _, format := range opts.OutputFormats {
 		outPath := types.FormatOutputPath(basePath, format)
 		switch format {
@@ -1180,17 +1377,23 @@ func finishStatelessExport(db *database.DB, opts *types.Options, outputPath stri
 				// A transcript was captured to this path; do not overwrite it.
 				continue
 			}
-			exportStatelessConsole(ctx, db, outPath, opts.OmitResponse)
+			if e, ok := exportStatelessConsole(ctx, db, outPath, opts.OmitResponse); ok {
+				outputs = append(outputs, e)
+			}
 		case "jsonl":
-			exportStatelessJSONL(ctx, db, opts, outPath)
+			if e, ok := exportStatelessJSONL(ctx, db, opts, outPath); ok {
+				outputs = append(outputs, e)
+			}
 		case "sqlite":
-			exportStatelessSQLite(ctx, db, outPath)
+			if e, ok := exportStatelessSQLite(ctx, db, outPath); ok {
+				outputs = append(outputs, e)
+			}
 		case "fs":
 			// The stateless temp DB holds only this run → whole-DB tree ("").
 			if stats, err := writeFSExport(ctx, db, database.QueryFilters{}, outPath, fsExportOptions{omitResponse: opts.OmitResponse}); err != nil {
 				fmt.Fprintf(os.Stderr, "%s Failed to export fs tree: %v\n", terminal.ErrorPrefix(), err)
 			} else {
-				fsPrintSummary(stats)
+				outputs = append(outputs, fsExportOutputs(stats)...)
 			}
 		default:
 			for _, rf := range reportFormats {
@@ -1200,15 +1403,20 @@ func finishStatelessExport(db *database.DB, opts *types.Options, outputPath stri
 				if rf.beforeMsg != "" {
 					fmt.Fprintf(os.Stderr, "%s %s\n", terminal.InfoSymbol(), rf.beforeMsg)
 				}
+				// Capture the report's body-trim summary (HTML only) so it lands as
+				// the row's detail in the unified "Exports" list instead of a long
+				// inline note printed mid-run.
+				var trim output.ReportTrimInfo
 				// Stateless temp DB holds only this run → whole-DB report ("").
-				if err := generateReportFromDB(ctx, db, outPath, opts.OmitResponse, "", rf); err != nil {
+				if err := generateReportFromDB(ctx, db, outPath, opts.OmitResponse, "", "", rf, func(t output.ReportTrimInfo) { trim = t }); err != nil {
 					fmt.Fprintf(os.Stderr, "%s Failed to generate %s: %v\n", terminal.ErrorPrefix(), rf.label, err)
 				} else {
-					fmt.Fprintf(os.Stderr, "%s %s exported to %s\n", terminal.InfoSymbol(), rf.label, terminal.Cyan(outPath))
+					outputs = append(outputs, exportedFile{label: rf.format, path: outPath, detail: trim.Summary()})
 				}
 			}
 		}
 	}
+	printExportSummary(outputs)
 }
 
 // dbIsolateAgentFlagUsage is the shared --db-isolate help text for the agent
@@ -1295,21 +1503,34 @@ func finishDBIsolateMerge(destCfg config.DatabaseConfig, scratchPath string, sil
 	ctx := context.Background()
 	destPath := database.ExpandPath(destCfg.SQLite.Path)
 
-	dest, err := database.NewDB(&destCfg)
-	if err != nil {
-		return dbIsolateMergeFailed(scratchPath, scanErr, fmt.Errorf("open destination database: %w", err))
-	}
-	defer func() { _ = dest.Close() }()
-
-	if err := dest.CreateSchema(ctx); err != nil {
-		return dbIsolateMergeFailed(scratchPath, scanErr, fmt.Errorf("prepare destination schema: %w", err))
-	}
-	// Best-effort: seed the default project/FTS so a brand-new destination is
-	// fully usable; a failure here doesn't block the merge of the result rows.
-	_ = dest.SeedDefaults(ctx)
-
+	// Serialize the ENTIRE destination-DB critical section — open, schema
+	// creation, default seeding, and the merge — under one cross-process lock.
+	// When many --db-isolate finishers target a single fresh shared --db (the
+	// -P fan-out and parallel-process case), opening the DB runs a WAL-mode
+	// switch + initial checkpoint and CreateSchema runs a batch of
+	// CREATE TABLE/INDEX IF NOT EXISTS DDL — all write operations that, outside
+	// the lock, run with no busy-retry of their own and can surface SQLITE_BUSY
+	// under heavy concurrent load, failing the merge. Holding the lock across
+	// open→schema→seed→merge means only one process initializes/writes the
+	// shared destination at a time; the rest see an already-initialized DB and
+	// their IF NOT EXISTS DDL is a fast no-op. The lock stays best-effort (it
+	// degrades to DB-level serialization on timeout), and MergeSQLiteFile keeps
+	// its own busy-retry for that degraded path.
 	var stats *database.MergeStats
 	mergeErr := database.WithMergeLock(destPath, 60*time.Second, func() error {
+		dest, err := database.NewDB(&destCfg)
+		if err != nil {
+			return fmt.Errorf("open destination database: %w", err)
+		}
+		defer func() { _ = dest.Close() }()
+
+		if err := dest.CreateSchema(ctx); err != nil {
+			return fmt.Errorf("prepare destination schema: %w", err)
+		}
+		// Best-effort: seed the default project/FTS so a brand-new destination is
+		// fully usable; a failure here doesn't block the merge of the result rows.
+		_ = dest.SeedDefaults(ctx)
+
 		var e error
 		stats, e = database.MergeSQLiteFile(ctx, dest, scratchPath)
 		return e
@@ -1384,7 +1605,7 @@ func streamJSONLExport(ctx context.Context, db *database.DB, w io.Writer, omitRe
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
 	n := 0
-	err := streamExportData(ctx, db, omitResponse, projectUUID, func(item any) error {
+	err := streamExportData(ctx, db, omitResponse, projectUUID, "", func(item any) error {
 		if err := enc.Encode(item); err != nil {
 			return err
 		}
@@ -1422,14 +1643,13 @@ func writeJSONLExport(ctx context.Context, db *database.DB, w io.Writer, omitRes
 // file. Used only in stateless mode, where the temp DB holds just this run, so
 // the whole-DB export is implicitly scoped to the current scan. The query runs
 // before the file is created so a query failure leaves no empty output file.
-func exportStatelessJSONL(ctx context.Context, db *database.DB, opts *types.Options, outputPath string) {
+func exportStatelessJSONL(ctx context.Context, db *database.DB, opts *types.Options, outputPath string) (exportedFile, bool) {
 	n, err := streamJSONLToFile(ctx, db, outputPath, opts.OmitResponse, "")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s Failed to export data: %v\n", terminal.ErrorPrefix(), err)
-		return
+		return exportedFile{}, false
 	}
-	fmt.Fprintf(os.Stderr, "%s Results exported to %s (%d records)\n",
-		terminal.InfoSymbol(), terminal.Cyan(outputPath), n)
+	return exportedFile{label: "jsonl", path: outputPath, detail: fmt.Sprintf("%d records", n)}, true
 }
 
 // exportStatelessSQLite materializes the stateless run's database to a
@@ -1439,12 +1659,12 @@ func exportStatelessJSONL(ctx context.Context, db *database.DB, opts *types.Opti
 // later with `vigolium finding/traffic -S --db <file>.sqlite`. VACUUM INTO
 // refuses to overwrite, so any stale target (and its WAL/SHM sidecars) is
 // removed first.
-func exportStatelessSQLite(ctx context.Context, db *database.DB, outputPath string) {
+func exportStatelessSQLite(ctx context.Context, db *database.DB, outputPath string) (exportedFile, bool) {
 	for _, p := range []string{outputPath, outputPath + "-wal", outputPath + "-shm"} {
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "%s Failed to prepare SQLite export path %s: %v\n",
 				terminal.ErrorPrefix(), terminal.Cyan(outputPath), err)
-			return
+			return exportedFile{}, false
 		}
 	}
 	// outputPath is operator-supplied (not attacker-controlled); single-quote
@@ -1452,10 +1672,9 @@ func exportStatelessSQLite(ctx context.Context, db *database.DB, outputPath stri
 	stmt := fmt.Sprintf("VACUUM INTO '%s'", strings.ReplaceAll(outputPath, "'", "''"))
 	if _, err := db.ExecContext(ctx, stmt); err != nil {
 		fmt.Fprintf(os.Stderr, "%s Failed to export SQLite database: %v\n", terminal.ErrorPrefix(), err)
-		return
+		return exportedFile{}, false
 	}
-	fmt.Fprintf(os.Stderr, "%s SQLite database exported to %s\n",
-		terminal.InfoSymbol(), terminal.Cyan(outputPath))
+	return exportedFile{label: "sqlite", path: outputPath}, true
 }
 
 // finishScanJSONLExport emits the post-scan unified JSONL envelope for a scan
@@ -1505,10 +1724,10 @@ func finishScanJSONLExport(db *database.DB, opts *types.Options) {
 // with the default console format so -o always produces a populated file even
 // when the phase only ingests HTTP records (e.g. discovery) and emits no
 // findings.
-func exportStatelessConsole(ctx context.Context, db *database.DB, outputPath string, omitResponse bool) {
+func exportStatelessConsole(ctx context.Context, db *database.DB, outputPath string, omitResponse bool) (exportedFile, bool) {
 	var lines int
 	err := atomicfile.Write(outputPath, func(w *bufio.Writer) error {
-		return streamExportData(ctx, db, omitResponse, "", func(item any) error {
+		return streamExportData(ctx, db, omitResponse, "", "", func(item any) error {
 			env, ok := item.(exportEnvelope)
 			if !ok {
 				return nil
@@ -1532,10 +1751,9 @@ func exportStatelessConsole(ctx context.Context, db *database.DB, outputPath str
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s Failed to export data: %v\n", terminal.ErrorPrefix(), err)
-		return
+		return exportedFile{}, false
 	}
-	fmt.Fprintf(os.Stderr, "%s Results exported to %s (%d lines)\n",
-		terminal.InfoSymbol(), terminal.Cyan(outputPath), lines)
+	return exportedFile{label: "console", path: outputPath, detail: fmt.Sprintf("%d lines", lines)}, true
 }
 
 // consoleHTTPRecordLine renders an HTTP record export item as a plain-text
@@ -1761,6 +1979,20 @@ func printScanSummary(opts *types.Options, settings *config.Settings, strategyNa
 	fmt.Fprintf(os.Stderr, "           %s | %s\n",
 		phaseLabel("KnownIssueScan", "known-issue-scan", knownIssueScanEnabled),
 		phaseLabel("DynamicAssessment", "dynamic-assessment", daEnabled))
+	// Total scan-duration budget (from --scanning-max-duration). The per-phase
+	// durations above are factor-scaled slices of this cap and share it — the
+	// whole scan is bounded by it. Under a parallel fan-out (-P > 1) each target
+	// is an isolated child process with its own budget, so the cap applies per
+	// target line, not across the whole batch.
+	if opts.ScanMaxDuration > 0 {
+		budgetLine := "Max scan duration: " + terminal.HiBlue(opts.ScanMaxDuration.String())
+		if opts.Parallel > 1 {
+			budgetLine += " " + terminal.Gray("per target line (each -P child runs its own budget)")
+		} else {
+			budgetLine += " " + terminal.Gray("(whole scan, all phases share this budget)")
+		}
+		fmt.Fprintf(os.Stderr, "  %s %s\n", terminal.Purple(terminal.SymbolInfo), budgetLine)
+	}
 	heuristicsDesc := map[string]string{
 		"basic":    "probe target root pages to detect content type (HTML, JSON, blank) and skip spidering for non-HTML targets",
 		"advanced": "basic checks + deep HTML analysis to detect SPA frameworks and optimize phase selection",
@@ -1894,56 +2126,70 @@ func countExtensionFiles(cfg *config.ExtensionsConfig) int {
 	return count
 }
 
+// summaryScopeHosts returns the in-scope (scheme, hostname, port) origins present in the
+// project's DB for the given CLI targets, delegating to Repository.InScopeHosts (the same
+// scoping the runner phases use). With no targets (or no settings/repo) it returns nil —
+// meaning "no filter", a project-wide pass. The scan-completion summary uses this so its
+// counts cover only the origins actually scanned, not leftovers from prior scans of other
+// origins in the project.
+func summaryScopeHosts(ctx context.Context, repo *database.Repository, settings *config.Settings, targets []string, projectUUID, scanUUID string) []database.HostTarget {
+	if repo == nil || settings == nil {
+		return nil
+	}
+	return repo.InScopeHosts(ctx, settings.Scope, targets, projectUUID, scanUUID)
+}
+
 // printScanCompletionSummary prints a compact summary of ingested records,
-// findings, and total wall-clock duration after scan completion.
-func printScanCompletionSummary(repo *database.Repository, elapsed time.Duration) {
+// findings, and total wall-clock duration after scan completion. The record count is
+// scoped to the in-scope origins (scheme/host/port); the finding count is scoped to the
+// same project + in-scope hostnames (findings carry no port column), so the summary
+// reflects the current scan's targets rather than the whole project.
+func printScanCompletionSummary(repo *database.Repository, projectUUID string, hosts []database.HostTarget, elapsed time.Duration) {
+	// Header line carries the total wall-clock duration, so it prints first and
+	// unconditionally: even if the count queries below fail, the operator still
+	// sees the completion banner and how long the run took.
+	fmt.Fprintf(os.Stderr, "\n%s %s %s%s\n",
+		terminal.Aqua(terminal.SymbolSparkle),
+		terminal.BoldAqua("Native scan completed"),
+		terminal.Gray("in "),
+		terminal.Magenta(elapsed.Round(time.Second).String()))
+
 	if repo == nil {
 		return
 	}
 
 	ctx := context.Background()
-	db := repo.DB()
 
-	// Count HTTP records
-	var recordCount int
-	err := db.NewSelect().Model((*database.HTTPRecord)(nil)).ColumnExpr("COUNT(*)").Scan(ctx, &recordCount)
+	// Count HTTP records on the in-scope origins. CountRecordsAfterCursor with a zero
+	// cursor counts every matching record; empty hosts means project-wide.
+	recordCount, err := repo.CountRecordsAfterCursor(ctx, time.Time{}, "", hosts...)
 	if err != nil {
 		return
 	}
 
-	// Count findings by severity
-	type sevCount struct {
-		Severity string `bun:"severity"`
-		Count    int64  `bun:"count"`
+	// Records line, with the status-class breakdown (2xx/3xx/4xx/5xx…) appended
+	// inline. The classes cover the same in-scope origins as the record count, so
+	// they sum to it. Best-effort: a status-query error just drops the breakdown.
+	recordsLine := fmt.Sprintf("  %s Records: %s http records ingested",
+		terminal.Purple(terminal.SymbolInfo),
+		terminal.Cyan(fmt.Sprintf("%d", recordCount)))
+	if byCode, err := repo.CountRecordsByStatusCode(ctx, hosts...); err == nil {
+		if classes := formatStatusClassLine(bucketStatusCounts(byCode)); classes != "" {
+			recordsLine += terminal.Gray(" — ") + classes
+		}
 	}
-	var sevCounts []sevCount
-	err = db.NewSelect().Model((*database.Finding)(nil)).
-		ColumnExpr("severity, COUNT(*) AS count").
-		GroupExpr("severity").
-		Scan(ctx, &sevCounts)
+	fmt.Fprintln(os.Stderr, recordsLine)
+
+	// Count findings by severity, scoped to the same project + in-scope hostnames.
+	counts, err := database.CountFindingsBySeverity(ctx, repo.DB(), projectUUID, database.HostnamesOf(hosts)...)
 	if err != nil {
 		return
 	}
 
 	var totalFindings int64
-	counts := make(map[string]int64)
-	for _, sc := range sevCounts {
-		counts[sc.Severity] = sc.Count
-		totalFindings += sc.Count
+	for _, c := range counts {
+		totalFindings += c
 	}
-
-	fmt.Fprintf(os.Stderr, "  %s Records: %s http records ingested\n",
-		terminal.Purple(terminal.SymbolInfo),
-		terminal.Cyan(fmt.Sprintf("%d", recordCount)))
-
-	// Total scan duration always prints last, after Records and the Findings line
-	// (whichever branch runs below). Registered here — not at function entry — so
-	// the rare DB-error early returns above don't emit a lone Duration line.
-	defer func() {
-		fmt.Fprintf(os.Stderr, "  %s Duration: %s\n",
-			terminal.Purple(terminal.SymbolInfo),
-			terminal.Gray(elapsed.Round(time.Second).String()))
-	}()
 
 	if totalFindings == 0 {
 		fmt.Fprintf(os.Stderr, "  %s Findings: %s\n",

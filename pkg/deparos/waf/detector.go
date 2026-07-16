@@ -53,6 +53,19 @@ type BodyCheck struct {
 
 	// Pattern checks if body matches this regex.
 	Pattern *regexp.Regexp
+
+	// Weak marks a generic phrase that also appears in ordinary (non-WAF)
+	// application responses (e.g. Azure's bare "The request is blocked"). A weak
+	// match alone never brands a response as this WAF: it only contributes once a
+	// strong signal — a vendor-specific header or a non-weak body signal — also
+	// matches. This keeps a plain application 403 from being misattributed to a
+	// vendor and tripping the discovery block circuit breaker.
+	Weak bool
+
+	// containsLower is the lowercased byte form of Contains, precomputed once at
+	// rule-build time (see normalizeBodyChecks) so matchBody compares against the
+	// once-lowercased body without re-lowering/allocating the needle per call.
+	containsLower []byte
 }
 
 // detector implements Detector interface.
@@ -95,13 +108,23 @@ func (d *detector) Detect(rc *responsechain.ResponseChain) *BlockResult {
 // classify runs the rule set against response primitives.
 func (d *detector) classify(statusCode int, header http.Header, body []byte) *BlockResult {
 	// Fast path: skip non-blocking status codes
-	if !isBlockingStatusCode(statusCode) {
+	if !IsBlockStatusCode(statusCode) {
 		return nil
+	}
+
+	// Lowercase the body once up front. Every rule's substring BodyChecks (7 for
+	// Cloudflare alone, dozens across the rule set) need a case-insensitive
+	// compare; lowercasing per-check re-copied the whole body 20-40 times for a
+	// single blocking response — exactly when a WAF-protected target is already
+	// hammering this path.
+	var lowerBody []byte
+	if len(body) > 0 {
+		lowerBody = bytes.ToLower(body)
 	}
 
 	// Check each rule in priority order
 	for _, rule := range d.rules {
-		if result := d.matchRule(rule, header, body, statusCode); result != nil {
+		if result := d.matchRule(rule, header, body, lowerBody, statusCode); result != nil {
 			return result
 		}
 	}
@@ -110,7 +133,7 @@ func (d *detector) classify(statusCode int, header http.Header, body []byte) *Bl
 }
 
 // matchRule checks if a response matches a specific WAF rule.
-func (d *detector) matchRule(rule Rule, header http.Header, body []byte, statusCode int) *BlockResult {
+func (d *detector) matchRule(rule Rule, header http.Header, body, lowerBody []byte, statusCode int) *BlockResult {
 	// Check status code if rule has specific codes
 	if len(rule.StatusCodes) > 0 && !containsInt(rule.StatusCodes, statusCode) {
 		return nil
@@ -118,26 +141,40 @@ func (d *detector) matchRule(rule Rule, header http.Header, body []byte, statusC
 
 	var indicators []string
 
-	// Check headers first (faster)
-	headerMatched := false
+	// A strong signal is a vendor-specific header or a non-weak body match — the
+	// kind of signal that on its own reliably attributes a response to this WAF.
+	strongMatched := false
+
+	// Check headers first (faster). Header matches are always strong.
 	for _, check := range rule.HeaderChecks {
 		if indicator := matchHeader(header, check); indicator != "" {
 			indicators = append(indicators, indicator)
-			headerMatched = true
+			strongMatched = true
 		}
 	}
 
-	// Check body patterns
-	bodyMatched := false
+	// Check body patterns. Weak body matches (generic phrases shared with plain
+	// application responses) are held aside and only counted once a strong signal
+	// corroborates them, so e.g. Azure's bare "The request is blocked" can't alone
+	// brand an ordinary 403 as WAF traffic.
+	var weakIndicators []string
 	for _, check := range rule.BodyChecks {
-		if indicator := matchBody(body, check); indicator != "" {
+		indicator := matchBody(body, lowerBody, check)
+		if indicator == "" {
+			continue
+		}
+		if check.Weak {
+			weakIndicators = append(weakIndicators, indicator)
+		} else {
 			indicators = append(indicators, indicator)
-			bodyMatched = true
+			strongMatched = true
 		}
 	}
 
-	// Rule matches if we have any indicators
-	if headerMatched || bodyMatched {
+	// Rule matches only on a strong signal. Weak indicators ride along for
+	// diagnostics once corroborated, but never trigger a match by themselves.
+	if strongMatched {
+		indicators = append(indicators, weakIndicators...)
 		return &BlockResult{
 			IsBlocked:  true,
 			WAFType:    rule.Name,
@@ -148,44 +185,57 @@ func (d *detector) matchRule(rule Rule, header http.Header, body []byte, statusC
 	return nil
 }
 
-// matchHeader checks if a header matches a HeaderCheck.
+// matchHeader checks if a header matches a HeaderCheck. It inspects every value
+// of the header, not just the first: Set-Cookie in particular is delivered as one
+// header line per cookie, so a fingerprinting cookie (e.g. datadome=, rbzid=,
+// _pxhd) is frequently NOT the first Set-Cookie in the response — a Get()-style
+// first-value check would miss it.
 func matchHeader(headers http.Header, check HeaderCheck) string {
-	value := headers.Get(check.Header)
+	values := headers.Values(check.Header)
 
 	if check.Exists {
-		if value != "" {
+		if len(values) > 0 {
 			return "header:" + check.Header
 		}
 		return ""
 	}
 
-	if value == "" {
+	if len(values) == 0 {
 		return ""
 	}
 
-	if check.Equals != "" && strings.EqualFold(value, check.Equals) {
-		return "header:" + check.Header + "=" + check.Equals
-	}
-
-	if check.Contains != "" && strings.Contains(strings.ToLower(value), strings.ToLower(check.Contains)) {
-		return "header:" + check.Header + " contains " + check.Contains
-	}
-
-	if check.Pattern != nil && check.Pattern.MatchString(value) {
-		return "header:" + check.Header + " matches pattern"
+	needle := strings.ToLower(check.Contains)
+	for _, value := range values {
+		if check.Equals != "" && strings.EqualFold(value, check.Equals) {
+			return "header:" + check.Header + "=" + check.Equals
+		}
+		if check.Contains != "" && strings.Contains(strings.ToLower(value), needle) {
+			return "header:" + check.Header + " contains " + check.Contains
+		}
+		if check.Pattern != nil && check.Pattern.MatchString(value) {
+			return "header:" + check.Header + " matches pattern"
+		}
 	}
 
 	return ""
 }
 
-// matchBody checks if body matches a BodyCheck.
-func matchBody(body []byte, check BodyCheck) string {
+// matchBody checks if body matches a BodyCheck. lowerBody is the caller's
+// once-lowercased copy of body, reused across all checks for the case-insensitive
+// Contains compare; the raw body is retained for case-sensitive pattern matching.
+func matchBody(body, lowerBody []byte, check BodyCheck) string {
 	if len(body) == 0 {
 		return ""
 	}
 
 	if check.Contains != "" {
-		if bytes.Contains(bytes.ToLower(body), []byte(strings.ToLower(check.Contains))) {
+		needle := check.containsLower
+		if needle == nil {
+			// Rule wasn't run through normalizeBodyChecks (no production path does
+			// this, but guard so an empty needle can't match every body).
+			needle = []byte(strings.ToLower(check.Contains))
+		}
+		if bytes.Contains(lowerBody, needle) {
 			return "body contains: " + truncate(check.Contains, 50)
 		}
 	}
@@ -197,8 +247,12 @@ func matchBody(body []byte, check BodyCheck) string {
 	return ""
 }
 
-// isBlockingStatusCode returns true for status codes commonly used by WAFs.
-func isBlockingStatusCode(code int) bool {
+// IsBlockStatusCode reports whether code is one WAFs/CDNs commonly use for
+// blocking responses. classify() uses it as its fast-path gate, and external
+// callers use it as a cheap pre-gate before paying for the fuller header/body
+// inspection in ClassifyParts (which reads the response body) — so a status that
+// passes this gate is exactly one ClassifyParts may classify as a block.
+func IsBlockStatusCode(code int) bool {
 	switch code {
 	case 403, 405, 406, 429, 501, 503:
 		return true
@@ -230,7 +284,7 @@ func truncate(s string, maxLen int) string {
 
 // defaultRules returns the built-in WAF detection rules.
 func defaultRules() []Rule {
-	return []Rule{
+	rules := []Rule{
 		cloudflareRule(),
 		akamaiRule(),
 		awsWAFRule(),
@@ -238,7 +292,38 @@ func defaultRules() []Rule {
 		impervaRule(),
 		sucuriRule(),
 		modsecurityRule(),
+		// Additional WAF / CDN vendors.
+		azureRule(),
+		fortiwebRule(),
+		barracudaRule(),
+		citrixNetscalerRule(),
+		wallarmRule(),
+		radwareRule(),
+		reblazeRule(),
+		wordfenceRule(),
+		// Bot-management / anti-automation vendors. These gate scan traffic just
+		// like a WAF (typically a 403 challenge/deny), so a hit is exactly the
+		// "your traffic is being filtered" signal the block warning surfaces.
+		datadomeRule(),
+		perimeterxRule(),
+		kasadaRule(),
+		queueItRule(),
 		genericRule(),
+	}
+	normalizeBodyChecks(rules)
+	return rules
+}
+
+// normalizeBodyChecks precomputes the lowercased needle for every substring
+// BodyCheck once, so the per-response classify loop never re-lowers/allocates it.
+func normalizeBodyChecks(rules []Rule) {
+	for i := range rules {
+		for j := range rules[i].BodyChecks {
+			bc := &rules[i].BodyChecks[j]
+			if bc.Contains != "" {
+				bc.containsLower = []byte(strings.ToLower(bc.Contains))
+			}
+		}
 	}
 }
 
@@ -376,6 +461,211 @@ func modsecurityRule() Rule {
 			{Contains: "NAXSI"},
 			{Contains: "This error was generated by Mod_Security"},
 			{Pattern: regexp.MustCompile(`(?i)not acceptable.*?security module`)},
+		},
+	}
+}
+
+func azureRule() Rule {
+	return Rule{
+		Name:        "azure",
+		Priority:    8,
+		StatusCodes: []int{403, 429, 503},
+		HeaderChecks: []HeaderCheck{
+			// Application Gateway WAF stamps its product name on the Server header;
+			// Front Door WAF tags blocked requests with a trace ref.
+			{Header: "Server", Contains: "Microsoft-Azure-Application-Gateway"},
+			{Header: "X-Azure-Ref", Exists: true},
+		},
+		BodyChecks: []BodyCheck{
+			{Contains: "Microsoft-Azure-Application-Gateway"},
+			// Generic phrase: Front Door/App Gateway emit it, but so do plain apps.
+			// Only counts alongside a strong Azure signal (e.g. the X-Azure-Ref
+			// header or the App Gateway product string above).
+			{Contains: "The request is blocked", Weak: true},
+		},
+	}
+}
+
+func fortiwebRule() Rule {
+	return Rule{
+		Name:        "fortiweb",
+		Priority:    9,
+		StatusCodes: []int{403, 429},
+		HeaderChecks: []HeaderCheck{
+			{Header: "Server", Contains: "FortiWeb"},
+			{Header: "Set-Cookie", Contains: "FORTIWAFSID="},
+		},
+		BodyChecks: []BodyCheck{
+			{Contains: "Web Page Blocked"},
+			{Contains: ".fgd_icon"},
+			{Contains: "Web Filter Block Override"},
+			{Contains: "fortinet"},
+		},
+	}
+}
+
+func barracudaRule() Rule {
+	return Rule{
+		Name:        "barracuda",
+		Priority:    10,
+		StatusCodes: []int{403, 429},
+		HeaderChecks: []HeaderCheck{
+			// Distinctive Barracuda load-balancer / WAF session cookies.
+			{Header: "Set-Cookie", Contains: "barra_counter_session"},
+			{Header: "Set-Cookie", Contains: "BNI__BARRACUDA"},
+			{Header: "Set-Cookie", Contains: "BNI_persistence"},
+		},
+		BodyChecks: []BodyCheck{
+			{Contains: "Barracuda"},
+		},
+	}
+}
+
+func citrixNetscalerRule() Rule {
+	return Rule{
+		Name:        "citrix_netscaler",
+		Priority:    11,
+		StatusCodes: []int{403, 429},
+		HeaderChecks: []HeaderCheck{
+			// NetScaler rewrites the Connection header into these misspelled forms —
+			// a long-standing, pathognomonic fingerprint.
+			{Header: "Cneonction", Exists: true},
+			{Header: "nnCoection", Exists: true},
+			{Header: "Via", Contains: "NS-CACHE"},
+			{Header: "Set-Cookie", Contains: "NSC_"},
+			{Header: "Set-Cookie", Contains: "ns_af="},
+			{Header: "Set-Cookie", Contains: "citrix_ns_id"},
+		},
+		BodyChecks: []BodyCheck{
+			{Contains: "NS Transaction ID"},
+		},
+	}
+}
+
+func wallarmRule() Rule {
+	return Rule{
+		Name:        "wallarm",
+		Priority:    12,
+		StatusCodes: []int{403, 429},
+		HeaderChecks: []HeaderCheck{
+			{Header: "Server", Contains: "nginx-wallarm"},
+		},
+	}
+}
+
+func radwareRule() Rule {
+	return Rule{
+		Name:        "radware",
+		Priority:    13,
+		StatusCodes: []int{403, 429},
+		HeaderChecks: []HeaderCheck{
+			{Header: "X-SL-CompState", Exists: true},
+		},
+		BodyChecks: []BodyCheck{
+			{Contains: "Unauthorized Activity Has Been Detected"},
+			{Contains: "Because your web request looks automated"},
+			{Contains: "CloudWebSec.radware.com"},
+		},
+	}
+}
+
+func reblazeRule() Rule {
+	return Rule{
+		Name:        "reblaze",
+		Priority:    14,
+		StatusCodes: []int{403, 429},
+		HeaderChecks: []HeaderCheck{
+			{Header: "Server", Contains: "Reblaze"},
+			{Header: "Set-Cookie", Contains: "rbzid="},
+			{Header: "Set-Cookie", Contains: "rbzsessionid"},
+		},
+		BodyChecks: []BodyCheck{
+			{Contains: "Current session has been terminated"},
+			{Contains: "check.reblaze.com"},
+		},
+	}
+}
+
+func wordfenceRule() Rule {
+	return Rule{
+		Name:        "wordfence",
+		Priority:    15,
+		StatusCodes: []int{403, 429, 503},
+		BodyChecks: []BodyCheck{
+			{Contains: "Generated by Wordfence"},
+			{Contains: "This response was generated by Wordfence"},
+			{Contains: "Your access to this site has been limited"},
+			{Contains: "wordfence.com"},
+		},
+	}
+}
+
+func datadomeRule() Rule {
+	return Rule{
+		Name:        "datadome",
+		Priority:    16,
+		StatusCodes: []int{403, 429},
+		HeaderChecks: []HeaderCheck{
+			{Header: "X-DataDome", Exists: true},
+			{Header: "X-DataDome-CID", Exists: true},
+			{Header: "X-DataDomeResponse", Exists: true},
+			{Header: "Set-Cookie", Contains: "datadome="},
+		},
+		BodyChecks: []BodyCheck{
+			{Contains: "geo.captcha-delivery.com"},
+			{Contains: "captcha-delivery.com"},
+			{Contains: "datadome"},
+		},
+	}
+}
+
+func perimeterxRule() Rule {
+	return Rule{
+		Name:        "perimeterx",
+		Priority:    17,
+		StatusCodes: []int{403, 429},
+		HeaderChecks: []HeaderCheck{
+			// PerimeterX / HUMAN drops _px* sensor and cookie tokens.
+			{Header: "Set-Cookie", Pattern: regexp.MustCompile(`(?i)_px[a-z0-9]*=`)},
+		},
+		BodyChecks: []BodyCheck{
+			{Contains: "www.perimeterx.com"},
+			{Contains: "perimeterx.com/whywasiblocked"},
+			{Contains: "px-captcha"},
+			{Contains: "Please verify you are a human"},
+			{Contains: "Access to this page has been denied because we believe you are using automation tools"},
+		},
+	}
+}
+
+func kasadaRule() Rule {
+	return Rule{
+		Name:        "kasada",
+		Priority:    18,
+		StatusCodes: []int{403, 429},
+		HeaderChecks: []HeaderCheck{
+			{Header: "X-Kpsdk-Ct", Exists: true},
+			{Header: "X-Kpsdk-Cd", Exists: true},
+			{Header: "X-Kpsdk-A", Exists: true},
+		},
+		BodyChecks: []BodyCheck{
+			{Contains: "kpsdk"},
+		},
+	}
+}
+
+func queueItRule() Rule {
+	return Rule{
+		Name:        "queue_it",
+		Priority:    19,
+		StatusCodes: []int{403, 429, 503},
+		HeaderChecks: []HeaderCheck{
+			{Header: "Set-Cookie", Contains: "QueueITAccepted"},
+			{Header: "Set-Cookie", Contains: "Queue-it"},
+		},
+		BodyChecks: []BodyCheck{
+			{Contains: "queue-it.net"},
+			{Contains: "Queue-it"},
 		},
 	}
 }

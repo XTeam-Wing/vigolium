@@ -1,6 +1,8 @@
 package sqli_boolean_blind
 
 import (
+	"context"
+	"strconv"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -37,7 +39,8 @@ func isExcludedHeader(ip httpmsg.InsertionPoint) bool {
 
 type Module struct {
 	modkit.BaseActiveModule
-	rhm dedup.Lazy[dedup.RequestHashManager]
+	modkit.RequestScopeContextStubs // no-op ScanPer{InsertionPoint,Host}Context
+	rhm                             dedup.Lazy[dedup.RequestHashManager]
 }
 
 func New() *Module {
@@ -64,6 +67,30 @@ func (m *Module) ScanPerRequest(
 	httpClient *http.Requester,
 	scanCtx *modkit.ScanContext,
 ) ([]*output.ResultEvent, error) {
+	return m.scanPerRequest(context.Background(), ctx, httpClient, scanCtx)
+}
+
+// ScanPerRequestContext is the deadline-aware entry point. Insertion points are
+// scanned in priority order (query/body params before cookies before headers), and
+// the loop returns the findings confirmed so far the moment runCtx is cancelled —
+// so a request carrying many insertion points (a browser-captured request has
+// 20+) never loses an already-confirmed injection when the per-module watchdog
+// fires. See pkg/core executor callGuard/runActiveWithTimeout.
+func (m *Module) ScanPerRequestContext(
+	runCtx context.Context,
+	ctx *httpmsg.HttpRequestResponse,
+	httpClient *http.Requester,
+	scanCtx *modkit.ScanContext,
+) ([]*output.ResultEvent, error) {
+	return m.scanPerRequest(runCtx, ctx, httpClient, scanCtx)
+}
+
+func (m *Module) scanPerRequest(
+	runCtx context.Context,
+	ctx *httpmsg.HttpRequestResponse,
+	httpClient *http.Requester,
+	scanCtx *modkit.ScanContext,
+) ([]*output.ResultEvent, error) {
 	var results []*output.ResultEvent
 
 	urlx, err := ctx.URL()
@@ -80,6 +107,8 @@ func (m *Module) ScanPerRequest(
 	// content (ads, recommendations, rotating blocks) manufacture phantom TRUE/FALSE
 	// differentials. Boolean-blind detection is entirely a body differential, so
 	// skip the whole request on such a surface.
+	// Covers cache/CDN-fronted surfaces, large dynamic HTML, and opaque high-entropy
+	// bodies (encrypted CDN/challenge blobs) — all unreliable for a body differential.
 	if modkit.DifferentialSurfaceUnreliable(ctx.Response()) {
 		return results, nil
 	}
@@ -90,14 +119,15 @@ func (m *Module) ScanPerRequest(
 		return results, errors.Wrap(err, "failed to create insertion points")
 	}
 
-	// Filter out already checked insertion points
-	rhm := m.rhm.Get(scanCtx.DedupMgr())
-	if rhm != nil {
-		points = rhm.GetNotCheckedInsertionPoints(urlx, ctx.Request(), points)
-	}
 	if len(points) == 0 {
 		return results, nil
 	}
+	// rhm dedup is claimed PER insertion point inside the loop (just before
+	// scanning it), not for the whole batch up front: GetNotCheckedInsertionPoints
+	// marks every point seen at filter time, so a per-module timeout after an early
+	// point left the later (never-probed) points permanently suppressed on a
+	// retry/resume. See the per-point ShouldCheckInsertionPoint claim below.
+	rhm := m.rhm.Get(scanCtx.DedupMgr())
 
 	// If a WAF was observed fronting this host (recorded by other modules on
 	// block responses), prepare signature-evasion mutators so detection isn't
@@ -106,8 +136,21 @@ func (m *Module) ScanPerRequest(
 
 ipScan:
 	for _, ip := range points {
+		// Per-module deadline reached — return the findings already confirmed
+		// rather than letting the hard watchdog discard the whole result set. The
+		// vulnerable query/body params are tested first (points are priority
+		// ordered), so a confirmed injection survives even under a tight budget.
+		if runCtx.Err() != nil {
+			return results, nil
+		}
 		// Skip content-negotiation request headers (see negotiationHeaders).
 		if isExcludedHeader(ip) {
+			continue
+		}
+		// Claim dedup for THIS point immediately before scanning it (marks it seen).
+		// Doing it per point — rather than for the whole batch up front — keeps
+		// points that a tight per-module budget never reaches eligible on retry.
+		if rhm != nil && !rhm.ShouldCheckInsertionPoint(urlx, ctx.Request(), ip.Name(), ip.BaseValue(), strconv.Itoa(int(ip.Type()))) {
 			continue
 		}
 		baseValue := ip.BaseValue()
@@ -143,6 +186,13 @@ ipScan:
 		}
 
 		for _, pair := range payloads {
+			// Honor the per-module deadline BETWEEN payload pairs too: a
+			// high-parameter request's baseline/true/false/WAF/stability/confirmation
+			// probes for one point can far outlast the watchdog if only checked
+			// between points.
+			if runCtx.Err() != nil {
+				return results, nil
+			}
 			result, err := m.testPayloadPair(ctx, httpClient, ip, baseValue, pair, baselineSig, baselineFull)
 			if err != nil {
 				if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
@@ -156,6 +206,26 @@ ipScan:
 				results = append(results, result)
 				continue ipScan
 			}
+		}
+
+		// Additive fallback: the plain single-parameter differential was
+		// inconclusive for this point. If a front-end filter blocked the plain
+		// payloads, retry the SAME differential + confirmation battery through HTTP
+		// Parameter Pollution channels — a WAF/proxy may inspect one occurrence of
+		// the parameter while the backend evaluates another. This only ever changes
+		// HOW the payload is delivered; the confirmation bar is unchanged, so it
+		// introduces no new false positives.
+		hpp, err := m.tryHPPFallback(ctx, httpClient, ip, baseValue, baselineSig, baselineFull)
+		if err != nil {
+			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
+				return results, nil
+			}
+			continue
+		}
+		if hpp != nil {
+			hpp.URL = urlx.String()
+			results = append(results, hpp)
+			continue ipScan
 		}
 	}
 
@@ -338,7 +408,14 @@ func (m *Module) sendPayload(
 	// re-parsing on this hot path.
 	fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
 
-	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true})
+	// NoClustering: the boolean-blind confirmation re-sends IDENTICAL requests to
+	// prove stability — the TRUE/FALSE retries (ratio-stable across a second send),
+	// the baseline-drift re-fetch of the original value, and confirmRepeat's repeated
+	// rounds. The 500ms request-cluster cache keys on raw request bytes, so without
+	// this those re-sends return the first response's cached copy and the stability
+	// checks pass trivially even on a non-deterministic (flapping / load-balanced)
+	// endpoint — silently defeating the module's core false-positive defenses.
+	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true, NoClustering: true})
 	if err != nil {
 		return "", responseSignature{}, false, err
 	}

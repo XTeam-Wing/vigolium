@@ -25,10 +25,17 @@ Run a full vulnerability scan pipeline. Supports multiple targets, input formats
 | `--output` | `-o` | string | — | Write findings to specified output file |
 | `--stats` | — | bool | `false` | Show live progress stats during scanning |
 | `--include-response` | — | bool | `false` | Include full HTTP response body in output |
+| `--omit-response` | — | bool | `false` | Omit raw request/response bytes (smaller files; drops the `.resp.*` files under `--format fs`) |
+| `--fail-on` | — | string | — | Exit non-zero when a finding at/above this severity is present (`info`,`suspect`,`low`,`medium`,`high`,`critical`); output written first, `--soft-fail` overrides |
+| `--split-by-host` | — | bool | `false` | Stateless multi-target (`-S -T file`): write per-host output files (`base-<host>.<ext>`); required for `-P > 1` fan-out; no-op for `--format fs` |
 | `--stateless` | — | bool | `false` | Use a temporary database, export results to `--output`, then discard |
 | `--upload-results` | — | bool | `false` | Upload scan results to cloud storage after completion (requires storage config) |
 
-Stateless mode is great for ephemeral CI/CD runs — it creates a temp SQLite file, runs the full scan against it, writes the export/report to `--output`, then deletes the DB (including WAL/SHM sidecars). Requires `--output`; mutually exclusive with `--db`. Combine with `--format jsonl` or `--format html` for shareable artifacts.
+Stateless mode is great for ephemeral CI/CD runs — it creates a temp SQLite file, runs the full scan against it, writes the export/report to `--output`, then deletes the DB (including WAL/SHM sidecars). Requires `--output`; mutually exclusive with `--db`. Combine with `--format jsonl`, `--format html`, `--format fs`, or `--format sqlite` for shareable artifacts (`sqlite` requires `-S`).
+
+`--format` accepts `console` (default), `jsonl`, `html`, `sqlite`, and `fs` (comma-separated for multiple):
+- **`fs`** — a flat, browsable tree (`<base>-traffic/` + `<base>-findings/`) with per-host `.req` / `.resp.headers` / `.resp.body` / `.md` files and a jq-friendly `index.json`. No `-o` → `vigolium-traffic/` + `vigolium-findings/`. Works with or without `-S`. `--omit-response` drops the `.resp.*` files.
+- **`sqlite`** (aliases `sqlite3`, `db`) — dumps the standalone per-run DB to `<output>.sqlite` via `VACUUM INTO`. Requires `-S/--stateless` + `-o`. Reopen with `vigolium finding/traffic -S --db <file>.sqlite`.
 
 ### Request flags (scan & run)
 
@@ -53,7 +60,21 @@ Stateless mode is great for ephemeral CI/CD runs — it creates a temp SQLite fi
 | `--auth-file` | []string | — | Path to auth file (YAML/JSON, single session or `sessions:` bundle), or bare name resolved against session_dir. Repeatable. |
 | `--auth` | []string | — | Inline session in `name:Header:value` format. Repeatable. |
 | `--oast-url` | string | — | Fixed out-of-band callback URL (overrides auto-generated interactsh URL) |
-| `--pilot` | bool | `false` | Enable AI pilot-driven crawling |
+
+### Parallel, DB & module flags (scan & run)
+
+| Flag | Short | Type | Default | Description |
+|------|-------|------|---------|-------------|
+| `--parallel` | `-P` | int | `1` | Scan up to N targets concurrently as isolated child processes (requires `-S -T --split-by-host`, OR `--db-isolate -T`) |
+| `--db-isolate` | — | bool | `false` | Scan into a private temp DB, then merge into `--db` at the end (SQLite only, not with `--stateless`) |
+| `--resume` | — | bool | `false` | Resume a prior `-S -T --split-by-host -P` run from its `<output>.progress.json` manifest |
+| `--follow-subdomains` | — | bool | `false` | Pull in-scope subdomains found in responses into the scan (auto-on at `--intensity deep`) |
+| `--module-id` | — | []string | — | Run exactly these module IDs (exact match against **both** active + passive registries; unlike `-m`, also selects passive) — **scan/scan-url/scan-request only, not `run`** |
+| `--passive-only` | — | bool | `false` | Run only passive modules (no active scan traffic) — **scan/scan-url/scan-request only, not `run`** |
+| `--print-finding` / `--print-traffic` / `--print-traffic-tree` | — | bool | `false` | After the scan, print findings / raw traffic / traffic tree to stdout (pairs with `-S`/`--silent`) |
+| `--report-url` | — | string | — | URL for the "Raw Report URL" button in HTML reports |
+| `--no-waf-pacing` | — | bool | `false` | Disable proactive CDN/WAF-edge pacing |
+| `--no-tech-filter` | — | bool | `false` | Disable tech-stack fingerprint gating of modules |
 
 ### Content Discovery flags (scan & run)
 
@@ -91,12 +112,9 @@ Stateless mode is great for ephemeral CI/CD runs — it creates a temp SQLite fi
 | `--known-issue-scan-severities` | []string | — | Filter Nuclei templates by severity (critical,high,medium,low,info) |
 | `--known-issue-scan-templates-dir` | string | — | Custom Nuclei templates directory |
 
-### SAST flags (scan & run)
-
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--rule` | string | — | Filter SAST rules by fuzzy name match |
-| `--sast-adhoc` | string | — | Ad-hoc SAST scan: local path or git URL (auto-detected, results not saved to database) |
+> **Source-aware / SAST scanning is an agent feature**, not a native `scan`/`run` phase.
+> Use `vigolium agent audit --source <path-or-git-url>` (security code audit) or
+> `vigolium agent query --source <path> -t code-review`. See `references/agent-commands.md`.
 
 ### Examples
 
@@ -130,17 +148,26 @@ vigolium scan -t https://example.com --format jsonl -o results.jsonl
 # HTML report
 vigolium scan -t https://example.com --format html -o report.html
 
+# Filesystem tree (run-traffic/ + run-findings/) — browsable with ls/grep/jq
+vigolium scan -t https://example.com --format fs -o run
+
+# Standalone per-run SQLite DB (requires -S)
+vigolium scan -t https://example.com -S --format sqlite -o run.sqlite
+
+# Fail the pipeline on any high/critical finding
+vigolium scan -t https://example.com --fail-on high
+
 # With proxy
 vigolium scan -t https://example.com --proxy http://127.0.0.1:8080
 
 # Speed tuning
 vigolium scan -t https://example.com -c 100 --rate-limit 200
 
-# Whitebox scanning
-vigolium scan -t https://example.com --source ./src --strategy whitebox
+# Source-aware / whitebox scanning is an agent feature (see agent-commands.md)
+vigolium agent autopilot -t https://example.com --source ./src
 
-# Whitebox via git clone
-vigolium scan -t https://example.com --source https://github.com/org/repo --strategy whitebox
+# Source-aware via git clone (--source accepts a git URL)
+vigolium agent swarm -t https://example.com --source https://github.com/org/repo
 
 # OpenAPI scan
 vigolium scan -I openapi -i openapi.yaml -t https://api.example.com
@@ -203,7 +230,6 @@ Scan a single URL for vulnerabilities. Designed for quick, targeted scans and AI
 | `--body` | string | — | Request body |
 | `--known-issue-scan` | bool | `false` | Run known issue scan (Nuclei/Kingfisher) |
 | `--no-passive` | bool | `false` | Skip passive modules |
-| `--no-insertion-points` | bool | `false` | Skip insertion point testing |
 
 ### Examples
 
@@ -256,10 +282,9 @@ Read a raw HTTP request from file or stdin and run scanner modules against it. D
 | Flag | Short | Type | Default | Description |
 |------|-------|------|---------|-------------|
 | `--input` | `-i` | string | `-` (stdin) | Input file or stdin |
-| `--target` | — | string | — | Override target URL (scheme://host) |
+| `--target` | `-t` | string | — | Override target URL (scheme://host) |
 | `--known-issue-scan` | — | bool | `false` | Run known issue scan |
 | `--no-passive` | — | bool | `false` | Skip passive modules |
-| `--no-insertion-points` | — | bool | `false` | Skip insertion point testing |
 
 ### Examples
 
@@ -296,11 +321,10 @@ Run a single scan phase directly. Equivalent to `vigolium scan --only <phase>`.
 | `external-harvest` | — |
 | `known-issue-scan` | — |
 | `spidering` | `spitolas` |
-| `sast` | — |
 | `dynamic-assessment` | `audit`, `dast`, `assessment` |
 | `extension` | `ext` |
 
-The `run` command accepts the same flag groups as `scan`: Spidering, Discovery, Harvest, KnownIssueScan, SAST, Input Format, Request, Output, and Other (--oast-url, --pilot).
+The `run` command accepts the same flag groups as `scan` (Spidering, Discovery, Harvest, KnownIssueScan, Input Format, Request, Output, and `--oast-url`), **except** the module-selection flags `--module-id` / `--passive-only`, which are only on `scan` / `scan-url` / `scan-request`.
 
 ### Examples
 
@@ -312,8 +336,6 @@ vigolium run audit -t https://example.com --module-tag spring
 vigolium run external-harvest -t https://example.com
 vigolium run known-issue-scan -t https://example.com
 vigolium run known-issue-scan -t https://example.com --known-issue-scan-tags cve --known-issue-scan-severities critical,high
-vigolium run sast --sast-adhoc /path/to/app
-vigolium run sast --sast-adhoc /path/to/app --rule gin
 vigolium run extension -t https://example.com --ext custom-check.js
 vigolium run ext -t https://example.com --ext ./my-scanner.js
 vigolium run deparos -t https://example.com
@@ -366,7 +388,7 @@ Speed settings have a layered precedence:
 
 The following phases can be used with `--only` and `--skip`:
 
-`ingestion`, `discovery`, `external-harvest`, `known-issue-scan`, `spidering`, `sast`, `audit`, `extension`
+`ingestion`, `discovery`, `external-harvest`, `known-issue-scan`, `spidering`, `dynamic-assessment` (aliases `audit`, `dast`, `assessment`), `extension`
 
 ### HTML Format Constraints
 
@@ -374,7 +396,21 @@ The following phases can be used with `--only` and `--skip`:
 - In `scan` mode with `--only`, HTML is only supported for `discovery` and `spidering` phases
 - The `export` command supports HTML for all data
 
-### SAST Constraints
+### Filesystem & SQLite Format Constraints
 
-- `--sast-adhoc` accepts either a local path or a git URL (auto-detected)
-- Git URLs are cloned to a temp directory automatically
+- `--format fs` writes two sibling dirs off the `-o` base (`<base>-traffic/` + `<base>-findings/`); with no `-o` it defaults to `vigolium-traffic/` + `vigolium-findings/` in the cwd. Available on `scan` / `scan-url` / `scan-request` / `run`, `export`, and `db export`. `--split-by-host` is a no-op (fs already splits per host). For `scan-url` / `scan-request`, pass `-o`, `-S`, or a phase flag so the request routes through the runner that writes the tree
+- `--format sqlite` requires `-S/--stateless` **and** `-o/--output`; aliases `sqlite3` / `db`. Under `--split-by-host` each file is `<base>-<host>.sqlite`. Reopen with `vigolium finding/traffic -S --db <file>.sqlite`
+
+### Exit-Code Gating
+
+- `--fail-on <sev>` (`scan` / `run` / `scan-url` / `scan-request`) makes the command exit non-zero when a finding at/above `<sev>` was produced. Accepted (ascending): `info`, `suspect`, `low`, `medium`, `high`, `critical`
+- Output is always written first; the gate fires afterward
+- `--soft-fail` (global) forces exit 0 even when the gate (or any other error) trips
+- Under `-P` / `--split-by-host` the gate is evaluated per child; the parent batch exits non-zero only when every target fails
+
+### Source-Aware / SAST
+
+Static analysis and source-aware scanning are **agent** features, not native `scan`/`run`
+phases. Use `vigolium agent audit --source <path-or-git-url>` (security code audit) or
+`vigolium agent query --source <path> -t code-review`. `--source` accepts a local
+directory, a git URL (cloned automatically), a `.zip`/`.tar.gz`, or a `gs://` archive.

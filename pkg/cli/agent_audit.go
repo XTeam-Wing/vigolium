@@ -56,6 +56,12 @@ var (
 	auditStateless    bool
 	auditReportOutput string
 
+	// auditOutputDir (--output-dir) bundles a --stateless run's HTML report
+	// and a copy of the raw vigolium-results/ tree(s) into one directory. A
+	// relative -o is nested under it; the source-tree copy is left in place
+	// (per --keep-raw). Only applies with -S/--stateless.
+	auditOutputDir string
+
 	auditPiProvider string
 	auditPiModel    string
 
@@ -159,7 +165,7 @@ func registerAuditFlags(cmd *cobra.Command) {
 	f.StringVar(&auditSource, "source", ".", "Source: local directory, git URL, gs://<project>/<key> archive, or local .zip/.tar.gz")
 	f.BoolVarP(&auditInteractive, "interactive", "i", false, "Drop into the coding agent with the audit harness installed and drive the audit yourself (audit-only; the embedded vigolium-audit binary's -i). Skips NDJSON streaming, the AgenticScan row, and findings auto-import — results land in <source>/vigolium-results/; import them afterward with 'vigolium import'. Not valid with --driver=piolium.")
 	f.BoolVar(&auditNoStream, "no-stream", false, "Don't echo agent output to the console (still written to {session}/<driver>/runtime.log)")
-	f.BoolVar(&auditShowThinking, "show-thinking", false, "Render the agent's internal thinking blocks (audit NDJSON `thinking` events) in the live stream. Off by default — thinking is verbose and produces many lines per phase.")
+	f.BoolVar(&auditShowThinking, "show-thinking", false, "Render the agent's internal thinking blocks (audit NDJSON 'thinking' events) in the live stream. Off by default — thinking is verbose and produces many lines per phase.")
 	f.BoolVar(&auditUploadResults, "upload-results", false, "Upload session bundle to cloud storage after completion (requires storage config)")
 	f.IntVar(&auditCommitDepth, "commit-depth", 1, "git clone --depth value when --source is a git URL (default 1; use 0 for full history; overrides --intensity)")
 	f.BoolVar(&auditNoDedup, "no-dedup", false, "Skip the post-pass project-wide findings dedup that runs after the audit completes")
@@ -167,6 +173,7 @@ func registerAuditFlags(cmd *cobra.Command) {
 	f.BoolVar(&auditCleanRaw, "clean-raw", false, "[audit] Remove <source>/vigolium-results/ from the source tree after the run (the session copy is always kept). Inverts the default --keep-raw retention of the source-folder copy. No effect on the piolium leg.")
 	f.BoolVarP(&auditStateless, "stateless", "S", false, "Run the audit into a throwaway temporary database (the main DB is left untouched) and auto-write a self-contained HTML report. Mirrors 'vigolium scan -S'. Not valid with --interactive.")
 	f.StringVarP(&auditReportOutput, "output", "o", "", "HTML report path for --stateless runs (default vigolium-result/vigolium-audit-report.html; supports gs://<project>/<key> and {ts}). Only applies with -S/--stateless.")
+	f.StringVar(&auditOutputDir, "output-dir", "", "Bundle directory for --stateless runs: collects the HTML report (as vigolium-audit-report.html) AND a copy of the raw vigolium-results/ output into one folder. A relative -o/--output is nested under it; an absolute path or gs:// URL wins. The source-tree copy is left in place. Supports {ts}/{project-uuid}. Only applies with -S/--stateless.")
 
 	// Audit-only. audit now drives both Claude Code and Codex
 	// internally, so anthropic-* and openai-* providers are both
@@ -193,8 +200,8 @@ func registerAuditFlags(cmd *cobra.Command) {
 	// run on this invocation; the underlying mapping is described in
 	// pkg/agent/auth_override.go.
 	f.StringVar(&auditAPIKey, "api-key", "", "BYOK API key for the run (literal, $ENV_NAME, or @path). claude→ANTHROPIC_API_KEY, codex→OPENAI_API_KEY. Empty inherits agent.olium.* config. Mutually exclusive with --oauth-token / --oauth-cred-file.")
-	f.StringVar(&auditOAuthToken, "oauth-token", "", "BYOK Anthropic OAuth bearer token (literal, $ENV_NAME, or @path). Claude only — produced by `claude setup-token`. Mutually exclusive with --api-key / --oauth-cred-file.")
-	f.StringVar(&auditOAuthCredFile, "oauth-cred-file", "", "BYOK OAuth credential file path (literal or $ENV_NAME). Codex (`~/.codex/auth.json` shape). Staged under <pi-agent-dir>/auth.json with backup-and-restore for piolium runs. Mutually exclusive with --api-key / --oauth-token.")
+	f.StringVar(&auditOAuthToken, "oauth-token", "", "BYOK Anthropic OAuth bearer token (literal, $ENV_NAME, or @path). Claude only — produced by 'claude setup-token'. Mutually exclusive with --api-key / --oauth-cred-file.")
+	f.StringVar(&auditOAuthCredFile, "oauth-cred-file", "", "BYOK OAuth credential file path (literal or $ENV_NAME). Codex ('~/.codex/auth.json' shape). Staged under <pi-agent-dir>/auth.json with backup-and-restore for piolium runs. Mutually exclusive with --api-key / --oauth-token.")
 }
 
 // driverPlan tags one driver's invocation: the harness identity, where its
@@ -292,10 +299,23 @@ func runAgentAudit(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// -o/--output only affects the --stateless HTML report; warn (don't error)
-	// when it's set without -S so the run still proceeds.
-	if strings.TrimSpace(auditReportOutput) != "" && !auditStateless {
-		fmt.Fprintf(os.Stderr, "%s -o/--output only applies with --stateless/-S; ignoring\n",
+	// -o/--output and --output-dir only shape the --stateless report/bundle;
+	// warn (don't error) when either is set without -S so the run still proceeds.
+	warnIgnoredWithoutStateless := func(flag, val string) {
+		if strings.TrimSpace(val) != "" && !auditStateless {
+			fmt.Fprintf(os.Stderr, "%s %s only applies with --stateless/-S; ignoring\n",
+				terminal.WarningSymbol(), flag)
+		}
+	}
+	warnIgnoredWithoutStateless("-o/--output", auditReportOutput)
+	warnIgnoredWithoutStateless("--output-dir", auditOutputDir)
+
+	// -S without --output-dir: the report is still written, but the raw
+	// vigolium-results/ tree is only left under <source>/ and the session dir.
+	// Nudge the operator toward bundling the report + raw results into one
+	// folder. (auditStateless implies !auditInteractive — rejected above.)
+	if auditStateless && strings.TrimSpace(auditOutputDir) == "" {
+		fmt.Fprintf(os.Stderr, "%s --stateless without --output-dir: raw scanner output stays under <source>/vigolium-results/; pass --output-dir <dir> to bundle the report and raw results together\n",
 			terminal.WarningSymbol())
 	}
 
@@ -570,19 +590,10 @@ func runAgentAudit(cmd *cobra.Command, args []string) error {
 
 	// --stateless: the audit drivers imported the on-disk vigolium-results
 	// folder(s) into the throwaway temp DB, so render the self-contained HTML
-	// report from those findings now (before the temp DB is discarded by the
-	// deferred cleanup). Skipped when every driver failed — nothing to report.
+	// report (and, with --output-dir, a copy of the raw results) now — before
+	// the temp DB is discarded by the deferred cleanup.
 	if auditStateless {
-		if allFailed {
-			fmt.Fprintf(os.Stderr, "%s --stateless: skipping HTML report — no audit driver completed\n",
-				terminal.WarningSymbol())
-		} else if db == nil {
-			fmt.Fprintf(os.Stderr, "%s --stateless: skipping HTML report — database unavailable\n",
-				terminal.WarningSymbol())
-		} else if err := emitAuditStatelessReport(context.Background(), db, projectUUID, auditReportOutput, absTarget, startedAt); err != nil {
-			fmt.Fprintf(os.Stderr, "%s --stateless: HTML report generation failed: %v\n",
-				terminal.WarningSymbol(), err)
-		}
+		emitAuditStatelessArtifacts(context.Background(), db, projectUUID, absTarget, startedAt, plans, allFailed)
 	}
 
 	// Skip upload when any driver failed so partial uploads don't get
